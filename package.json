@@ -1,0 +1,31 @@
+{
+  "name": "couchside",
+  "version": "0.1.0",
+  "description": "Install and manage the Couchside agent on your Steam Deck / SteamOS box, with the pairing QR right in Game Mode.",
+  "type": "module",
+  "scripts": {
+    "build": "shx rm -rf dist && rollup -c",
+    "watch": "rollup -c -w"
+  },
+  "keywords": ["decky", "decky-loader", "steamdeck", "steamos", "bazzite", "couchside"],
+  "license": "MIT",
+  "author": "ETS3D LLC",
+  "devDependencies": {
+    "@decky/rollup": "^1.0.1",
+    "@types/react": "^18.3.3",
+    "rollup": "^4.22.0",
+    "shx": "^0.3.4",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "@decky/api": "^1.1.2",
+    "@decky/ui": "^4.9.0",
+    "qrcode.react": "^4.1.0",
+    "react-icons": "^5.3.0"
+  },
+  "pnpm": {
+    "peerDependencyRules": {
+      "ignoreMissing": ["react", "react-dom"]
+    }
+  }
+}
