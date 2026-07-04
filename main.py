@@ -75,6 +75,9 @@ def _target_user() -> str:
 
 
 def _run(cmd, check=False):
+    """Run cmd and return the CompletedProcess. check=True raises RuntimeError
+    on nonzero exit; otherwise never raises, so callers can probe .returncode
+    directly."""
     log.info("couchside: run %s", " ".join(cmd))
     p = subprocess.run(cmd, capture_output=True, text=True)
     if check and p.returncode != 0:
@@ -108,7 +111,9 @@ def _read_port() -> int:
 def _lan_ip() -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("192.0.2.1", 9))  # no packet is actually sent
+        # TEST-NET-1 (RFC 5737): unroutable on purpose, so this only picks the
+        # outbound interface; no packet is actually sent.
+        s.connect(("192.0.2.1", 9))
         ip = s.getsockname()[0]
         s.close()
         return "" if ip.startswith("127.") else ip
@@ -235,6 +240,8 @@ class Plugin:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(_gen_config(have_sddm, have_kodi), f, indent=2)
             os.chmod(CONFIG_FILE, 0o644)
+            # root-owned so the user-run agent can read its allowed actions but
+            # not rewrite which privileged commands it is permitted to run.
             os.chown(CONFIG_FILE, 0, 0)
 
         # (f) sudoers rule, validated with visudo before install
@@ -323,6 +330,8 @@ class Plugin:
         host = f"{_hostname_short()}.local"
         # HTTPS relaunch link; token rides the #fragment so it never hits the web server.
         pair_url = f"https://couchside.tv/pair#host={host}&port={port}&token={token}"
+        # Ship the raw LAN IP too: the .local host is mDNS and may not resolve
+        # where mDNS is blocked, so the phone can fall back to &ip=. Keep both.
         ip = _lan_ip()
         if ip:
             pair_url += f"&ip={ip}"
