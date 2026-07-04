@@ -40,8 +40,17 @@ function Content() {
 
   useEffect(() => {
     refresh();
+    // The QAM panel stays mounted after you first open it, so a one-shot read
+    // can latch onto a transient state (e.g. "Stopped" caught while the service
+    // is mid-restart) and never update. Re-poll so the status corrects itself
+    // instead of waiting for a button tap.
+    const timer = setInterval(refresh, 5000);
+    return () => clearInterval(timer);
   }, []);
 
+  // busy is null or the one active action's label: non-null disables all
+  // buttons (actions are mutually exclusive), and === label picks that button's
+  // spinner text.
   const withBusy = async (label: string, fn: () => Promise<Result>, ok: string) => {
     setBusy(label);
     try {
@@ -153,6 +162,8 @@ function Content() {
           <ButtonItem
             layout="below"
             disabled={busy !== null}
+            // Reuses bInstall and the "install" busy label on purpose: install
+            // is idempotent, so re-running it upgrades in place.
             onClick={() => withBusy("install", bInstall, "Agent updated.")}
           >
             {busy === "install" ? "Updating…" : "Re-install / update"}
