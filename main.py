@@ -87,7 +87,14 @@ def _chown(path, uid, gid, recursive=False):
     if recursive and os.path.isdir(path):
         for root, dirs, files in os.walk(path):
             for name in dirs + files:
-                os.chown(os.path.join(root, name), uid, gid)
+                # follow_symlinks=False so a dangling link chowns the link
+                # itself instead of chasing a missing target; skip anything
+                # that vanished between the walk and the chown.
+                try:
+                    os.chown(os.path.join(root, name), uid, gid,
+                             follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
 
 
 def _read_port() -> int:
@@ -188,7 +195,18 @@ class Plugin:
         dst_daemon = os.path.join(install_dir, "couchsided.py")
         shutil.copyfile(src_daemon, dst_daemon)
         os.chmod(dst_daemon, 0o755)
-        _chown(os.path.join(home, ".local"), uid, gid, recursive=True)
+        # Only fix ownership of what we just created. Chowning all of ~/.local
+        # would recurse into the user's Steam library (tens of GB) and blow up
+        # on the broken symlinks in old steam-runtime trees. makedirs may have
+        # created ~/.local and ~/.local/opt as root, so touch those two nodes
+        # too, but never their subtrees.
+        _chown(install_dir, uid, gid, recursive=True)
+        for parent in (os.path.join(home, ".local", "opt"),
+                       os.path.join(home, ".local")):
+            try:
+                os.chown(parent, uid, gid)
+            except OSError:
+                pass
 
         # (d) token
         os.makedirs(ETC_DIR, exist_ok=True)
