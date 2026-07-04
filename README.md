@@ -4,7 +4,7 @@ Install and manage the [Couchside](https://couchside.tv) agent on your Steam Dec
 or SteamOS / Bazzite box without leaving Game Mode. The plugin also shows the
 phone pairing QR right in the Quick Access Menu.
 
-Couchside turns your phone into your box's monitor, remote console, and game
+Couchside turns your phone into your box's dashboard, remote console, and game
 controller ([App Store](https://apps.apple.com/app/id6786884115) ·
 [Google Play](https://play.google.com/store/apps/details?id=com.ets3d.rescueremote)).
 The box side is a tiny, dependency-free Python agent; this plugin installs and

@@ -5,7 +5,7 @@
   "api_version": 1,
   "publish": {
     "tags": ["system-tools", "utility"],
-    "description": "Turn your phone into your Steam Deck / SteamOS box's monitor, console, and controller. Installs and manages the open-source Couchside agent and shows the pairing QR right here in Game Mode, without a terminal or a trip to the desktop.",
+    "description": "Turn your phone into your Steam Deck / SteamOS box's dashboard, console, and controller. Installs and manages the open-source Couchside agent and shows the pairing QR right here in Game Mode, without a terminal or a trip to the desktop.",
     "image": "https://couchside.tv/couchside/assets/og.png"
   }
 }
