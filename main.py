@@ -79,7 +79,19 @@ def _run(cmd, check=False):
     on nonzero exit; otherwise never raises, so callers can probe .returncode
     directly."""
     log.info("couchside: run %s", " ".join(cmd))
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    # Decky's plugin loader is a PyInstaller bundle: it points LD_LIBRARY_PATH at
+    # its own bundled libs (an older libcrypto), and we inherit that. A system
+    # binary like systemctl then links the wrong libcrypto and dies before it
+    # does anything ("OPENSSL_3.4.0 not found"). Hand the child the pre-bundle
+    # library path (LD_LIBRARY_PATH_ORIG if PyInstaller saved one, else drop the
+    # var) so it loads the OS libraries instead.
+    env = dict(os.environ)
+    orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    if orig is not None:
+        env["LD_LIBRARY_PATH"] = orig
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    p = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if check and p.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)} failed ({p.returncode}): {p.stderr.strip()}")
     return p
