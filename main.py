@@ -222,7 +222,6 @@ class Plugin:
         dst_daemon = os.path.join(install_dir, "couchsided.py")
         fetched = None
         try:
-            import urllib.request
             req = urllib.request.Request(DAEMON_URL, headers={"User-Agent": "couchside-decky"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = r.read()
