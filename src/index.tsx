@@ -5,6 +5,8 @@ import {
   staticClasses,
   Spinner,
   Field,
+  ConfirmModal,
+  showModal,
 } from "@decky/ui";
 import { callable, definePlugin, toaster } from "@decky/api";
 import { useEffect, useState } from "react";
@@ -12,7 +14,7 @@ import { FaCouch, FaRotate, FaKey, FaTrash } from "react-icons/fa6";
 import { QRCodeSVG } from "qrcode.react";
 
 // ---- backend bridges (names match main.py's Plugin methods) --------------
-type Status = { installed: boolean; running: boolean; port: number; agent_version?: string | null };
+type Status = { installed: boolean; running: boolean; port: number; agent_version?: string | null; uinput_ready?: boolean };
 type Pairing = { ok: boolean; host?: string; port?: number; token?: string; pair_url?: string; error?: string };
 type Result = { ok: boolean; error?: string };
 
@@ -64,6 +66,26 @@ function Content() {
     }
   };
 
+  // Gate a destructive action behind a ConfirmModal so a stray Game-Mode D-pad
+  // click can't un-pair every phone or remove the agent with no undo. ConfirmModal
+  // closes itself on OK/Cancel; we only run the action when the user confirms.
+  const confirmThen = (
+    title: string,
+    description: string,
+    okText: string,
+    run: () => void,
+  ) =>
+    showModal(
+      <ConfirmModal
+        strTitle={title}
+        strDescription={description}
+        strOKButtonText={okText}
+        strCancelButtonText="Cancel"
+        bDestructiveWarning={true}
+        onOK={run}
+      />,
+    );
+
   if (!status) {
     return (
       <PanelSection title="Couchside">
@@ -110,6 +132,18 @@ function Content() {
             {status.running ? `Running · v${status.agent_version ?? "?"}` : "Stopped"}
           </Field>
         </PanelSectionRow>
+        {status.uinput_ready === false && (
+          <PanelSectionRow>
+            {/* The #1 silent post-install failure: the service is "Running" but the
+                virtual gamepad device isn't usable, so no controller input reaches
+                games. Surface it instead of showing a bare green "Running". */}
+            <Field label="Virtual gamepad" focusable={false} bottomSeparator="none">
+              <span style={{ color: "#f5a623" }}>
+                Unavailable — reboot or reinstall
+              </span>
+            </Field>
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <Field label="Port" focusable={false}>{status.port}</Field>
         </PanelSectionRow>
@@ -152,7 +186,14 @@ function Content() {
           <ButtonItem
             layout="below"
             disabled={busy !== null}
-            onClick={() => withBusy("regen", bRegen, "New token generated. Re-pair your phones.")}
+            onClick={() =>
+              confirmThen(
+                "Regenerate token?",
+                "This invalidates the current token. Every paired phone will be signed out and must scan the new QR to pair again.",
+                "Regenerate",
+                () => withBusy("regen", bRegen, "New token generated. Re-pair your phones."),
+              )
+            }
           >
             <FaKey style={{ marginRight: 8 }} />
             {busy === "regen" ? "Regenerating…" : "Regenerate token"}
@@ -173,7 +214,14 @@ function Content() {
           <ButtonItem
             layout="below"
             disabled={busy !== null}
-            onClick={() => withBusy("uninstall", () => bUninstall(false), "Agent removed.")}
+            onClick={() =>
+              confirmThen(
+                "Uninstall agent?",
+                "This stops and removes the Couchside agent from this box. Your phones will lose remote control until you reinstall.",
+                "Uninstall",
+                () => withBusy("uninstall", () => bUninstall(false), "Agent removed."),
+              )
+            }
           >
             <FaTrash style={{ marginRight: 8 }} />
             {busy === "uninstall" ? "Removing…" : "Uninstall agent"}

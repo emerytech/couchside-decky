@@ -45,6 +45,7 @@ UNIT_DST = "/etc/systemd/system/couchside.service"
 UINPUT_UDEV = "/etc/udev/rules.d/99-couchside-uinput.rules"
 UINPUT_MODLOAD = "/etc/modules-load.d/couchside-uinput.conf"
 RTC_UDEV = "/etc/udev/rules.d/99-couchside-rtc.rules"
+WOL_LINK = "/etc/systemd/network/50-couchside-wol.link"
 
 # The current agent on main. Installed by preference so a plugin release can
 # never downgrade the daemon; the bundled defaults/couchsided.py is the offline
@@ -116,6 +117,32 @@ def _chown(path, uid, gid, recursive=False):
                              follow_symlinks=False)
                 except FileNotFoundError:
                     pass
+
+
+def _uinput_ready() -> bool:
+    """Whether /dev/uinput exists and is writable by the TARGET user. This
+    backend runs as root (os.access would always say yes), so decide from the
+    node's owner/group/mode against the user's uid + group membership."""
+    try:
+        import grp, stat
+        st = os.stat("/dev/uinput")
+        user = _target_user()
+        pw = pwd.getpwnam(user)
+        # gather the user's group ids (primary + supplementary)
+        gids = {pw.pw_gid}
+        for g in grp.getgrall():
+            if user in g.gr_mem:
+                gids.add(g.gr_gid)
+        mode = st.st_mode
+        if st.st_uid == pw.pw_uid and (mode & stat.S_IWUSR):
+            return True
+        if st.st_gid in gids and (mode & stat.S_IWGRP):
+            return True
+        if mode & stat.S_IWOTH:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 def _read_port() -> int:
@@ -221,17 +248,25 @@ class Plugin:
         os.makedirs(install_dir, exist_ok=True)
         dst_daemon = os.path.join(install_dir, "couchsided.py")
         fetched = None
+        tmp_dl = dst_daemon + ".dl"
         try:
             req = urllib.request.Request(DAEMON_URL, headers={"User-Agent": "couchside-decky"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = r.read()
-            tmp_dl = dst_daemon + ".dl"
             with open(tmp_dl, "wb") as f:
                 f.write(data)
             _run(["python3", "-m", "py_compile", tmp_dl], check=True)  # trust only if it compiles
             fetched = tmp_dl
         except Exception:
             fetched = None
+        finally:
+            # A fetch/compile failure can leave a partial .dl behind; never let it
+            # linger. Only remove it here if we're NOT about to promote it below.
+            if fetched is None and os.path.exists(tmp_dl):
+                try:
+                    os.remove(tmp_dl)
+                except OSError:
+                    pass
         if fetched:
             os.replace(fetched, dst_daemon)
         else:
@@ -272,8 +307,10 @@ class Plugin:
         # (e) config.json (only if absent)
         if not (os.path.exists(CONFIG_FILE) and os.path.getsize(CONFIG_FILE) > 0):
             have_sddm = _run(["systemctl", "cat", "sddm.service"]).returncode == 0
+            # Per-user flatpaks are invisible to root, so probe as the DESKTOP USER
+            # (matches install.sh, which runs `flatpak info` as the invoking user).
             have_kodi = (shutil.which("flatpak") is not None
-                         and _run(["flatpak", "info", "tv.kodi.Kodi"]).returncode == 0)
+                         and _run(["sudo", "-u", user, "flatpak", "info", "tv.kodi.Kodi"]).returncode == 0)
             with open(CONFIG_FILE, "w") as f:
                 json.dump(_gen_config(have_sddm, have_kodi), f, indent=2)
             os.chmod(CONFIG_FILE, 0o644)
@@ -288,7 +325,7 @@ class Plugin:
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl reboot\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl suspend\n"
-            f"{user} ALL=(root) NOPASSWD: /usr/bin/journalctl *\n"
+            f"{user} ALL=(root) NOPASSWD: /usr/bin/journalctl -u *\n"
         )
         tmp_sudoers = os.path.join(pdir, ".couchside-sudoers.tmp")
         with open(tmp_sudoers, "w") as f:
@@ -363,7 +400,8 @@ class Plugin:
                     version = json.loads(r.read().decode()).get("version")
             except Exception:
                 pass
-        return {"installed": installed, "running": running, "port": port, "agent_version": version}
+        return {"installed": installed, "running": running, "port": port,
+                "agent_version": version, "uinput_ready": _uinput_ready()}
 
     # ---- pairing (for the QR) -------------------------------------------
     async def get_pairing(self):
@@ -412,6 +450,54 @@ class Plugin:
                     os.remove(p)
             _run(["systemctl", "daemon-reload"])
             shutil.rmtree(os.path.join(home, ".local", "opt", "couchside"), ignore_errors=True)
+
+            # Mirror the install's system-level side effects so an uninstall
+            # leaves nothing behind. All best-effort / idempotent: a missing
+            # file or a tool that isn't present must never abort the uninstall.
+            # (a) firewalld port we opened
+            if shutil.which("firewall-cmd") and _run(["firewall-cmd", "--state"]).returncode == 0:
+                port = _read_port()
+                _run(["firewall-cmd", f"--remove-port={port}/tcp", "--permanent"])
+                _run(["firewall-cmd", "--reload"])
+            # (b) Wake-on-LAN .link, if the box installer armed one
+            if os.path.exists(WOL_LINK):
+                try:
+                    os.remove(WOL_LINK)
+                except OSError:
+                    pass
+            # (c) drop the agent user from the 'input' group we added it to
+            if shutil.which("gpasswd"):
+                _run(["gpasswd", "-d", user, "input"])
+            elif shutil.which("usermod"):
+                # rebuild the supplementary list without 'input'
+                try:
+                    import grp
+                    keep = [g.gr_name for g in grp.getgrall()
+                            if user in g.gr_mem and g.gr_name != "input"]
+                    _run(["usermod", "-G", ",".join(keep), user])
+                except Exception:
+                    pass
+
+            # Retire any pre-rename installs (rescue-agent / couchpilot) too, so a
+            # purge is a clean slate. Units always; sudoers only on purge, matching
+            # the current-install sudoers being purge-gated below.
+            for old_etc, old_unit, old_sudoers in OLD_INSTALLS:
+                unit_path = f"/etc/systemd/system/{old_unit}"
+                if os.path.exists(unit_path):
+                    _run(["systemctl", "disable", "--now", old_unit])
+                    try:
+                        os.remove(unit_path)
+                    except OSError:
+                        pass
+                    _run(["systemctl", "daemon-reload"])
+                if purge:
+                    shutil.rmtree(old_etc, ignore_errors=True)
+                    if os.path.exists(old_sudoers):
+                        try:
+                            os.remove(old_sudoers)
+                        except OSError:
+                            pass
+
             if purge:
                 shutil.rmtree(ETC_DIR, ignore_errors=True)
                 if os.path.exists(SUDOERS_FILE):
