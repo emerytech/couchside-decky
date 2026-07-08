@@ -13,20 +13,24 @@ defaults.
 
 import argparse
 import base64
+import calendar
 import glob
 import hashlib
 import hmac
 import json
 import os
 import random
+import select
 import shutil
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -36,7 +40,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.4.0"
+VERSION = "2.8.1"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -85,7 +89,7 @@ DEFAULT_UNITS = [
 DEFAULT_ACTIONS = {
     "restart-session": {
         "label": "Restart Session",
-        "description": "Restart the display session (sddm) to fix a wedged or black screen",
+        "description": "Restart the display session (sddm), fixes a wedged/black screen",
         "danger": "high",
         "cmd": ["sudo", "systemctl", "restart", "sddm"],
         "user_env": False,
@@ -122,7 +126,7 @@ SESSION_ACTIONS = {
         "danger": "medium",
         # "plasma" = one-time switch to the desktop (doesn't change the default
         # login mode, so the box still boots into Game Mode). NB: session-select
-        # has no "desktop" arg; valid targets are plasma*/gamescope.
+        # has no "desktop" arg: valid targets are plasma*/gamescope.
         "cmd": ["steamos-session-select", "plasma"],
         "user_env": True,
         "detached": True,
@@ -137,19 +141,35 @@ SESSION_ACTIONS = {
     },
 }
 
+# Suspend action, injected at load time when the scoped sudoers rule allows it
+# (see _inject_suspend_action). Built-in like the session actions so it appears
+# without a config edit, but gated on sudo: the agent is a system service with
+# no login seat, so logind/polkit will not grant suspend, and the installer's
+# sudoers rule must permit `systemctl suspend`. The app pairs this with a
+# Wake-on-LAN magic packet to wake the box back up (see read_net).
+SUSPEND_ACTION = {
+    "label": "Suspend",
+    "description": "Suspend the box to RAM; wake it from the app over Wake-on-LAN",
+    "danger": "medium",
+    "cmd": ["sudo", "systemctl", "suspend"],
+    "user_env": False,
+    "detached": True,
+}
+
 # Custom launcher limits (see the SECURITY NOTE in the launcher routes).
 MAX_LAUNCHERS = 100        # cap on total custom launchers
 MAX_CMD_ARGS = 64          # cap on argv count per launcher
 MAX_CMD_ARG_LEN = 4096     # cap on a single argv token
 MAX_LABEL_LEN = 200        # cap on a launcher label
 
-# Effective config, set by load_config() before the server starts.
+# Effective config: set by load_config() before the server starts.
 WATCHLIST = list(DEFAULT_UNITS)
 WATCHLIST_NAMES = {name for name, _scope in WATCHLIST}
 ACTIONS = dict(DEFAULT_ACTIONS)
 ACTION_ORDER = list(DEFAULT_ACTION_ORDER)
 CONFIG_PORT = None  # optional "port" from config.json
-LAUNCHERS = []  # list of {"id","label","cmd":[...]}; custom launchers only
+CONFIG_PANEL = None  # optional {"device","baud"} RS-232 panel-control config
+LAUNCHERS = []  # list of {"id","label","cmd":[...]}, custom launchers only
 CONFIG_PATH = DEFAULT_CONFIG_PATH  # remembered by load_config() for rewrites
 CONFIG_LOCK = threading.Lock()  # serializes launcher config rewrites
 
@@ -289,18 +309,39 @@ def _parse_config(raw):
                 raise ConfigError("launchers[%d].cmd must be a non-empty argv list" % i)
             launchers.append({"id": lid, "label": label, "cmd": list(cmd)})
 
-    return units, actions, order, port, launchers
+    # Optional RS-232 panel control (e.g. Newline TruTouch over a USB-serial
+    # adapter). device must live under /dev/: this string is opened and
+    # written raw command frames, so it must never be attacker-influenced or a
+    # path outside the device tree.
+    panel = None
+    panel_raw = raw.get("panel")
+    if panel_raw is not None:
+        if not isinstance(panel_raw, dict):
+            raise ConfigError("panel must be an object")
+        device = panel_raw.get("device")
+        if not isinstance(device, str) or not device.startswith("/dev/"):
+            raise ConfigError("panel.device must be a string path under /dev/")
+        baud = panel_raw.get("baud", 19200)
+        if baud not in PANEL_BAUDS:
+            raise ConfigError("panel.baud must be one of %s"
+                              % ", ".join(str(b) for b in sorted(PANEL_BAUDS)))
+        proto = panel_raw.get("protocol", "newline")
+        if proto != "newline":
+            raise ConfigError("panel.protocol must be \"newline\"")
+        panel = {"device": device, "baud": int(baud), "protocol": proto}
+
+    return units, actions, order, port, launchers, panel
 
 
 def load_config(path):
     """Load config.json into the module globals; fall back to defaults."""
     global WATCHLIST, WATCHLIST_NAMES, ACTIONS, ACTION_ORDER, CONFIG_PORT
-    global LAUNCHERS, CONFIG_PATH
+    global LAUNCHERS, CONFIG_PATH, CONFIG_PANEL
     CONFIG_PATH = path  # remembered so launcher POST/DELETE can rewrite it
     try:
         with open(path) as f:
             raw = json.load(f)
-        units, actions, order, port, launchers = _parse_config(raw)
+        units, actions, order, port, launchers, panel = _parse_config(raw)
     except FileNotFoundError:
         print("warning: config %s not found, using built-in generic defaults"
               % path, file=sys.stderr, flush=True)
@@ -315,6 +356,7 @@ def load_config(path):
     ACTION_ORDER = order
     CONFIG_PORT = port
     LAUNCHERS = launchers
+    CONFIG_PANEL = panel
     print("config loaded from %s: %d units, %d actions, %d launchers"
           % (path, len(WATCHLIST), len(ACTIONS), len(LAUNCHERS)), flush=True)
 
@@ -333,6 +375,34 @@ def _inject_session_actions():
             if aid not in ACTION_ORDER:
                 ACTION_ORDER.append(aid)
 
+
+def _can_sudo_suspend():
+    """True when the sudoers rule lets the agent run `systemctl suspend` without
+    a password. Probes with `sudo -n -l`, which lists the permission and never
+    runs the command. False on any failure, so a box whose installer predates
+    the suspend rule simply omits the action instead of offering a dead one."""
+    try:
+        r = subprocess.run(["sudo", "-n", "-l", "/usr/bin/systemctl", "suspend"],
+                           capture_output=True, timeout=4)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _inject_suspend_action(mock):
+    """Add the Suspend action when the box can run it. In --mock it is always
+    added so the app's power control can be developed off-box; in real mode it
+    appears only when the sudoers rule permits suspend. Called after load_config,
+    idempotent, and skipped when the config already defines a suspend action."""
+    global ACTIONS, ACTION_ORDER
+    if "suspend" in ACTIONS:
+        return
+    if not mock and not _can_sudo_suspend():
+        return
+    ACTIONS["suspend"] = dict(SUSPEND_ACTION)
+    if "suspend" not in ACTION_ORDER:
+        ACTION_ORDER.append("suspend")
+
 # ---------------------------------------------------------------------------
 # Real-mode data collection (Linux; each helper degrades gracefully)
 # ---------------------------------------------------------------------------
@@ -350,6 +420,95 @@ def read_uptime_s():
             return int(float(f.read().split()[0]))
     except Exception:
         return 0
+
+
+# --- primary-interface network facts (for the app's Wake-on-LAN power path) --
+# The app's power button suspends the box over the LAN while it is awake, then
+# wakes it with a Wake-on-LAN magic packet once it is asleep and the agent is
+# gone. For that the app needs the box's MAC, whether the link is wired (WoL
+# over WiFi rarely works), and whether magic-packet wake is armed. These facts
+# rarely change, so read_net() is cached for _NET_TTL seconds (see
+# net_info_cached) instead of shelling out to ethtool on every status poll.
+_NET_TTL = 30.0
+_NET_CACHE = {"at": 0.0, "val": None}
+
+
+def _default_iface():
+    """Interface name of the IPv4 default route, or None. Reads /proc/net/route
+    (the row whose destination is 00000000). Pure stdlib, no shell."""
+    try:
+        with open("/proc/net/route") as f:
+            next(f)  # skip the header row
+            for line in f:
+                cols = line.split()
+                if len(cols) > 1 and cols[1] == "00000000":
+                    return cols[0]
+    except (OSError, StopIteration):
+        return None
+    return None
+
+
+def _iface_mac(iface):
+    try:
+        with open("/sys/class/net/%s/address" % iface) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _iface_wired(iface):
+    """True wired, False wireless. A wireless NIC exposes a
+    /sys/class/net/<if>/wireless directory or DEVTYPE=wlan in its uevent."""
+    if os.path.isdir("/sys/class/net/%s/wireless" % iface):
+        return False
+    try:
+        with open("/sys/class/net/%s/uevent" % iface) as f:
+            if "DEVTYPE=wlan" in f.read():
+                return False
+    except OSError:
+        pass
+    return True
+
+
+def _iface_wol_armed(iface):
+    """True when magic-packet wake (WoL flag 'g') is enabled per ethtool, False
+    when disabled, None when ethtool is missing or the read fails. Reading the
+    WoL state does not need root."""
+    ethtool = shutil.which("ethtool")
+    if not ethtool:
+        return None
+    try:
+        r = subprocess.run([ethtool, iface], capture_output=True, text=True,
+                           timeout=4)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("Wake-on:"):
+            return "g" in s.split(":", 1)[1]
+    return None
+
+
+def read_net():
+    """Primary-interface facts for the app's Wake-on-LAN power path. Every field
+    degrades to None when it can't be read."""
+    iface = _default_iface()
+    if not iface:
+        return {"iface": None, "mac": None, "wired": None, "wol_armed": None}
+    return {"iface": iface, "mac": _iface_mac(iface),
+            "wired": _iface_wired(iface), "wol_armed": _iface_wol_armed(iface)}
+
+
+def net_info_cached():
+    """read_net() memoized for _NET_TTL seconds so status polls do not shell out
+    to ethtool every few seconds. A lost race just recomputes, which is fine."""
+    now = time.monotonic()
+    if _NET_CACHE["val"] is None or now - _NET_CACHE["at"] > _NET_TTL:
+        _NET_CACHE["val"] = read_net()
+        _NET_CACHE["at"] = now
+    return _NET_CACHE["val"]
 
 
 def read_load():
@@ -446,6 +605,7 @@ def real_status():
         "cpu_temp_c": read_cpu_temp_c(),
         "mem": read_mem(),
         "disks": read_disks(),
+        "net": net_info_cached(),
         "agent_version": VERSION,
     }
 
@@ -552,6 +712,220 @@ def real_action(action_id):
 
 
 # ---------------------------------------------------------------------------
+# Sleep timer + scheduled wake (/api/power/schedule|sleep|wake).
+#
+# Delayed suspend/poweroff is an in-process one-shot threading.Timer firing the
+# existing suspend/poweroff action — deliberately volatile (a restart clears it;
+# the app detects that by polling). Scheduled wake is an RTC alarm set via ioctl
+# on /dev/rtc0, reachable through a udev rule that adds rtc0 to group `input`
+# (the agent already has SupplementaryGroups=input) — NO sudoers change; the
+# alarm survives restarts and the suspend itself. The ioctl numbers + struct
+# layout + the valid-date-clear + single-open behaviour were all verified on a
+# real Bazzite rtc0.
+# ---------------------------------------------------------------------------
+
+SLEEP_MIN_S, SLEEP_MAX_S = 60, 8 * 3600
+WAKE_MIN_S, WAKE_MAX_S = 120, 86100   # just under 24h (exact-day is ambiguous on some CMOS RTCs)
+SLEEP_ACTIONS = ("suspend", "poweroff")
+
+POWER_MOCK = False          # set by set_power_schedule(mock)
+SLEEP_LOCK = threading.Lock()
+_SLEEP = {"timer": None, "action": None, "fire_at": 0.0}
+
+RTC_DEV = "/dev/rtc0"
+RTC_LOCK = threading.Lock()
+# ioctl request numbers (validated on hardware); _IOR('p',0x09,36) etc.
+RTC_RD_TIME = 0x80247009
+RTC_WKALM_RD = 0x80287010
+RTC_WKALM_SET = 0x4028700f
+_RTC_TIME = "=9i"           # sec,min,hour,mday,mon,year,wday,yday,isdst
+_RTC_WK = "=BB2x9i"         # enabled, pending, 2 pad, rtc_time
+_MOCK_WAKE = {"fire_at": 0}  # --mock in-memory alarm
+
+
+def set_power_schedule(mock):
+    global POWER_MOCK
+    POWER_MOCK = mock
+
+
+def _can_sudo_action(cmd):
+    """True iff the agent user has passwordless sudo for exactly `cmd`. Probes
+    with `sudo -n -l` (never runs it). Generalises _can_sudo_suspend."""
+    try:
+        r = subprocess.run(["sudo", "-n", "-l"] + list(cmd), capture_output=True, timeout=4)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def sleep_can_arm(action):
+    """(ok, error). The action must be a known sleep action, present in ACTIONS,
+    and its privileged command actually permitted — so we never arm a timer that
+    silently fails when it fires (poweroff is in ACTIONS unconditionally but sudo
+    may still refuse it)."""
+    if action not in SLEEP_ACTIONS:
+        return (False, "unknown action")
+    if POWER_MOCK:
+        return (True, None)
+    spec = ACTIONS.get(action)
+    if spec is None:
+        return (False, "%s unavailable" % action)
+    cmd = list(spec["cmd"])
+    if cmd and cmd[0] == "sudo":
+        probe = cmd[1:]
+        if probe and not probe[0].startswith("/"):
+            probe = ["/usr/bin/" + probe[0]] + probe[1:]  # sudo -l wants an absolute path
+        if not _can_sudo_action(probe):
+            return (False, "%s not permitted (sudoers)" % action)
+    return (True, None)
+
+
+def _sleep_info_locked():
+    if _SLEEP["timer"] is None:
+        return None
+    return {"action": _SLEEP["action"], "fire_at": int(_SLEEP["fire_at"]),
+            "remaining_s": max(0, int(_SLEEP["fire_at"] - time.time()))}
+
+
+def _sleep_cancel_locked():
+    if _SLEEP["timer"] is not None:
+        _SLEEP["timer"].cancel()
+    _SLEEP.update(timer=None, action=None, fire_at=0.0)
+
+
+def sleep_arm(delay_s, action):
+    """Arm a one-shot suspend/poweroff after delay_s, replacing any prior arm."""
+    with SLEEP_LOCK:
+        _sleep_cancel_locked()
+        fire_at = time.time() + delay_s
+
+        def _fire():
+            with SLEEP_LOCK:
+                if _SLEEP["timer"] is not timer:  # cancelled or superseded
+                    return
+                _SLEEP.update(timer=None, action=None, fire_at=0.0)
+            r = mock_action(action) if POWER_MOCK else real_action(action)
+            print("[sleep] fired %s: ok=%s" % (action, r.get("ok")), flush=True)
+
+        timer = threading.Timer(delay_s, _fire)
+        timer.daemon = True
+        _SLEEP.update(timer=timer, action=action, fire_at=fire_at)
+        timer.start()
+        return _sleep_info_locked()
+
+
+def sleep_cancel():
+    with SLEEP_LOCK:
+        _sleep_cancel_locked()
+
+
+def sleep_info():
+    with SLEEP_LOCK:
+        return _sleep_info_locked()
+
+
+def rtc_available():
+    if POWER_MOCK:
+        return True
+    return os.path.exists(RTC_DEV) and os.access(RTC_DEV, os.R_OK | os.W_OK)
+
+
+def _rtc_ioctl_read(fd, req, size):
+    buf = bytearray(size)
+    fcntl.ioctl(fd, req, buf, True)
+    return bytes(buf)
+
+
+def _rtc_now_epoch(fd):
+    """Current RTC time as an epoch in the RTC's OWN timebase (fields read as if
+    UTC), so alarm math is immune to whether the RTC runs UTC or LOCAL."""
+    t = struct.unpack(_RTC_TIME, _rtc_ioctl_read(fd, RTC_RD_TIME, 36))
+    return calendar.timegm((t[5] + 1900, t[4] + 1, t[3], t[2], t[1], t[0], 0, 0, 0))
+
+
+def rtc_wake_info():
+    """Current wake alarm as {fire_at, remaining_s} (wall time) or None."""
+    if POWER_MOCK:
+        fa = _MOCK_WAKE["fire_at"]
+        if fa and fa > time.time():
+            return {"fire_at": int(fa), "remaining_s": int(fa - time.time())}
+        return None
+    if not rtc_available():
+        return None
+    try:
+        with RTC_LOCK:
+            with open(RTC_DEV, "rb") as fd:
+                rtc_epoch = _rtc_now_epoch(fd)
+                w = struct.unpack(_RTC_WK, _rtc_ioctl_read(fd, RTC_WKALM_RD, 40))
+    except OSError:
+        return None
+    if not w[0]:
+        return None
+    alarm_epoch = calendar.timegm((w[7] + 1900, w[6] + 1, w[5], w[4], w[3], w[2], 0, 0, 0))
+    fire_at = time.time() + (alarm_epoch - rtc_epoch)  # RTC-timebase -> wall
+    return {"fire_at": int(fire_at), "remaining_s": max(0, int(fire_at - time.time()))}
+
+
+def rtc_set_wake(at_epoch):
+    """Set the RTC wake alarm to fire at wall-time `at_epoch`; verify read-back.
+    Returns True on success."""
+    if POWER_MOCK:
+        _MOCK_WAKE["fire_at"] = int(at_epoch)
+        print("[wake] mock alarm at %d" % int(at_epoch), flush=True)
+        return True
+    if not rtc_available():
+        return False
+    try:
+        with RTC_LOCK:
+            with open(RTC_DEV, "rb") as fd:
+                target = _rtc_now_epoch(fd) + int(at_epoch - time.time())
+                tm = time.gmtime(target)
+                alarm = struct.pack(_RTC_WK, 1, 0, tm.tm_sec, tm.tm_min, tm.tm_hour,
+                                    tm.tm_mday, tm.tm_mon - 1, tm.tm_year - 1900,
+                                    tm.tm_wday, tm.tm_yday, tm.tm_isdst)
+                fcntl.ioctl(fd, RTC_WKALM_SET, alarm)
+                r = struct.unpack(_RTC_WK, _rtc_ioctl_read(fd, RTC_WKALM_RD, 40))
+        # Verify enabled + Y/M/D/h/m/s; the kernel normalises wday/yday/isdst.
+        return (r[0] == 1 and r[2] == tm.tm_sec and r[3] == tm.tm_min
+                and r[4] == tm.tm_hour and r[5] == tm.tm_mday
+                and r[6] == tm.tm_mon - 1 and r[7] == tm.tm_year - 1900)
+    except OSError:
+        return False
+
+
+def rtc_clear_wake():
+    """Disable the wake alarm. enabled=0 must still carry a VALID date — a zero
+    date is rejected with EINVAL (verified on hardware)."""
+    if POWER_MOCK:
+        _MOCK_WAKE["fire_at"] = 0
+        return True
+    if not rtc_available():
+        return False
+    try:
+        with RTC_LOCK:
+            with open(RTC_DEV, "rb") as fd:
+                tm = time.gmtime(_rtc_now_epoch(fd))
+                clr = struct.pack(_RTC_WK, 0, 0, tm.tm_sec, tm.tm_min, tm.tm_hour,
+                                  tm.tm_mday, tm.tm_mon - 1, tm.tm_year - 1900,
+                                  tm.tm_wday, tm.tm_yday, tm.tm_isdst)
+                fcntl.ioctl(fd, RTC_WKALM_SET, clr)
+        return True
+    except OSError:
+        return False
+
+
+def power_schedule_info():
+    """The /api/power/schedule payload."""
+    return {
+        "sleep": sleep_info(),
+        "wake": rtc_wake_info(),
+        "wake_available": rtc_available(),
+        "limits": {"sleep_min_s": SLEEP_MIN_S, "sleep_max_s": SLEEP_MAX_S,
+                   "wake_min_s": WAKE_MIN_S, "wake_max_s": WAKE_MAX_S},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Mock mode
 # ---------------------------------------------------------------------------
 
@@ -580,6 +954,8 @@ def mock_status():
             {"mount": "/var", "total_gb": 465.1, "used_gb": 198.2,
              "free_gb": 266.9, "pct": 43},
         ],
+        "net": {"iface": "eth0", "mac": "de:ad:be:ef:00:01",
+                "wired": True, "wol_armed": True},
         "agent_version": VERSION,
     }
 
@@ -698,6 +1074,22 @@ STEAM_TOOL_APPIDS = frozenset({
     "1493710",  # Proton Experimental
 })
 
+# appmanifest StateFlags bits meaning "an operation is in progress". A game is
+# reported in /api/downloads ONLY when one of these is set, or when its byte
+# counters prove an incomplete transfer — an allowlist, never "anything != 4".
+DL_UPDATE_RUNNING = 256
+DL_UPDATE_STARTED = 512
+DL_UPDATE_STOPPING = 1024
+DL_UNINSTALLING = 2048        # excluded: an uninstall is not a download
+DL_VALIDATING = 131072
+DL_PREALLOCATING = 524288
+DL_DOWNLOADING = 1048576
+DL_STAGING = 2097152
+DL_COMMITTING = 4194304
+DL_ACTIVE_OP = (DL_UPDATE_RUNNING | DL_UPDATE_STARTED | DL_UPDATE_STOPPING
+                | DL_VALIDATING | DL_PREALLOCATING | DL_DOWNLOADING
+                | DL_STAGING | DL_COMMITTING)
+
 
 def _steam_root():
     """Return the first existing Steam root path, or None (never raises)."""
@@ -714,8 +1106,9 @@ def _steam_root():
 def _parse_vdf_paths(text):
     """Extract library "path" values from a libraryfolders.vdf blob.
 
-    Best-effort line scan for `"path"   "<value>"`; the VDF is a simple quoted
-    key/value tree and we only need the path strings. Never raises.
+    Steam's VDF has no stdlib parser and the agent ships pure-stdlib (no pip on
+    immutable distros), so rather than vendor a parser we line-scan for the one
+    thing needed here: `"path"   "<value>"`. Best-effort; never raises.
     """
     paths = []
     for line in text.splitlines():
@@ -763,11 +1156,12 @@ def _steam_libraries(root):
     return libs
 
 
-def _parse_acf(text):
+def _parse_acf(text, keys=("appid", "name")):
     """Extract simple quoted top-level keys from an appmanifest .acf blob.
 
-    Returns a dict of the string keys we care about ("appid", "name"). The ACF
-    format is `"key"  "value"` lines; we scan for those two. Never raises.
+    Returns a dict of the requested string keys. The ACF format is
+    `"key"  "value"` lines; we scan for the ones named in `keys` (default
+    "appid"/"name", so existing callers are unchanged). Never raises.
     """
     out = {}
     for line in text.splitlines():
@@ -778,7 +1172,7 @@ def _parse_acf(text):
         if end <= 1:
             continue
         key = s[1:end]
-        if key not in ("appid", "name"):
+        if key not in keys:
             continue
         rest = s[end + 1:].lstrip()
         if len(rest) >= 2 and rest[0] == '"':
@@ -838,6 +1232,128 @@ def discover_steam_games():
         return launchers
     except Exception:
         return []
+
+
+def _acf_int(s):
+    """Parse an ACF numeric string to int; 0 on missing/garbage (never raises)."""
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _download_state(flags):
+    """Map StateFlags to a coarse, user-facing operation label."""
+    if flags & (DL_DOWNLOADING | DL_PREALLOCATING):
+        return "downloading"
+    if flags & DL_VALIDATING:
+        return "validating"
+    if flags & (DL_STAGING | DL_COMMITTING):
+        return "finalizing"
+    if flags & (DL_UPDATE_RUNNING | DL_UPDATE_STARTED | DL_UPDATE_STOPPING):
+        return "updating"
+    # Incomplete bytes with no active-op bit: paused and queued look identical
+    # in the appmanifest, so report the more useful "paused".
+    return "paused"
+
+
+def steam_downloads():
+    """Steam apps with an in-progress download/update/validation, best-effort.
+
+    Read-only; any failure yields [] rather than raising. Walks the same
+    libraries as discover_steam_games() but reads StateFlags + byte counters
+    from each appmanifest. Inclusion is an allowlist: an app is reported only
+    when an active-op bit is set OR its byte counters prove an incomplete
+    transfer. Uninstalls (2048) and fully-installed / stale pending-update
+    entries with equal counters are omitted, so the list reflects only what is
+    actually moving.
+    """
+    try:
+        root = _steam_root()
+        if root is None:
+            return []
+        keys = ("appid", "name", "StateFlags", "BytesToDownload", "BytesDownloaded")
+        found = {}  # appid(str) -> dict
+        for steamapps in _steam_libraries(root):
+            try:
+                manifests = glob.glob(os.path.join(steamapps, "appmanifest_*.acf"))
+            except Exception:
+                continue
+            for mf in manifests:
+                try:
+                    with open(mf, "r", encoding="utf-8", errors="replace") as f:
+                        fields = _parse_acf(f.read(), keys=keys)
+                except OSError:
+                    continue
+                except Exception:
+                    continue
+                appid = fields.get("appid")
+                name = fields.get("name")
+                if not appid or not appid.isdigit() or not name:
+                    continue
+                if _is_steam_tool(appid, name):
+                    continue
+                flags = _acf_int(fields.get("StateFlags"))
+                total = _acf_int(fields.get("BytesToDownload"))
+                done = _acf_int(fields.get("BytesDownloaded"))
+                if flags & DL_UNINSTALLING:
+                    continue  # uninstall in progress, not a download
+                incomplete = total > 0 and done < total
+                if not (flags & DL_ACTIVE_OP) and not incomplete:
+                    # Fully installed, or a stale flags==6 pending-update entry
+                    # whose byte counters are equal: nothing is moving.
+                    continue
+                percent = (
+                    int(max(0, min(100, round(done * 100.0 / total)))) if total > 0 else 0
+                )
+                found[appid] = {
+                    "appid": int(appid),
+                    "name": name,
+                    "state": _download_state(flags),
+                    "bytes_total": total,
+                    "bytes_downloaded": done,
+                    "percent": percent,
+                }
+        order = {"downloading": 0, "paused": 1}
+        items = list(found.values())
+        items.sort(key=lambda d: (order.get(d["state"], 2), d["name"].lower(), d["appid"]))
+        return items
+    except Exception:
+        return []
+
+
+# Steam caches each game's portrait "library capsule" (600x900 cover art) on
+# disk under the Steam root. Two on-disk layouts exist across Steam versions;
+# the app fetches this from the agent (never a CDN) so it stays LAN-only.
+STEAM_COVER_CACHE = ("appcache", "librarycache")
+
+
+def _steam_cover_path(appid):
+    """Local path to the 600x900 library cover for a Steam appid, or None.
+
+    Looks in <root>/appcache/librarycache/ for both known layouts:
+      new (2023+):  <appid>/library_600x900.jpg
+      old (flat):   <appid>_library_600x900.jpg
+    appid must be all-digits (caller-validated too) so the path can never
+    escape the cache dir. Read-only, best-effort; never raises.
+    """
+    if not (isinstance(appid, str) and appid.isdigit()):
+        return None
+    root = _steam_root()
+    if root is None:
+        return None
+    cache = os.path.join(root, *STEAM_COVER_CACHE)
+    candidates = (
+        os.path.join(cache, appid, "library_600x900.jpg"),
+        os.path.join(cache, "%s_library_600x900.jpg" % appid),
+    )
+    for p in candidates:
+        try:
+            if os.path.isfile(p):
+                return p
+        except OSError:
+            continue
+    return None
 
 
 def list_launchers():
@@ -919,6 +1435,25 @@ def mock_launch(argv):
     """--mock stand-in: log the argv, never execute anything real."""
     print("[launch] %s" % " ".join(argv), flush=True)
     return {"ok": True}
+
+
+_MOCK_DL_PCT = 0
+
+
+def mock_downloads():
+    """--mock stand-in: one advancing download (0->100%, +7% per poll so the
+    progress bar visibly moves) and one paused entry. No real Steam needed."""
+    global _MOCK_DL_PCT
+    _MOCK_DL_PCT = (_MOCK_DL_PCT + 7) % 101
+    total = 42_000_000_000
+    done = int(total * _MOCK_DL_PCT / 100)
+    return [
+        {"appid": 1091500, "name": "Cyberpunk 2077", "state": "downloading",
+         "bytes_total": total, "bytes_downloaded": done, "percent": _MOCK_DL_PCT},
+        {"appid": 570, "name": "Dota 2", "state": "paused",
+         "bytes_total": 18_000_000_000, "bytes_downloaded": 5_400_000_000,
+         "percent": 30},
+    ]
 
 
 def _slugify_label(label):
@@ -1034,6 +1569,1421 @@ def delete_launcher(launcher_id):
 
 
 # ---------------------------------------------------------------------------
+# TV control (probe-and-appear): three interchangeable backends
+#
+# GET  /api/tv        -> {"available": true, "backend": "...", "adapter": "...",
+#                         "ops": [...]}
+# POST /api/tv/<op>   -> ActionResult; op ∈ TV_OPS
+#
+# The app polls GET /api/tv once per box connect and shows a compact TV strip
+# only when a backend answers; both routes 404 like any unknown route when no
+# backend is present, so a box with no TV hardware surfaces no strip. The "ops"
+# list tells the app which controls the active backend supports, so it can hide
+# the power buttons on a backend that only does volume.
+#
+# Backends, preferred in this order:
+#   panel: RS-232 serial control (e.g. Newline TruTouch). CONFIG-DRIVEN: only
+#           active when config.json names a serial device (never auto-probed,
+#           so we never blast command frames at an unrelated tty). Reliable:
+#           the panel MCU listens even in standby, so power-on-from-off works.
+#   cec:   HDMI-CEC via cec-ctl (kernel framework) or cec-client (libcec).
+#           Auto-probed; only counts when the HDMI connector is actually live.
+#   soft:  the box's own volume via the OS media keys (uinput), like a hardware
+#           volume rocker. Volume and mute only, no power. Lowest priority, so it
+#           appears as a fallback when neither panel nor CEC can drive the TV.
+#
+# Unified ops (TV_OPS): power_on, power_off, volume_up, volume_down, mute. The
+# soft backend serves the volume/mute subset (SOFT_OPS) and rejects power ops.
+# CEC has no discrete "off": power_off maps to CEC standby.
+# ---------------------------------------------------------------------------
+
+TV_OPS = ("power_on", "power_off", "volume_up", "volume_down", "mute")
+
+# ---- CEC backend ----------------------------------------------------------
+# CEC availability is re-evaluated CHEAPLY per request (see cec_current), not
+# frozen at startup: the kernel-CEC path is a few sysfs reads, so a TV powered
+# on after the agent started becomes controllable without a restart, and a dark
+# HDMI port stays hidden. Only the expensive libcec probe (a ~6 s cec-client
+# shell-out) is done once at startup and cached in CEC_LIBCEC.
+CEC_CTL_BIN = None   # path to cec-ctl if on PATH, else None (set at startup)
+CEC_LIBCEC = None    # cached libcec descriptor {tool,bin,device,adapter} or None
+
+
+def _cec_connector_status(dev):
+    """DRM connector status ('connected'/'disconnected'/…) for a /dev/cecN, or
+    None if it can't be mapped. The kernel nests each CEC device's sysfs node
+    under its HDMI connector dir, e.g. /sys/class/drm/card1/card1-HDMI-A-1/cec0.
+    """
+    name = os.path.basename(dev)
+    try:
+        for status_path in glob.glob("/sys/class/drm/*/*/status"):
+            if os.path.isdir(os.path.join(os.path.dirname(status_path), name)):
+                with open(status_path) as f:
+                    return f.read().strip()
+    except OSError:
+        return None
+    return None
+
+
+def _usable_cec_dev():
+    """First /dev/cec[0-9] whose HDMI connector is not 'disconnected'. Skips
+    adapters bound to a dark port (box HDMI unplugged, display on DisplayPort)
+    so the TV strip never appears over a dead CEC bus. A device whose connector
+    can't be mapped (status None) is permitted: unknown != disconnected.
+
+    Because cec_current() calls this per request, a display that asserts HPD
+    (any powered-on TV, and the many TVs that keep HPD live in standby) is
+    picked up dynamically; only a TV in deep-off that drops HPD is missed until
+    it is woken once by other means (such TVs rarely CEC-wake reliably anyway)."""
+    for dev in sorted(glob.glob("/dev/cec[0-9]")):
+        if _cec_connector_status(dev) != "disconnected":
+            return dev
+    return None
+
+
+def _libcec_has_adapter(cec_client_bin):
+    """True if libcec's `cec-client -l` enumerates at least one adapter
+    (e.g. a Pulse-Eight USB-CEC dongle). Never raises; false on any failure."""
+    try:
+        r = subprocess.run([cec_client_bin, "-l"], capture_output=True,
+                           timeout=6)
+    except Exception:
+        return False
+    # cec-client's `-l` output format shifts between libcec versions: newer
+    # builds print a "COM port:" line per adapter, older ones only a "Found
+    # devices: N" summary line, so accept either as proof of an adapter.
+    out = (r.stdout or b"").decode("utf-8", "replace").lower()
+    if "com port:" in out:
+        return True
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("found devices:"):
+            try:
+                return int(s.split(":", 1)[1].strip()) > 0
+            except ValueError:
+                return False
+    return False
+
+
+def set_cec(mock):
+    """Startup CEC probe: cache cec-ctl's presence and (via one ~6 s shell-out)
+    whether libcec sees an adapter. In --mock no CEC is registered: the mock
+    TV strip runs on the panel backend (see set_panel) so development exercises
+    the serial path the user is building toward."""
+    global CEC_CTL_BIN, CEC_LIBCEC
+    if mock:
+        CEC_CTL_BIN = None
+        CEC_LIBCEC = None
+        return
+    CEC_CTL_BIN = shutil.which("cec-ctl")
+    client = shutil.which("cec-client")
+    if client and _libcec_has_adapter(client):
+        CEC_LIBCEC = {"tool": "cec-client", "bin": client, "device": None,
+                      "adapter": "libcec adapter"}
+    else:
+        CEC_LIBCEC = None
+
+
+def cec_current():
+    """Live CEC descriptor, recomputed cheaply per call, or None. Prefers the
+    kernel framework (cec-ctl) on a connected /dev/cec port (re-checked each
+    call), then the cached libcec adapter. Never raises."""
+    try:
+        if CEC_CTL_BIN:
+            dev = _usable_cec_dev()
+            if dev:
+                return {"tool": "cec-ctl", "bin": CEC_CTL_BIN, "device": dev,
+                        "adapter": "kernel CEC (%s)" % dev}
+    except Exception:
+        pass
+    return CEC_LIBCEC
+
+
+def cec_available():
+    return cec_current() is not None
+
+
+def _cec_argv(cec, op):
+    """Return (argv, stdin_bytes|None) for a CEC op against descriptor <cec>.
+    Ops here are the CEC-internal names (power_on/standby/volume_*/mute). All
+    target the TV (logical address 0); volume/mute use CEC User Control (UI)
+    commands, which a TV forwards to an ARC audio system when system-audio is
+    on."""
+    if cec["tool"] == "cec-ctl":
+        base = [cec["bin"], "-d", cec["device"], "--to", "0"]
+        if op == "power_on":
+            return base + ["--image-view-on"], None
+        if op == "standby":
+            return base + ["--standby"], None
+        ui = {"volume_up": "volume-up", "volume_down": "volume-down",
+              "mute": "mute"}[op]
+        # Press + release in one invocation is the one-shot UI-command idiom.
+        return base + ["--user-control-pressed", "ui-cmd=" + ui,
+                       "--user-control-released"], None
+    # cec-client (libcec): single-command mode (-s), command on stdin.
+    cmd = {"power_on": "on 0", "standby": "standby 0", "volume_up": "volup",
+           "volume_down": "voldown", "mute": "mute"}[op]
+    return [cec["bin"], "-s", "-d", "1"], (cmd + "\n").encode("ascii")
+
+
+def real_cec(op):
+    """Run a CEC op via a one-shot arg-list subprocess. ActionResult-shaped."""
+    start = time.monotonic()
+    cec = cec_current()
+    if cec is None:  # raced from available to gone (TV/HDMI dropped)
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "cec backend unavailable", "duration_ms": 0}
+    argv, stdin = _cec_argv(cec, op)
+    try:
+        r = subprocess.run(argv, input=stdin, capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "cec command timed out",
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    except Exception as e:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "%s: %s" % (e.__class__.__name__, e),
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    out = (r.stdout or b"").decode("utf-8", "replace")
+    err = (r.stderr or b"").decode("utf-8", "replace")
+    return {"ok": r.returncode == 0, "exit_code": r.returncode,
+            "stdout": out, "stderr": err,
+            "duration_ms": int((time.monotonic() - start) * 1000)}
+
+
+def mock_cec(op):
+    """--mock stand-in for a CEC op: log it, never touch hardware, succeed."""
+    time.sleep(0.1)
+    print("[cec] %s" % op, flush=True)
+    return {"ok": True, "exit_code": 0, "stdout": "[mock cec] %s\n" % op,
+            "stderr": "", "duration_ms": 100}
+
+
+# ---- panel backend (RS-232 serial) ----------------------------------------
+# Supported serial line speeds (int -> termios constant). Membership is also
+# the config validator for panel.baud (see _parse_config).
+PANEL_BAUDS = {
+    9600: termios.B9600,
+    19200: termios.B19200,
+    38400: termios.B38400,
+    57600: termios.B57600,
+    115200: termios.B115200,
+}
+
+# Newline TruTouch RS-232 protocol (19200 8N1). Frame is a fixed 9-byte header,
+# a one-byte key code, then a 0xCF terminator: 7F 08 99 A2 B3 C4 02 FF 01 XX CF.
+# The panel echoes 7F 09 99 A2 B3 C4 02 FF 01 XX 01 CF on success.
+PANEL_FRAME_HEAD = bytes([0x7F, 0x08, 0x99, 0xA2, 0xB3, 0xC4, 0x02, 0xFF, 0x01])
+PANEL_FRAME_TAIL = 0xCF
+PANEL_CODES = {
+    "power_on": 0x00,
+    "power_off": 0x01,
+    "mute": 0x02,
+    "volume_down": 0x17,
+    "volume_up": 0x18,
+    # Select the OPS / Internal-PC input (the slot the box lives in), so a phone
+    # tap pulls the panel back to the box from any other source. Validated on a
+    # Newline TruTouch TT-7516UB; the OPS select code is shared across the UB/C
+    # series. Panel-only: CEC/soft have no input-select equivalent.
+    "source_box": 0x38,
+    # Toggle the panel backlight (screen dark / lit) WITHOUT touching power. On
+    # OPS displays, standby cuts power to the OPS slot and kills the box, so this
+    # is the way to "turn the screen off" while the box keeps running in the
+    # background. Toggle-only (the panel exposes no readable backlight state on
+    # this firmware). Validated on a TT-7516UB: box stayed reachable after blank.
+    "screen_toggle": 0x15,
+}
+
+# Ordered display inputs the Newline RS-232 panel can switch to, surfaced to the
+# app as a source picker. Codes validated on a TT-7516UB (OPS / HDMI 1 / Home
+# confirmed live; HDMI 2 / HDMI 3 per the Newline UB/C/STV code tables). This is
+# panel-only: CEC cannot arbitrarily route a display's input from the box side.
+PANEL_SOURCES = (
+    ("ops", "Box (OPS)", 0x38),
+    ("hdmi1", "HDMI 1", 0x0A),
+    ("hdmi2", "HDMI 2", 0x52),
+    ("hdmi3", "HDMI 3", 0x53),
+    ("home", "Home", 0x1C),
+)
+PANEL_SOURCE_CODES = {sid: code for (sid, _label, code) in PANEL_SOURCES}
+
+# Factory-remote keys (Newline UB/C/STV code tables; OK/arrows/menu/home/return
+# validated against the UB manual). Lets the app emulate the physical Newline
+# remote entirely over RS-232: navigate the panel OSD / Android home, open its
+# menu and settings, without the IR remote. Panel-only.
+PANEL_KEYS = {
+    "up": 0x2E,
+    "down": 0x2F,
+    "left": 0x2C,
+    "right": 0x2D,
+    "ok": 0x2B,
+    "menu": 0x1B,
+    "home": 0x1C,
+    "back": 0x1D,
+    "settings": 0x20,
+    "bright_up": 0x47,
+    "bright_down": 0x48,
+}
+
+# Absolute-volume closed loop bounds. The panel has no working absolute-set
+# command (0x05 ACKs but does nothing on the UB), yet volume READ (0x33) tracks
+# step-by-step exactly, so absolute set = read, then step vol+/- until the
+# target is reached. 110 caps a full 0->100 sweep with margin.
+PANEL_VOL_MAX_STEPS = 110
+
+# Populated at startup by set_panel(); {"device","baud","protocol"} or None.
+PANEL = None
+
+# One transaction on the panel's serial line at a time. The HTTP server is
+# threaded, so a tv_info poll (volume read) can otherwise interleave with a
+# running volume closed loop on the same /dev/ttyS*, crossing their replies.
+PANEL_IO_LOCK = threading.Lock()
+
+
+def _panel_frame(op):
+    """Build the 11-byte Newline command frame for a unified TV op."""
+    return PANEL_FRAME_HEAD + bytes([PANEL_CODES[op], PANEL_FRAME_TAIL])
+
+
+def _hexstr(b):
+    return " ".join("%02X" % x for x in b)
+
+
+def _serial_send(device, baud, frame, expect_reply=True, timeout=1.0):
+    """Open <device> raw at <baud> 8N1 (pure stdlib termios), write <frame>
+    bytes, optionally read a short reply. Returns the reply bytes (may be
+    empty). Raises OSError on open/IO failure. Serialized on PANEL_IO_LOCK so
+    threaded HTTP handlers can't interleave transactions on the one line."""
+    with PANEL_IO_LOCK:
+        return _serial_send_locked(device, baud, frame, expect_reply, timeout)
+
+
+def _serial_send_locked(device, baud, frame, expect_reply, timeout):
+    speed = PANEL_BAUDS[baud]
+    fd = os.open(device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        iflag, oflag, cflag, lflag, _ispeed, _ospeed, cc = termios.tcgetattr(fd)
+        # 8 data bits, no parity, 1 stop bit, ignore modem lines, receiver on.
+        cflag = (cflag & ~termios.CSIZE) | termios.CS8
+        cflag &= ~(termios.PARENB | termios.CSTOPB)
+        if hasattr(termios, "CRTSCTS"):
+            cflag &= ~termios.CRTSCTS
+        cflag |= (termios.CLOCAL | termios.CREAD)
+        iflag &= ~(termios.IXON | termios.IXOFF | termios.IXANY)
+        iflag &= ~(termios.INLCR | termios.IGNCR | termios.ICRNL)
+        oflag &= ~termios.OPOST
+        lflag &= ~(termios.ICANON | termios.ECHO | termios.ECHOE | termios.ISIG)
+        termios.tcsetattr(fd, termios.TCSANOW,
+                          [iflag, oflag, cflag, lflag, speed, speed, cc])
+        termios.tcflush(fd, termios.TCIOFLUSH)
+        # Write fully (device opened non-blocking; a short frame won't block,
+        # but loop defensively on partial writes).
+        mv = memoryview(frame)
+        wdeadline = time.monotonic() + timeout
+        while mv:
+            try:
+                n = os.write(fd, mv)
+                mv = mv[n:]
+            except BlockingIOError:
+                if time.monotonic() >= wdeadline:
+                    raise
+                select.select([], [fd], [], max(0.0, wdeadline - time.monotonic()))
+        termios.tcdrain(fd)
+        reply = b""
+        if expect_reply:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                r, _, _ = select.select([fd], [], [],
+                                        max(0.0, deadline - time.monotonic()))
+                if not r:
+                    break
+                try:
+                    chunk = os.read(fd, 64)
+                except (BlockingIOError, OSError):
+                    break
+                if not chunk:
+                    break
+                reply += chunk
+                if len(reply) >= 12:  # a full Newline return frame
+                    break
+        return reply
+    finally:
+        os.close(fd)
+
+
+def set_panel(mock):
+    """Populate the panel descriptor. In --mock a fake serial device is always
+    reported so the TV strip can be developed before the RS-232 adapter exists.
+    Real mode: active only when config.json named a serial device that exists."""
+    global PANEL
+    if mock:
+        PANEL = {"device": "mock", "baud": 19200, "protocol": "newline"}
+    elif CONFIG_PANEL and os.path.exists(CONFIG_PANEL["device"]):
+        PANEL = dict(CONFIG_PANEL)
+    else:
+        PANEL = None
+
+
+def panel_available():
+    return PANEL is not None
+
+
+def _panel_send_code(code):
+    """Send one raw Newline key code over the serial line. Success means the
+    frame was written (the panel may or may not reply); the reply, if any, is
+    echoed in stdout for diagnostics. ActionResult-shaped."""
+    start = time.monotonic()
+    frame = PANEL_FRAME_HEAD + bytes([code, PANEL_FRAME_TAIL])
+    try:
+        reply = _serial_send(PANEL["device"], PANEL["baud"], frame)
+    except Exception as e:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "%s: %s" % (e.__class__.__name__, e),
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    stdout = "sent %s | reply %s" % (
+        _hexstr(frame), _hexstr(reply) if reply else "(none)")
+    return {"ok": True, "exit_code": 0, "stdout": stdout, "stderr": "",
+            "duration_ms": int((time.monotonic() - start) * 1000)}
+
+
+def real_panel(op):
+    """Send the Newline command frame for a unified TV op. ActionResult-shaped."""
+    return _panel_send_code(PANEL_CODES[op])
+
+
+def real_panel_source(sid):
+    """Switch the panel to display input <sid> (see PANEL_SOURCES)."""
+    return _panel_send_code(PANEL_SOURCE_CODES[sid])
+
+
+def real_panel_key(key):
+    """Send one factory-remote key (see PANEL_KEYS) to the panel."""
+    return _panel_send_code(PANEL_KEYS[key])
+
+
+def _panel_read_volume():
+    """Current panel speaker volume (0-100 int), or None if unreadable. Uses the
+    0x33 status query; the reply carries the level at byte 10:
+    7F 09 99 A2 B3 C4 02 FF 01 33 <VOL> CF."""
+    frame = PANEL_FRAME_HEAD + bytes([0x33, PANEL_FRAME_TAIL])
+    try:
+        reply = _serial_send(PANEL["device"], PANEL["baud"], frame)
+    except Exception:
+        return None
+    if len(reply) >= 12 and reply[8:10] == bytes([0x01, 0x33]):
+        return reply[10]
+    return None
+
+
+def panel_set_volume(level):
+    """Set the panel volume to <level> (0-100) via a closed loop: read the
+    current level, then step vol+/vol- until it matches. The panel ignores its
+    documented absolute-set frame, but the read tracks each step exactly (one
+    step = one unit, verified on a TT-7516UB), so stepping converges. Bails on
+    read failure or a stalled loop. ActionResult-shaped, plus "level". The whole
+    loop holds VOLUME_LOCK (individual frames are already serialized by
+    PANEL_IO_LOCK, but two overlapping loops would still interleave steps)."""
+    with VOLUME_LOCK:
+        return _panel_set_volume_locked(level)
+
+
+def _panel_set_volume_locked(level):
+    start = time.monotonic()
+    level = max(0, min(100, int(level)))
+
+    def result(ok, cur, note):
+        return {"ok": ok, "exit_code": 0 if ok else -1,
+                "stdout": note, "stderr": "" if ok else note, "level": cur,
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+
+    cur = _panel_read_volume()
+    if cur is None:
+        return result(False, None, "panel volume unreadable")
+    steps = 0
+    while cur != level and steps < PANEL_VOL_MAX_STEPS:
+        code = 0x18 if level > cur else 0x17  # vol+ / vol-
+        r = _panel_send_code(code)
+        if not r["ok"]:
+            return result(False, cur, "step failed: %s" % r["stderr"])
+        steps += 1
+        # The panel ACKs the key before it applies the level change, so give it
+        # a moment to settle before reading — an immediate read sees the OLD
+        # value and would misdiagnose a stall (measured on the TT-7516UB).
+        time.sleep(0.12)
+        nxt = _panel_read_volume()
+        if nxt == cur:  # slow apply? one grace re-read before declaring a stall
+            time.sleep(0.2)
+            nxt = _panel_read_volume()
+        if nxt is None:
+            return result(False, cur, "panel volume unreadable mid-loop")
+        if nxt == cur:  # panel stopped moving (limit or wedged) — don't spin
+            return result(nxt == level, nxt,
+                          "stalled at %d after %d steps" % (nxt, steps))
+        cur = nxt
+    return result(cur == level, cur, "level %d in %d steps" % (cur, steps))
+
+
+def mock_panel(op):
+    """--mock stand-in: log the frame that would go out, never open a device."""
+    time.sleep(0.1)
+    frame = _panel_frame(op)
+    print("[panel] %s -> %s" % (op, _hexstr(frame)), flush=True)
+    return {"ok": True, "exit_code": 0,
+            "stdout": "[mock panel] %s -> %s\n" % (op, _hexstr(frame)),
+            "stderr": "", "duration_ms": 100}
+
+
+# ---- soft backend (box volume via the OS media keys) ----------------------
+# Controls the box's own volume by emitting the KEY_VOLUMEUP/DOWN/MUTE media
+# keys through uinput, exactly as the hardware volume rocker does. This matters
+# on SteamOS Game Mode: Steam manages its own volume node and shows an on-screen
+# volume OSD in response to those keys, whereas a direct wpctl change to the
+# default sink neither shows the OSD nor affects what Steam is playing. Volume
+# and mute only (there is no power key), and it is the lowest-priority backend,
+# so it appears only when neither panel nor CEC drives the TV. Uses the virtual
+# media-key device (see UInputMediaKeys), so it needs /dev/uinput, never sudo.
+SOFT_OPS = ("volume_up", "volume_down", "mute")
+SOFT = None           # {"adapter": ...} when the media-key device exists, else None
+_MEDIA_DEV = None      # the persistent UInputMediaKeys device, created by set_soft
+_PRE_MUTE_VOL = None   # volume before we muted, so unmute restores it (see _soft_mute)
+
+# Serializes stateful volume transactions (mute's read-modify-write of the sink
+# + _PRE_MUTE_VOL, and both absolute-set convergence loops). The HTTP server is
+# threaded; two overlapping loops would fight step-against-step and the stale
+# request could win.
+VOLUME_LOCK = threading.Lock()
+
+
+def set_soft(mock):
+    """Create the virtual media-key device at startup. It is built once, up
+    front, rather than on first use, because the compositor does not read a
+    freshly hot-plugged input device for a second or two, which would silently
+    drop the first volume presses. Creating it early gives gamescope time to
+    enumerate it well before anyone touches volume. In --mock the soft backend
+    stays off so the mock TV strip runs on the panel path. SOFT is set only when
+    the device is created."""
+    global SOFT, _MEDIA_DEV
+    if mock:
+        SOFT = None
+        return
+    if _MEDIA_DEV is None:
+        try:
+            _MEDIA_DEV = UInputMediaKeys()
+        except Exception:
+            _MEDIA_DEV = None
+    SOFT = {"adapter": "OS volume keys"} if _MEDIA_DEV is not None else None
+
+
+def soft_available():
+    return SOFT is not None
+
+
+def real_soft(op):
+    """Change box volume. Volume up/down emit media keys via the media-key device
+    so the OS moves the volume and (in Game Mode) shows its OSD. Mute drives the
+    volume to 0 the same way (see _soft_mute), because gamescope does not bind
+    KEY_MUTE. ActionResult-shaped. Power ops are rejected (no volume key)."""
+    start = time.monotonic()
+    if op == "mute":
+        return _soft_mute(start)
+    code = SOFT_MEDIA_KEYS.get(op)
+    if code is None:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "%s is not a volume op" % op, "duration_ms": 0}
+    if _MEDIA_DEV is None:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "media-key device unavailable",
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    try:
+        _MEDIA_DEV.tap(code)
+    except OSError as e:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "%s: %s" % (e.__class__.__name__, e),
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    return {"ok": True, "exit_code": 0, "stdout": "sent %s" % op, "stderr": "",
+            "duration_ms": int((time.monotonic() - start) * 1000)}
+
+
+def _wpctl_volume_line():
+    """Raw 'wpctl get-volume @DEFAULT_AUDIO_SINK@' stdout, or None if unreadable.
+    Looks like 'Volume: 0.45' or 'Volume: 0.00 [MUTED]'."""
+    wp = shutil.which("wpctl")
+    if wp is None:
+        return None
+    try:
+        r = subprocess.run([wp, "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                           capture_output=True, timeout=4, env=_user_env())
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return (r.stdout or b"").decode("utf-8", "replace")
+
+
+def _soft_muted():
+    """Current mute state of the box's default sink (True/False), or None if it
+    can't be read. Volume 0 counts as muted: driving the volume to 0 with the
+    media key is exactly how mute is applied, and the sink reads '[MUTED]' there."""
+    line = _wpctl_volume_line()
+    if line is None:
+        return None
+    return "MUTED" in line.upper()
+
+
+def _soft_volume():
+    """Current box volume as a float (0.0-1.0+), or None if unreadable."""
+    line = _wpctl_volume_line()
+    if line is None:
+        return None
+    for tok in line.split():
+        try:
+            return float(tok)
+        except ValueError:
+            continue
+    return None
+
+
+def _wpctl_set(*args):
+    """Run 'wpctl <args>' in the user's audio session. Returns the CompletedProcess
+    or None if wpctl is missing / the call raised."""
+    wp = shutil.which("wpctl")
+    if wp is None:
+        return None
+    try:
+        return subprocess.run([wp] + list(args), capture_output=True,
+                              timeout=4, env=_user_env())
+    except Exception:
+        return None
+
+
+def _soft_mute(start):
+    """Toggle box mute. gamescope binds no KEY_MUTE and shows no mute OSD, so a
+    plain wpctl mute would be invisible on the panel. Instead mute drives the
+    volume to 0 with the volume-down media key: that fires the on-screen volume
+    OSD (bar empties to the muted-speaker icon) AND leaves the sink '[MUTED]'.
+    The pre-mute level is saved so unmute restores it. ActionResult-shaped with a
+    "muted" field for the app's own indicator. Serialized on VOLUME_LOCK: it is
+    a read-modify-write of sink state + _PRE_MUTE_VOL, and a double-tap from the
+    app would otherwise interleave two toggles into a wrong final state."""
+    global _PRE_MUTE_VOL
+    with VOLUME_LOCK:
+        return _soft_mute_locked(start)
+
+
+def _soft_mute_locked(start):
+    global _PRE_MUTE_VOL
+    def result(ok, muted, stdout="", stderr=""):
+        return {"ok": ok, "exit_code": 0 if ok else -1, "stdout": stdout,
+                "stderr": stderr, "muted": muted,
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    if shutil.which("wpctl") is None:
+        return result(False, None, stderr="wpctl not found for mute")
+    if _soft_muted():
+        # Unmute: clear the flag and restore the volume we saved when muting.
+        _wpctl_set("set-mute", "@DEFAULT_AUDIO_SINK@", "0")
+        if _PRE_MUTE_VOL is not None:
+            _wpctl_set("set-volume", "@DEFAULT_AUDIO_SINK@", "%.2f" % _PRE_MUTE_VOL)
+            _PRE_MUTE_VOL = None
+        return result(True, False, stdout="unmuted")
+    # Mute: remember the current level, drop just above zero silently, then one
+    # volume-down media key to land on 0 with the OSD showing. Keep an already
+    # saved pre-mute level: the media tap applies asynchronously, so a rapid
+    # second toggle can arrive while the sink still reads unmuted at 0.02 —
+    # overwriting would trade the user's real level for that 2%.
+    if _PRE_MUTE_VOL is None:
+        _PRE_MUTE_VOL = _soft_volume()
+    _wpctl_set("set-volume", "@DEFAULT_AUDIO_SINK@", "0.02")
+    tapped = False
+    if _MEDIA_DEV is not None:
+        try:
+            _MEDIA_DEV.tap(KEY_VOLUMEDOWN)
+            tapped = True
+        except OSError:
+            tapped = False
+    if tapped:
+        # Wait for the compositor to apply the tap so the sink reads [MUTED]
+        # before the lock releases — a back-to-back toggle then sees the truth.
+        deadline = time.monotonic() + 0.6
+        while time.monotonic() < deadline:
+            time.sleep(0.08)
+            if _soft_muted():
+                break
+        else:
+            tapped = False  # never landed; fall through to the direct flag
+    if not tapped:
+        # No media-key device (or it failed): no OSD is possible, so just set the
+        # mute flag directly. Correct state, only the on-screen indicator is lost.
+        _wpctl_set("set-mute", "@DEFAULT_AUDIO_SINK@", "1")
+    return result(True, True, stdout="muted")
+
+
+def soft_set_volume(level):
+    """Set the box volume to <level> percent (0-100). Prefers media-key stepping
+    (Game Mode shows its OSD and Steam tracks it; direct wpctl writes are
+    invisible there), converging via a closed loop on the sink's real level. If
+    stepping doesn't move the sink (desktop session with no key handler), falls
+    back to one direct wpctl set. ActionResult-shaped, plus "level". Serialized
+    on VOLUME_LOCK so two overlapping sets can't fight step-against-step."""
+    with VOLUME_LOCK:
+        return _soft_set_volume_locked(level)
+
+
+def _soft_set_volume_locked(level):
+    global _PRE_MUTE_VOL
+    start = time.monotonic()
+    level = max(0, min(100, int(level)))
+    target = level / 100.0
+    # Slider endpoints mean exactly "silent" / "max": no convergence tolerance
+    # there, or a request for 0 could return ok while audio still plays.
+    tol = 0.001 if level in (0, 100) else 0.025
+
+    def result(ok, cur, note):
+        return {"ok": ok, "exit_code": 0 if ok else -1,
+                "stdout": note, "stderr": "" if ok else note,
+                "level": None if cur is None else int(round(cur * 100)),
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+
+    cur = _soft_volume()
+    if cur is None:
+        return result(False, None, "box volume unreadable (wpctl)")
+    # Mute leaves the flag set at 0; a positive target should unmute first so
+    # the level change is audible (mirrors what the volume keys do). The saved
+    # pre-mute level is stale once an explicit level is chosen — drop it so a
+    # later mute/unmute cycle can't restore a forgotten volume.
+    if level > 0 and _soft_muted():
+        _wpctl_set("set-mute", "@DEFAULT_AUDIO_SINK@", "0")
+        _PRE_MUTE_VOL = None
+    for _ in range(40):  # media-key steps are ~5%, so 40 covers 0->100 twice
+        if abs(cur - target) <= tol:
+            return result(True, cur, "level %d" % int(round(cur * 100)))
+        if _MEDIA_DEV is None:
+            break
+        code = KEY_VOLUMEUP if target > cur else KEY_VOLUMEDOWN
+        try:
+            _MEDIA_DEV.tap(code)
+        except OSError:
+            break
+        time.sleep(0.08)  # let the compositor apply the step before re-reading
+        nxt = _soft_volume()
+        if nxt is None or abs(nxt - cur) < 0.001:
+            break  # no handler moving the sink — fall through to direct set
+        # Overshoot straddling the target counts as done (step > remaining gap).
+        if (cur < target < nxt) or (nxt < target < cur):
+            return result(True, nxt, "level %d" % int(round(nxt * 100)))
+        cur = nxt
+    # Direct fallback (desktop sessions; no OSD, but the level is correct).
+    r = _wpctl_set("set-volume", "@DEFAULT_AUDIO_SINK@", "%.2f" % target)
+    if r is None or r.returncode != 0:
+        return result(False, cur, "wpctl set-volume failed")
+    return result(True, target, "level %d (direct)" % level)
+
+
+def mock_soft(op):
+    """--mock stand-in for a box-volume op: log it, touch nothing, succeed."""
+    time.sleep(0.1)
+    print("[soft] %s" % op, flush=True)
+    return {"ok": True, "exit_code": 0, "stdout": "[mock soft] %s\n" % op,
+            "stderr": "", "duration_ms": 100}
+
+
+# ---- unified dispatch -----------------------------------------------------
+# CEC has no discrete power-off; its standby command IS the off state.
+_TV_TO_CEC = {"power_on": "power_on", "power_off": "standby",
+              "volume_up": "volume_up", "volume_down": "volume_down",
+              "mute": "mute"}
+
+_POWER_OPS = ("power_on", "power_off")
+
+# Ops only the RS-232 panel can do (no CEC/soft equivalent): jump to the box's
+# OPS input, and blank/unblank the screen without cutting power.
+_PANEL_ONLY_OPS = ("source_box", "screen_toggle")
+
+
+def set_tv(mock):
+    """Probe every TV backend at startup (call after load_config)."""
+    set_cec(mock)
+    set_panel(mock)
+    set_soft(mock)
+
+
+def _tv_hw_backend():
+    """The external TV backend for power (and TV volume, when chosen): the serial
+    panel first (it can power on from standby), then CEC. None when neither
+    exists. Kept separate from box volume, which the soft backend handles."""
+    if panel_available():
+        return "panel"
+    if cec_available():
+        return "cec"
+    return None
+
+
+def tv_info():
+    """GET /api/tv body, or None when nothing is controllable. The two concerns
+    are split so the app can offer box vs TV volume: tv_power/tv_volume mean an
+    external TV backend (panel/CEC) is present; box_volume means the box's own OS
+    volume (soft) is available. Volume defaults to the box (see tv_send)."""
+    hw = _tv_hw_backend()
+    box_vol = soft_available()
+    if hw is None and not box_vol:
+        return None
+    if hw == "panel":
+        backend, adapter = "panel", "Newline RS-232 (%s @ %d)" % (
+            PANEL["device"], PANEL["baud"])
+    elif hw == "cec":
+        cec = cec_current()
+        backend, adapter = "cec", (cec["adapter"] if cec else "CEC")
+    else:
+        backend, adapter = "soft", (SOFT["adapter"] if SOFT else "OS volume keys")
+    return {
+        "available": True,
+        "backend": backend,
+        "adapter": adapter,
+        "ops": list(TV_OPS),
+        "box_volume": box_vol,
+        "tv_volume": hw is not None,
+        "tv_power": hw is not None,
+        # Input source switch (jump the panel to the box's OPS input). Only the
+        # RS-232 panel backend can do it, so the app shows the button solely for
+        # panel boxes — CEC/soft boxes never see it (keeps the default UI clean).
+        "source_box": panel_available(),
+        # Full display-input picker (panel only). Each entry: {id,label}; the app
+        # POSTs /api/tv/source/<id> to switch. Empty when no panel backend.
+        "sources": ([{"id": sid, "label": label}
+                     for (sid, label, _code) in PANEL_SOURCES]
+                    if panel_available() else []),
+        # Screen blank/unblank without cutting power (keeps the box alive when an
+        # OPS display would otherwise power the box off in standby). Panel-only.
+        "screen_toggle": panel_available(),
+        # Factory-remote key emulation (arrows/ok/menu/home/back/settings) over
+        # RS-232, so the app's Remote view can drive the panel OSD. Panel-only.
+        "keys": panel_available(),
+        # Box mute state, so the app shows the right mute indicator on connect.
+        "muted": _soft_muted() if box_vol else None,
+        # Current levels (0-100 or null) so the app's volume slider can show and
+        # keep a real position. Both are cheap reads (wpctl / one serial query).
+        "box_volume_level": (None if (v := _soft_volume()) is None
+                             else max(0, min(100, int(round(v * 100)))))
+                            if box_vol else None,
+        "tv_volume_level": _panel_read_volume() if panel_available() else None,
+    }
+
+
+def _send_tv_hw(op, mock):
+    """Route an op to the external TV backend (panel/CEC), or None if neither."""
+    b = _tv_hw_backend()
+    if b == "panel":
+        return mock_panel(op) if mock else real_panel(op)
+    if b == "cec":
+        cec_op = _TV_TO_CEC[op]
+        return mock_cec(cec_op) if mock else real_cec(cec_op)
+    return None
+
+
+def tv_send(op, mock, target=None):
+    """Dispatch a TV op. Power always goes to the external TV backend. Volume
+    goes to the box's own OS volume (soft) by default, or to the TV backend when
+    target == "tv" (the app's opt-in). Falls back to whichever exists when the
+    chosen target is missing. None when nothing can handle it (caller 404s)."""
+    if op in _PANEL_ONLY_OPS:
+        # Input-select and screen-blank are panel-only (RS-232). No CEC/soft
+        # fallback exists for them.
+        if not panel_available():
+            return None
+        return mock_panel(op) if mock else real_panel(op)
+    if op in _POWER_OPS:
+        return _send_tv_hw(op, mock)
+    if target != "tv" and soft_available():
+        return mock_soft(op) if mock else real_soft(op)
+    r = _send_tv_hw(op, mock)
+    if r is not None:
+        return r
+    if soft_available():
+        return mock_soft(op) if mock else real_soft(op)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# MPRIS media-player control (now-playing + transport) over the user session
+# bus via `busctl`. Named MPRIS_*/mpris_* so it never collides with the box's
+# OS-volume media-key device (_MEDIA_DEV / SOFT_MEDIA_KEYS / UInputMediaKeys),
+# which is a different "media". No new listener/port; ships with systemd.
+# ---------------------------------------------------------------------------
+
+MPRIS_PREFIX = "org.mpris.MediaPlayer2."
+MPRIS_OBJPATH = "/org/mpris/MediaPlayer2"
+MPRIS_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
+MPRIS_MAX_PLAYERS = 8
+MPRIS_ART_MAX = 2 * 1024 * 1024  # 2 MiB read cap on album art
+
+# Fixed transport op -> Player method. Closed table: no client string reaches
+# D-Bus; "seek" is handled separately (SetPosition, Seek-delta fallback).
+MPRIS_METHODS = {
+    "play": "Play", "pause": "Pause", "play_pause": "PlayPause",
+    "next": "Next", "previous": "Previous", "stop": "Stop",
+}
+MPRIS_OPS = tuple(MPRIS_METHODS) + ("seek",)
+
+BUSCTL = None            # "busctl" when usable (or in --mock), else None
+_MPRIS_ART_ROOTS = ()    # realpath allowlist for file:// art, set by set_mpris
+
+
+def mpris_available():
+    """True when the user session bus and busctl are both present."""
+    return (shutil.which("busctl") is not None
+            and os.path.exists(os.path.join(XDG_RUNTIME_DIR, "bus")))
+
+
+def set_mpris(mock):
+    """Startup probe. Enables MPRIS when busctl + the session bus exist (always
+    in --mock), and computes the realpath allowlist for file:// album art."""
+    global BUSCTL, _MPRIS_ART_ROOTS
+    home = os.path.expanduser("~")
+    roots = []
+    for p in ("/tmp", XDG_RUNTIME_DIR, os.path.join(home, ".cache"),
+              os.path.join(home, ".var"), os.path.join(home, ".mozilla")):
+        try:
+            roots.append(os.path.realpath(p))
+        except Exception:
+            pass
+    _MPRIS_ART_ROOTS = tuple(roots)
+    BUSCTL = "busctl" if (mock or mpris_available()) else None
+
+
+def _bus_val(v):
+    """Unwrap one busctl --json=short variant {"type","data"} to a Python value,
+    recursing into a{sv} dicts. Arrays/scalars pass through. Never raises."""
+    if not isinstance(v, dict) or "data" not in v:
+        return v
+    d = v["data"]
+    if str(v.get("type", "")).startswith("a{") and isinstance(d, dict):
+        return {k: _bus_val(x) for k, x in d.items()}
+    return d
+
+
+def _busctl_json(args, timeout=2):
+    """busctl --user --json=short <args> -> parsed JSON, or None. Never raises;
+    runs with the user session env so it targets the right bus."""
+    if BUSCTL is None:
+        return None
+    try:
+        r = subprocess.run([BUSCTL, "--user", "--json=short"] + list(args),
+                           capture_output=True, timeout=timeout, env=_user_env())
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout.decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _busctl_call(argv, start, timeout=3):
+    """Run a busctl method call; return an ActionResult (mirrors real_cec)."""
+    try:
+        r = subprocess.run(argv, capture_output=True, timeout=timeout,
+                           env=_user_env())
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "busctl timed out",
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    except Exception as e:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "%s: %s" % (e.__class__.__name__, e),
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    return {"ok": r.returncode == 0, "exit_code": r.returncode,
+            "stdout": (r.stdout or b"").decode("utf-8", "replace"),
+            "stderr": (r.stderr or b"").decode("utf-8", "replace"),
+            "duration_ms": int((time.monotonic() - start) * 1000)}
+
+
+def _mpris_list_names():
+    """Bus names of all MPRIS players (org.mpris.MediaPlayer2.*)."""
+    obj = _busctl_json(["call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                        "org.freedesktop.DBus", "ListNames"])
+    names = obj.get("data") if isinstance(obj, dict) else None
+    # busctl wraps the single 'as' out-arg as data:[[name, ...]] — unwrap it.
+    if isinstance(names, list) and names and isinstance(names[0], list):
+        names = names[0]
+    if not isinstance(names, list):
+        return []
+    return [n for n in names
+            if isinstance(n, str) and n.startswith(MPRIS_PREFIX)
+            and all(c.isalnum() or c in "._-" for c in n)]
+
+
+def _mpris_getall(name):
+    """Every property across BOTH MPRIS interfaces (Player transport props +
+    the root MediaPlayer2 Identity), merged into a flat {prop: value} dict
+    (values unwrapped), or {} on total failure.
+
+    The empty-interface form `GetAll s ""` is NOT supported by real players
+    (verified on-box: busctl returns 'No such interface ""'), so we query each
+    interface explicitly. Per-call D-Bus wait is bounded with --timeout=1 so a
+    hung player can't stall the list."""
+    props = {}
+    for iface in (MPRIS_PLAYER_IFACE, "org.mpris.MediaPlayer2"):
+        obj = _busctl_json(["--timeout=1", "call", name, MPRIS_OBJPATH,
+                            "org.freedesktop.DBus.Properties", "GetAll", "s", iface])
+        if not isinstance(obj, dict):
+            continue
+        data = obj.get("data")
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            data = data[0]  # single a{sv} out-arg wrapped as a list
+        if isinstance(data, dict):
+            for k, v in data.items():
+                props[k] = _bus_val(v)
+    return props
+
+
+def _mpris_str(v):
+    return v if isinstance(v, str) else ""
+
+
+def _mpris_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _art_key(url):
+    """Short stable cache-buster for an art URL (changes with the track)."""
+    if not url:
+        return ""
+    return hashlib.sha1(url.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _art_url_path(url):
+    """If `url` is a file:// path under the art allowlist, return the real path;
+    else None. Keeps "no client-addressable file routes" honest — only art a
+    running player advertises, under a small set of cache dirs. Never raises."""
+    if not isinstance(url, str) or not url.startswith("file://"):
+        return None
+    try:
+        real = os.path.realpath(unquote(urlparse(url).path))
+    except Exception:
+        return None
+    for root in _MPRIS_ART_ROOTS:
+        if real == root or real.startswith(root + os.sep):
+            return real
+    return None
+
+
+def _mpris_player_info(name):
+    """Build the player dict for one MPRIS name, or None on failure."""
+    props = _mpris_getall(name)
+    if not props:
+        return None
+    meta = props.get("Metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+    artists = meta.get("xesam:artist")
+    if isinstance(artists, list):
+        artist = ", ".join(str(a) for a in artists if isinstance(a, str))
+    else:
+        artist = _mpris_str(artists)
+    art_url = _mpris_str(meta.get("mpris:artUrl"))
+    servable = _art_url_path(art_url) is not None  # file:// only; http(s) never fetched
+    length_us = _mpris_int(meta.get("mpris:length"))
+    pos_us = _mpris_int(props.get("Position"))
+    status = _mpris_str(props.get("PlaybackStatus"))
+    try:
+        rate = float(props.get("Rate"))
+    except (TypeError, ValueError):
+        rate = 1.0
+    return {
+        "id": name[len(MPRIS_PREFIX):],
+        "identity": _mpris_str(props.get("Identity")) or name[len(MPRIS_PREFIX):],
+        "status": status if status in ("Playing", "Paused", "Stopped") else "Stopped",
+        "title": _mpris_str(meta.get("xesam:title")),
+        "artist": artist,
+        "album": _mpris_str(meta.get("xesam:album")),
+        "position_ms": pos_us // 1000 if pos_us > 0 else 0,
+        "length_ms": length_us // 1000 if length_us > 0 else 0,
+        "rate": rate,
+        "can_seek": bool(props.get("CanSeek")),
+        "can_go_next": bool(props.get("CanGoNext")),
+        "can_go_previous": bool(props.get("CanGoPrevious")),
+        "can_play": bool(props.get("CanPlay")),
+        "can_pause": bool(props.get("CanPause")),
+        "art": servable,
+        "art_key": _art_key(art_url) if servable else "",
+    }
+
+
+def list_mpris_players():
+    """All MPRIS players, Playing first, capped at MPRIS_MAX_PLAYERS. Best-effort;
+    per-player failures are skipped. The name list is capped BEFORE the (one
+    GetAll each) loop so a box that spawns many idle players (Chromium) can't
+    blow the time budget; results are then sorted Playing-first. Worst case is
+    (1 + MPRIS_MAX_PLAYERS) busctl calls, each bounded by the 2 s subprocess
+    timeout (a live bus answers in ms); pathological all-hang ceiling ~18 s."""
+    names = _mpris_list_names()[:MPRIS_MAX_PLAYERS]
+    players = []
+    for n in names:
+        info = _mpris_player_info(n)
+        if info is not None:
+            players.append(info)
+    order = {"Playing": 0, "Paused": 1}
+    players.sort(key=lambda p: (order.get(p["status"], 2), p["identity"].lower()))
+    return players
+
+
+def mpris_info():
+    """{"available":True,"players":[...]} or None when MPRIS is unavailable."""
+    if BUSCTL is None:
+        return None
+    return {"available": True, "players": list_mpris_players()}
+
+
+def _mpris_seek(name, position_ms, start):
+    """Seek to an absolute position (ms). Prefers SetPosition (needs the current
+    trackid); falls back to a relative Seek for players that reject it."""
+    if position_ms is None or position_ms < 0:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "position_ms required", "duration_ms": 0}
+    props = _mpris_getall(name)
+    meta = props.get("Metadata") if isinstance(props.get("Metadata"), dict) else {}
+    trackid = _mpris_str(meta.get("mpris:trackid"))
+    length_us = _mpris_int(meta.get("mpris:length"))
+    pos_us = position_ms * 1000
+    if length_us > 0:
+        pos_us = max(0, min(length_us, pos_us))
+    if trackid:
+        r = _busctl_call([BUSCTL, "--user", "call", name, MPRIS_OBJPATH,
+                          MPRIS_PLAYER_IFACE, "SetPosition", "ox",
+                          trackid, str(pos_us)], start)
+        if r["ok"]:
+            return r
+    delta = pos_us - _mpris_int(props.get("Position"))
+    return _busctl_call([BUSCTL, "--user", "call", name, MPRIS_OBJPATH,
+                         MPRIS_PLAYER_IFACE, "Seek", "x", str(delta)], start)
+
+
+def real_mpris_op(player, op, position_ms=None):
+    """Run a transport op on <player>. ActionResult-shaped, or None for an
+    unknown/dead player or op (route 404s). Re-validates the player against a
+    fresh ListNames so we never act on a name that vanished."""
+    start = time.monotonic()
+    name = MPRIS_PREFIX + player
+    if name not in _mpris_list_names():
+        return None
+    if op == "seek":
+        return _mpris_seek(name, position_ms, start)
+    method = MPRIS_METHODS.get(op)
+    if method is None:
+        return None
+    return _busctl_call([BUSCTL, "--user", "call", name, MPRIS_OBJPATH,
+                         MPRIS_PLAYER_IFACE, method], start)
+
+
+_ART_MAGIC = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def _sniff_image(data):
+    """Magic-byte image type, or None (so a text/HTML file can't be served)."""
+    for magic, mime in _ART_MAGIC:
+        if data.startswith(magic):
+            return mime
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def mpris_art(player, art_key):
+    """Resolve <player>'s CURRENT advertised art file (the client never supplies
+    a path), enforce the 2 MiB read cap, and sniff the image type. Returns
+    (data, mime) or None. `art_key` must match the current track's key (else the
+    track changed — 404)."""
+    props = _mpris_getall(MPRIS_PREFIX + player)
+    meta = props.get("Metadata") if isinstance(props.get("Metadata"), dict) else {}
+    art_url = _mpris_str(meta.get("mpris:artUrl"))
+    if art_key and _art_key(art_url) != art_key:
+        return None
+    path = _art_url_path(art_url)
+    if path is None:
+        return None
+    try:
+        if os.path.getsize(path) > MPRIS_ART_MAX:  # cheap pre-filter
+            return None
+        with open(path, "rb") as f:
+            data = f.read(MPRIS_ART_MAX + 1)  # read-time enforcement
+    except OSError:
+        return None
+    if len(data) > MPRIS_ART_MAX:
+        return None
+    mime = _sniff_image(data)
+    return (data, mime) if mime else None
+
+
+_MOCK_MPRIS_POS = 0
+# 1x1 transparent PNG, so --mock album art works on macOS with no player.
+_MOCK_ART_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+
+
+def mock_mpris_info():
+    """--mock: one advancing Spotify-like player."""
+    global _MOCK_MPRIS_POS
+    _MOCK_MPRIS_POS = (_MOCK_MPRIS_POS + 3000) % 214000
+    return {"available": True, "players": [{
+        "id": "spotify", "identity": "Spotify", "status": "Playing",
+        "title": "Midnight City", "artist": "M83",
+        "album": "Hurry Up, We're Dreaming",
+        "position_ms": _MOCK_MPRIS_POS, "length_ms": 214000, "rate": 1.0,
+        "can_seek": True, "can_go_next": True, "can_go_previous": True,
+        "can_play": True, "can_pause": True, "art": True, "art_key": "mockart1",
+    }]}
+
+
+def mock_mpris_op(player, op, position_ms=None):
+    print("[mpris] %s %s%s" % (player, op,
+          "" if position_ms is None else " -> %dms" % position_ms), flush=True)
+    return {"ok": True, "exit_code": 0,
+            "stdout": "[mock mpris] %s %s" % (player, op),
+            "stderr": "", "duration_ms": 40}
+
+
+def mock_mpris_art(player, art_key):
+    return (_MOCK_ART_PNG, "image/png")
+
+
+# ---------------------------------------------------------------------------
+# Live screen preview: grab one composited frame on demand, downscale to a
+# small JPEG, serve over the bearer port (reuses _send_bytes, §3c). gamescope
+# (Game Mode) does NOT implement wlr-screencopy, so grim fails — the primary
+# path is `gamescopectl screenshot <path>`, which writes a 4K PNG
+# ASYNCHRONOUSLY (~1.4s on a real Bazzite box), downscaled to a ~60KB 960px
+# JPEG via ImageMagick/ffmpeg. KDE Desktop sessions use spectacle. All
+# invocations + timings verified on-box.
+# ---------------------------------------------------------------------------
+
+SCREEN_MIN_INTERVAL_S = 0.5       # server floor: at most ~2 captures/sec, any client count
+SCREEN_CAPTURE_TIMEOUT_S = 8      # per-step ceiling (gamescopectl async write + downscale)
+SCREEN_MAX_BYTES = 12 * 1024 * 1024
+SCREEN_WIDTH = 960                # downscale target width
+SCREEN_LOCK = threading.Lock()    # single-flight: never stack captures
+_SCREEN = None                    # capability dict or None; set by set_screen
+_SCREEN_CACHE = {"ts": 0.0, "data": None, "mime": None}  # 500 ms frame cache
+
+
+def _screen_downscaler():
+    """(argv-builder, name) for a PNG->JPEG downscaler, or (None, None). Prefers
+    ImageMagick, then ffmpeg — both ship on gaming boxes; keeps the agent off PIL
+    (absent on stock SteamOS)."""
+    if shutil.which("magick"):
+        return (lambda src, dst: ["magick", src, "-resize", "%dx" % SCREEN_WIDTH,
+                                  "-quality", "80", dst], "magick")
+    if shutil.which("convert"):
+        return (lambda src, dst: ["convert", src, "-resize", "%dx" % SCREEN_WIDTH,
+                                  "-quality", "80", dst], "convert")
+    if shutil.which("ffmpeg"):
+        return (lambda src, dst: ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+                                  "-vf", "scale=%d:-1" % SCREEN_WIDTH, "-q:v", "6", dst],
+                "ffmpeg")
+    return (None, None)
+
+
+def set_screen(mock):
+    """Detect a capture path at startup: gamescopectl when a gamescope socket
+    exists, else spectacle for a KDE desktop. Requires a downscaler for real
+    frames (a raw 4K PNG is too big to stream)."""
+    global _SCREEN
+    if mock:
+        _SCREEN = {"session": "mock", "backends": ["mock"], "dscale": None}
+        return
+    dbuild, _ = _screen_downscaler()
+    if dbuild is None:
+        _SCREEN = None
+        return
+    gs = [s for s in _wayland_display_sockets() if s.startswith("gamescope-")]
+    backends = []
+    if shutil.which("gamescopectl") and gs:
+        backends.append("gamescopectl")
+    if shutil.which("spectacle"):
+        backends.append("spectacle")
+    if not backends:
+        _SCREEN = None
+        return
+    _SCREEN = {"session": "gamescope" if gs else "desktop", "backends": backends,
+               "dscale": dbuild, "gs_socket": gs[0] if gs else None}
+
+
+def _screen_env():
+    env = _user_env()
+    if _SCREEN and _SCREEN.get("gs_socket"):
+        env["WAYLAND_DISPLAY"] = _SCREEN["gs_socket"]
+    else:
+        socks = _wayland_display_sockets()
+        if len(socks) == 1:
+            env["WAYLAND_DISPLAY"] = socks[0]
+    env.setdefault("DISPLAY", ":0")
+    return env
+
+
+def _png_complete(path):
+    """True when a PNG is fully written: >=100 bytes and ends in the IEND chunk.
+    gamescopectl writes async, so the file appears before it is complete."""
+    try:
+        if os.path.getsize(path) < 100:
+            return False
+        with open(path, "rb") as f:
+            f.seek(-8, os.SEEK_END)
+            return f.read(8) == b"IEND\xaeB`\x82"
+    except OSError:
+        return False
+
+
+def _grab_gamescopectl(env, outdir):
+    """`gamescopectl screenshot <png>` then poll for the async write to settle."""
+    png = os.path.join(outdir, "frame.png")
+    try:
+        os.unlink(png)
+    except OSError:
+        pass
+    try:
+        subprocess.run(["gamescopectl", "screenshot", png], env=env,
+                       timeout=SCREEN_CAPTURE_TIMEOUT_S,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    deadline = time.monotonic() + SCREEN_CAPTURE_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if os.path.exists(png):
+            s1 = os.path.getsize(png)
+            time.sleep(0.1)
+            if s1 == os.path.getsize(png) and _png_complete(png):
+                return png
+        time.sleep(0.1)
+    return None
+
+
+def _grab_spectacle(env, outdir):
+    """`spectacle -b -n -o <png>` (background, no notify) for a KDE desktop."""
+    png = os.path.join(outdir, "frame.png")
+    try:
+        os.unlink(png)
+    except OSError:
+        pass
+    try:
+        subprocess.run(["spectacle", "-b", "-n", "-o", png], env=env,
+                       timeout=SCREEN_CAPTURE_TIMEOUT_S,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    return png if _png_complete(png) else None
+
+
+def real_screen_frame():
+    """Capture one frame -> (jpeg_bytes, "image/jpeg") or None. Single-flight +
+    500 ms cache so any number of pollers cause at most ~2 captures/sec."""
+    if _SCREEN is None:
+        return None
+    now = time.monotonic()
+    if _SCREEN_CACHE["data"] is not None and now - _SCREEN_CACHE["ts"] < SCREEN_MIN_INTERVAL_S:
+        return (_SCREEN_CACHE["data"], _SCREEN_CACHE["mime"])
+    if not SCREEN_LOCK.acquire(blocking=False):
+        # A capture is already running: serve the last frame if we have one,
+        # else wait for the in-flight capture rather than starting a second.
+        if _SCREEN_CACHE["data"] is not None:
+            return (_SCREEN_CACHE["data"], _SCREEN_CACHE["mime"])
+        SCREEN_LOCK.acquire()
+    try:
+        now = time.monotonic()
+        if _SCREEN_CACHE["data"] is not None and now - _SCREEN_CACHE["ts"] < SCREEN_MIN_INTERVAL_S:
+            return (_SCREEN_CACHE["data"], _SCREEN_CACHE["mime"])
+        env = _screen_env()
+        outdir = os.path.join(XDG_RUNTIME_DIR, "couchside-screen")
+        try:
+            os.makedirs(outdir, mode=0o700, exist_ok=True)
+        except OSError:
+            return None
+        png = os.path.join(outdir, "frame.png")
+        jpg = os.path.join(outdir, "frame.jpg")
+        try:
+            grabbed = None
+            for backend in _SCREEN["backends"]:
+                if backend == "gamescopectl":
+                    grabbed = _grab_gamescopectl(env, outdir)
+                elif backend == "spectacle":
+                    grabbed = _grab_spectacle(env, outdir)
+                if grabbed:
+                    break
+            if not grabbed:
+                return None
+            data = None
+            try:
+                subprocess.run(_SCREEN["dscale"](grabbed, jpg), env=env,
+                               timeout=SCREEN_CAPTURE_TIMEOUT_S,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with open(jpg, "rb") as f:
+                    data = f.read(SCREEN_MAX_BYTES + 1)
+            except Exception:
+                return None
+            if not data or len(data) > SCREEN_MAX_BYTES:
+                return None
+            _SCREEN_CACHE.update(ts=time.monotonic(), data=data, mime="image/jpeg")
+            return (data, "image/jpeg")
+        finally:
+            # Always clean tmpfs, even when the grab itself failed (no partial
+            # frame.png left behind on a box that never captures successfully).
+            for p in (png, jpg):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+    finally:
+        SCREEN_LOCK.release()
+
+
+def screen_info():
+    """{available, session, backends, formats} or None when no capture path."""
+    if _SCREEN is None:
+        return None
+    return {"available": True, "session": _SCREEN["session"],
+            "backends": _SCREEN["backends"], "formats": ["image/jpeg"]}
+
+
+def _encode_png(w, h, rows):
+    """Encode 8-bit RGBA scanlines (each `bytes` of length w*4) to PNG bytes.
+    Pure zlib + struct, no PIL (§3e); also copied to the Windows GDI port."""
+    def _chunk(tag, data):
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xffffffff))
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)  # RGBA, no interlace
+    raw = b"".join(b"\x00" + r for r in rows)  # per-scanline filter byte 0
+    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(raw, 6)) + _chunk(b"IEND", b""))
+
+
+_MOCK_SCREEN_N = 0
+
+
+def mock_screen_frame():
+    """--mock: a small stdlib PNG with a moving band, so the app's preview works
+    on macOS without a compositor."""
+    global _MOCK_SCREEN_N
+    _MOCK_SCREEN_N += 1
+    w, h = 320, 180
+    band = (_MOCK_SCREEN_N * 12) % w
+    rows = []
+    for y in range(h):
+        row = bytearray()
+        for x in range(w):
+            r = 220 if abs(x - band) <= 6 else 30
+            row += bytes((r, (255 * y) // h, (255 * x) // w, 255))
+        rows.append(bytes(row))
+    return (_encode_png(w, h, rows), "image/png")
+
+
+# ---------------------------------------------------------------------------
 # Virtual gamepad: evdev/uinput constants and pure-stdlib uinput driver
 # ---------------------------------------------------------------------------
 
@@ -1123,6 +3073,7 @@ KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_TAB = 12, 13, 14, 15
 KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y = 16, 17, 18, 19, 20, 21
 KEY_U, KEY_I, KEY_O, KEY_P = 22, 23, 24, 25
 KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_ENTER = 26, 27, 28
+KEY_LEFTCTRL = 29  # for the Ctrl+V paste chord (non-ASCII text delivery)
 KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H = 30, 31, 32, 33, 34, 35
 KEY_J, KEY_K, KEY_L, KEY_SEMICOLON = 36, 37, 38, 39
 KEY_APOSTROPHE, KEY_GRAVE, KEY_LEFTSHIFT, KEY_BACKSLASH = 40, 41, 42, 43
@@ -1131,6 +3082,15 @@ KEY_COMMA, KEY_DOT, KEY_SLASH = 51, 52, 53
 KEY_SPACE = 57
 KEY_HOME, KEY_UP = 102, 103
 KEY_LEFT, KEY_RIGHT, KEY_END, KEY_DOWN = 105, 106, 107, 108
+KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP = 113, 114, 115
+
+# Volume up/down go through the media keys so the OS shows its volume OSD. Mute
+# is NOT here: gamescope does not bind KEY_MUTE, so real_soft toggles mute via
+# wpctl on the default sink instead.
+SOFT_MEDIA_KEYS = {
+    "volume_up": KEY_VOLUMEUP,
+    "volume_down": KEY_VOLUMEDOWN,
+}
 
 # ASCII printable char -> (keycode, needs_shift)
 def _build_char_map():
@@ -1204,16 +3164,19 @@ SPECIAL_KEYS = {
 }
 
 # All KEY_* codes the virtual keyboard may emit (declared at device create).
+# KEY_LEFTCTRL is included for the Ctrl+V paste chord even though no char maps
+# to it, else the uinput device won't declare the capability and emit fails.
 KEYBOARD_CODES = sorted(
     {code for code, _shift in CHAR_KEYMAP.values()}
     | set(SPECIAL_KEYS.values())
-    | {KEY_LEFTSHIFT}
+    | {KEY_LEFTSHIFT, KEY_LEFTCTRL}
 )
 
 # Names for mock logging of keyboard/mouse EV_KEY events.
 _KEY_CODE_NAMES = {
     KEY_ESC: "KEY_ESC", KEY_BACKSPACE: "KEY_BACKSPACE", KEY_TAB: "KEY_TAB",
     KEY_ENTER: "KEY_ENTER", KEY_SPACE: "KEY_SPACE", KEY_LEFTSHIFT: "KEY_LEFTSHIFT",
+    KEY_LEFTCTRL: "KEY_LEFTCTRL",
     KEY_UP: "KEY_UP", KEY_DOWN: "KEY_DOWN", KEY_LEFT: "KEY_LEFT",
     KEY_RIGHT: "KEY_RIGHT", KEY_HOME: "KEY_HOME", KEY_END: "KEY_END",
     KEY_MINUS: "KEY_MINUS", KEY_EQUAL: "KEY_EQUAL", KEY_LEFTBRACE: "KEY_LEFTBRACE",
@@ -1258,7 +3221,10 @@ def _event_name(etype, code):
     return "code_%d" % code
 
 
-# Linux ioctl request encoding: dir<<30 | size<<16 | type<<8 | nr
+# Python's stdlib has no helper for ioctl request numbers, so reproduce the
+# kernel's _IOC macros from <asm-generic/ioctl.h> by hand: each uinput request
+# below is built as direction<<30 | size<<16 | type<<8 | nr, the same way the C
+# header builds it.
 _IOC_NONE, _IOC_WRITE = 0, 1
 
 
@@ -1274,6 +3240,8 @@ def _IOW(typ, nr, size):
     return _ioc(_IOC_WRITE, typ, nr, size)
 
 
+# uinput's own ioctls. "U" is uinput's magic type byte; the numbers and the
+# int-sized argument come straight from <linux/uinput.h>.
 UI_SET_EVBIT = _IOW("U", 100, 4)   # int
 UI_SET_KEYBIT = _IOW("U", 101, 4)  # int
 UI_SET_RELBIT = _IOW("U", 102, 4)  # int
@@ -1302,23 +3270,35 @@ class UInputGamepad:
     def __init__(self):
         if fcntl is None:
             raise RuntimeError("fcntl module unavailable on this platform")
+        # A real size check, not an assert (python3 -O strips asserts). A struct
+        # that packed to the wrong size would silently scramble the descriptor
+        # handed to the kernel; 1116 is the fixed uinput_user_dev size.
         if struct.calcsize(_UINPUT_USER_DEV) != 1116:  # survives python3 -O
             raise RuntimeError("uinput_user_dev struct packs to %d bytes, expected 1116"
                                % struct.calcsize(_UINPUT_USER_DEV))
         self.fd = None
         fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
         try:
-            fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
-            fcntl.ioctl(fd, UI_SET_EVBIT, EV_ABS)
+            # Legacy uinput handshake, strictly in this order: declare which
+            # event types and codes the device can emit (UI_SET_*), write the
+            # uinput_user_dev descriptor, then UI_DEV_CREATE to bring it to life.
+            fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)   # buttons
+            fcntl.ioctl(fd, UI_SET_EVBIT, EV_ABS)   # sticks, triggers, dpad
             for code in BTN_CODES.values():
                 fcntl.ioctl(fd, UI_SET_KEYBIT, code)
             for code, _lo, _hi in GAMEPAD_AXES:
                 fcntl.ioctl(fd, UI_SET_ABSBIT, code)
+            # Axis ranges are indexed by the ABS_* code itself, so the arrays
+            # need a slot for every possible code (64). The concrete per-axis
+            # numbers (signed sticks, 0..255 triggers) live in GAMEPAD_AXES.
             absmin = [0] * 64
             absmax = [0] * 64
             for code, lo, hi in GAMEPAD_AXES:
                 absmin[code] = lo
                 absmax[code] = hi
+            # The struct ends with four s32[64] arrays: absmax, absmin, absfuzz,
+            # absflat. We fill max/min and leave fuzz/flat zero (no dead zone or
+            # jitter filter here; the phone side already smooths the sticks).
             setup = struct.pack(
                 _UINPUT_USER_DEV,
                 self.name.encode("utf-8"),
@@ -1380,6 +3360,44 @@ def _emit_events(fd, events):
     )
     data += struct.pack(_INPUT_EVENT, 0, 0, EV_SYN, SYN_REPORT, 0)
     os.write(fd, data)
+
+
+class UInputMediaKeys:
+    """Virtual device that emits the volume media keys (mute / down / up). The OS
+    handles them exactly like a hardware volume rocker: it changes the real
+    volume and, in SteamOS Game Mode, shows the on-screen volume OSD. Kept
+    separate from the WS keyboard (torn down each gamepad session) so /api/tv
+    volume stands on its own."""
+
+    name = "Couchside Media Keys"
+
+    def __init__(self):
+        if fcntl is None:
+            raise RuntimeError("fcntl module unavailable on this platform")
+        self.fd = None
+        fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+            for code in (KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP):
+                fcntl.ioctl(fd, UI_SET_KEYBIT, code)
+            setup = struct.pack(
+                _UINPUT_USER_DEV,
+                self.name.encode("utf-8"),
+                0x03, 0x045E, 0x028B, 0x111,
+                0,  # ff_effects_max
+                *([0] * 64 + [0] * 64 + [0] * 64 + [0] * 64),
+            )
+            os.write(fd, setup)
+            fcntl.ioctl(fd, UI_DEV_CREATE)
+        except Exception:
+            os.close(fd)
+            raise
+        self.fd = fd
+
+    def tap(self, code):
+        """Press then release one media key."""
+        _emit_events(self.fd, [(EV_KEY, code, 1)])
+        _emit_events(self.fd, [(EV_KEY, code, 0)])
 
 
 class UInputMouse:
@@ -1623,19 +3641,12 @@ def keyboard_events(msg):
         text = msg.get("text")
         if not isinstance(text, str):
             raise ValueError("kt text must be a string")
-        events = []
-        for ch in text:
-            entry = CHAR_KEYMAP.get(ch)
-            if entry is None:
-                raise ValueError("unsupported character %r" % (ch,))
-            code, shift = entry
-            if shift:
-                events.append((EV_KEY, KEY_LEFTSHIFT, 1))
-            events.append((EV_KEY, code, 1))
-            events.append((EV_KEY, code, 0))
-            if shift:
-                events.append((EV_KEY, KEY_LEFTSHIFT, 0))
-        return events
+        # Tolerant: unmappable chars are skipped, never raised. A single smart
+        # quote / emoji used to raise here and kill the whole WS session.
+        # Genuine non-ASCII is delivered via the paste path in
+        # Handler._handle_kt, which intercepts 'kt' before this decoder; this
+        # stays a safe fallback if 'kt' is ever routed straight through.
+        return _type_events(text)
     if t == "k":
         key = msg.get("key")
         if key not in SPECIAL_KEYS:
@@ -1643,6 +3654,209 @@ def keyboard_events(msg):
         code = SPECIAL_KEYS[key]
         return [(EV_KEY, code, 1), (EV_KEY, code, 0)]
     raise ValueError("unknown keyboard message type %r" % (t,))
+
+
+def _type_events(text):
+    """Uinput events to type `text`, skipping any char the ASCII keymap can't
+    produce (tolerant — never raises). Non-typeable chars are handled elsewhere
+    via paste; here they are simply omitted."""
+    events = []
+    for ch in text:
+        entry = CHAR_KEYMAP.get(ch)
+        if entry is None:
+            continue
+        code, shift = entry
+        if shift:
+            events.append((EV_KEY, KEY_LEFTSHIFT, 1))
+        events.append((EV_KEY, code, 1))
+        events.append((EV_KEY, code, 0))
+        if shift:
+            events.append((EV_KEY, KEY_LEFTSHIFT, 0))
+    return events
+
+
+def _split_typeable(text):
+    """Split text into ordered ('type'|'paste', chunk) runs by whether each
+    char is in CHAR_KEYMAP. Typeable runs go through uinput; paste runs go
+    through the clipboard (unicode delivery)."""
+    runs = []
+    cur, buf = None, []
+    for ch in text:
+        kind = "type" if ch in CHAR_KEYMAP else "paste"
+        if kind != cur:
+            if buf:
+                runs.append((cur, "".join(buf)))
+            cur, buf = kind, [ch]
+        else:
+            buf.append(ch)
+    if buf:
+        runs.append((cur, "".join(buf)))
+    return runs
+
+
+# Bounds for one 'kt' frame, so a giant or pathologically-alternating string
+# can't tie up the session's reader thread (each paste run costs ~2 subprocesses
+# + a settle sleep). A real typed message is tiny; these are generous.
+_KT_MAX_CHARS = 4096
+_KT_MAX_PASTE_RUNS = 8
+
+# Ctrl+V chord as uinput events (press ctrl, tap v, release ctrl).
+_CTRL_V_EVENTS = [
+    (EV_KEY, KEY_LEFTCTRL, 1),
+    (EV_KEY, KEY_V, 1),
+    (EV_KEY, KEY_V, 0),
+    (EV_KEY, KEY_LEFTCTRL, 0),
+]
+
+
+def _wayland_display_sockets():
+    """Names of wayland DISPLAY sockets in XDG_RUNTIME_DIR. Recognizes the
+    standard wayland-<N> and gamescope's gamescope-<N> (Bazzite / Steam Deck
+    Game Mode names its compositor socket gamescope-0, NOT wayland-0), while
+    excluding lock files and gamescope's -ei / -stats side sockets. Never raises."""
+    out = []
+    try:
+        for e in os.listdir(XDG_RUNTIME_DIR):
+            if e.endswith(".lock"):
+                continue
+            if e.startswith("wayland-") and e[len("wayland-"):].isdigit():
+                out.append(e)
+            elif e.startswith("gamescope-") and e[len("gamescope-"):].isdigit():
+                out.append(e)
+    except OSError:
+        pass
+    return out
+
+
+def _paste_env():
+    """Session env for wl-copy/wl-paste, with WAYLAND_DISPLAY pinned to the one
+    detected display socket (gamescope-0 in Game Mode); _session_env alone only
+    finds wayland-<N>, which gamescope does not create."""
+    env = _session_env()
+    socks = _wayland_display_sockets()
+    if len(socks) == 1:
+        env["WAYLAND_DISPLAY"] = socks[0]
+    return env
+
+
+_PASTE_OK = None  # tri-state cache: None = unprobed, then True/False
+
+
+def _paste_available():
+    """True only when a clipboard paste actually WORKS: wl-copy + wl-paste exist,
+    exactly one wayland display socket exists (single-socket safety gate against
+    wrong-session pastes), AND a real wl-copy->wl-paste roundtrip succeeds.
+
+    The roundtrip is essential, not paranoia: gamescope (Bazzite / Steam Deck
+    Game Mode) exposes a wayland socket but does NOT implement
+    wl_data_device_manager, so wl-copy silently fails there. Presence alone would
+    wrongly advertise unicode; the roundtrip degrades Game Mode to ascii while
+    keeping real Desktop-Mode wayland sessions on unicode. Probed once, cached,
+    and clipboard-preserving (restores whatever was there)."""
+    global _PASTE_OK
+    if _PASTE_OK is not None:
+        return _PASTE_OK
+    _PASTE_OK = False
+    if shutil.which("wl-copy") is None or shutil.which("wl-paste") is None:
+        return False
+    if len(_wayland_display_sockets()) != 1:
+        return False
+    env = _paste_env()
+    sentinel = b"couchside-clip-probe"
+    try:
+        orig = subprocess.run(["wl-paste", "-n"], env=env, timeout=2,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        saved = orig.stdout if orig.returncode == 0 else None
+        subprocess.run(["wl-copy"], input=sentinel, env=env, timeout=2,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.05)
+        rb = subprocess.run(["wl-paste", "-n"], env=env, timeout=2,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        _PASTE_OK = rb.returncode == 0 and rb.stdout == sentinel
+        if _PASTE_OK:  # restore the user's clipboard, don't leave the sentinel
+            if saved:
+                subprocess.run(["wl-copy"], input=saved, env=env, timeout=2,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(["wl-copy", "--clear"], env=env, timeout=2,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        _PASTE_OK = False
+    return _PASTE_OK
+
+
+def _text_caps(mock):
+    """Capability advertised in the hello frame: 'unicode' when we can deliver
+    arbitrary text (via paste), else 'ascii' so the app strips non-typeable
+    chars client-side. --mock always claims unicode."""
+    return "unicode" if (mock or _paste_available()) else "ascii"
+
+
+def _paste_log_once(entry, msg):
+    """Log a paste diagnostic at most once per WS session."""
+    if not entry.get("_paste_logged"):
+        entry["_paste_logged"] = True
+        print("[keyboard] %s" % msg, flush=True)
+
+
+def _schedule_clipboard_clear(entry, env, delay=3.0):
+    """Clear the wayland clipboard a few seconds after a paste, so pasted text
+    (possibly sensitive) does not linger. Generation-guarded: a newer paste
+    bumps the counter and cancels this clear (that paste owns the clipboard and
+    schedules its own)."""
+    gen = entry.get("_paste_gen", 0) + 1
+    entry["_paste_gen"] = gen
+
+    def _clear():
+        if entry.get("_paste_gen") != gen:
+            return
+        try:
+            subprocess.run(["wl-copy", "--clear"], env=env, timeout=2,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    threading.Timer(delay, _clear).start()
+
+
+def clipboard_paste(text, kbd, mock, entry):
+    """Deliver non-ASCII `text` by setting the wayland clipboard and sending
+    Ctrl+V on the session keyboard device. Returns True on a delivered paste.
+
+    Safety: wl-copy receives the text on STDIN (never argv — process cmdlines
+    are world-readable and could leak a password). After copying we read the
+    clipboard back with wl-paste; only if it matches do we press Ctrl+V, so a
+    failed/again-wrong-socket copy can never paste a stale clipboard. On the
+    first hard failure the paste path is marked dead for the session."""
+    if mock:
+        print("[mock] paste %d chars" % len(text), flush=True)
+        return True
+    if entry.get("_paste_dead"):
+        return False
+    env = _paste_env()
+    try:
+        subprocess.run(["wl-copy"], input=text.encode("utf-8"), env=env,
+                       timeout=2, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.05)  # let the compositor take ownership of the selection
+        rb = subprocess.run(["wl-paste", "-n"], env=env, timeout=2,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        entry["_paste_dead"] = True
+        _paste_log_once(entry, "paste unavailable (%s); non-ASCII dropped" % e)
+        return False
+    if rb.returncode != 0 or rb.stdout.decode("utf-8", "replace") != text:
+        # The compositor did not accept our clipboard on this socket: do NOT
+        # Ctrl+V (would paste whatever was there before). Drop this chunk.
+        _paste_log_once(entry, "clipboard read-back mismatch; non-ASCII dropped")
+        return False
+    try:
+        kbd.emit(_CTRL_V_EVENTS)
+    except Exception as e:
+        _paste_log_once(entry, "Ctrl+V emit failed: %s" % e)
+        return False
+    _schedule_clipboard_clear(entry, env)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1664,6 +3878,10 @@ def ws_try_parse(buf):
     if len(buf) < 2:
         return None
     b0, b1 = buf[0], buf[1]
+    # Byte 0 packs FIN (0x80), three RSV bits (0x70), and the opcode (0x0F);
+    # byte 1 packs the MASK bit (0x80) and a 7-bit length (0x7F). The app only
+    # ever sends whole, single-frame, masked messages, so anything else is a
+    # protocol violation we reject rather than try to handle.
     if not (b0 & 0x80) or (b0 & 0x0F) == 0:
         raise ValueError("fragmented frames not supported")
     if b0 & 0x70:
@@ -1672,6 +3890,8 @@ def ws_try_parse(buf):
         raise ValueError("client frames must be masked")
     length = b1 & 0x7F
     idx = 2
+    # A 7-bit length of 126 means the real length is the next 2 bytes, 127 the
+    # next 8, both big-endian.
     if length == 126:
         if len(buf) < 4:
             return None
@@ -1687,6 +3907,8 @@ def ws_try_parse(buf):
     end = idx + 4 + length
     if len(buf) < end:
         return None
+    # The 4-byte masking key sits right before the payload; unmask by XOR-ing
+    # each byte with the key byte it cycles through (i mod 4).
     mask = buf[idx:idx + 4]
     payload = bytearray(buf[idx + 4:end])
     for i in range(length):
@@ -1716,8 +3938,11 @@ def ws_recv_frame(conn, buf):
 
 
 def ws_send(conn, opcode, payload=b""):
+    # Server frames are never masked. The header is FIN|opcode, then the length
+    # in its smallest form: inline 7-bit when under 126, otherwise the 126+u16
+    # or 127+u64 escape (this mirrors the read side in ws_try_parse).
     n = len(payload)
-    header = bytes([0x80 | opcode])
+    header = bytes([0x80 | opcode])   # 0x80 = FIN, i.e. a complete message
     if n < 126:
         header += bytes([n])
     elif n < (1 << 16):
@@ -1761,12 +3986,12 @@ def _gamepad_teardown(entry):
 #
 # SECURITY: /pair exposes the pairing token in the clear, so it is gated to
 # loopback clients only (see Handler.do_GET). It is NOT under /api and is NOT
-# bearer-authed; the loopback check IS the entire security model.
+# bearer-authed: the loopback check IS the entire security model.
 # ---------------------------------------------------------------------------
 
 # Inlined, MIT-licensed pure-JS QR generator (Kazuhiko Arase's
 # qrcode-generator, reduced to 8-bit byte mode / EC level M / auto type).
-# Rendered fully client-side and OFFLINE (no CDN), so it works on a box with
+# Rendered fully client-side and OFFLINE: no CDN, so it works on a box with
 # no internet. Exposes a global `qrcode(typeNumber)` factory.
 PAIR_QR_JS = r"""
 var qrcode = (function () {
@@ -1970,7 +4195,7 @@ def build_pair_url(token, port):
     HTTPS (not couchside://) because Android camera apps won't open custom
     schemes from a QR code; every scanner opens https. couchside.tv/pair
     relaunches the app via the scheme (or shows install links). The params
-    ride the URL #FRAGMENT, which browsers never send to the server, so the
+    ride the URL #FRAGMENT, which browsers never send to the server: the
     token stays between the QR and the phone.
 
     host= stays the mDNS name (survives DHCP lease changes); ip= is the
@@ -1992,7 +4217,7 @@ def render_pair_page(token, port):
     The pairing URL is injected as a JSON string literal (json.dumps) so it is
     safely escaped for the inline <script>. The QR is drawn client-side to a
     canvas from the inlined generator above; the couchside:// URL is shown as a
-    small text fallback. No external resources, so it works on a box with no net.
+    small text fallback. No external resources: works on a box with no net.
     """
     pair_url = build_pair_url(token, port)
     url_js = json.dumps(pair_url)          # safe JS string literal
@@ -2019,8 +4244,9 @@ def render_pair_page(token, port):
         ".err{color:#ff6b6b;margin-top:3vmin;font-size:min(3vmin,18px);}"
         "</style></head><body>"
         "<h1>Scan to pair Couchside</h1>"
-        "<div class=\"sub\">Open the Couchside app on your phone and scan this code, "
-        "or point your phone camera at it.</div>"
+        "<div class=\"sub\">Point your phone&rsquo;s <b>camera</b> at this code "
+        "&mdash; it opens the Couchside app and pairs your box automatically. "
+        "The app itself has no scanner; use the camera.</div>"
         "<div class=\"card\"><canvas id=\"qr\" width=\"560\" height=\"560\"></canvas></div>"
         "<div class=\"url\">" + url_html + "</div>"
         "<div id=\"err\" class=\"err\"></div>"
@@ -2086,7 +4312,7 @@ class Handler(BaseHTTPRequestHandler):
 
         Anti-DNS-rebinding gate for /pair: a malicious web page loaded in the
         box's own browser can rebind its domain to 127.0.0.1 and fetch
-        http://attacker.tld:PORT/pair; the socket peer IS loopback then, but
+        http://attacker.tld:PORT/pair: the socket peer IS loopback then, but
         the Host header still says attacker.tld. The legitimate launcher opens
         http://localhost:PORT/pair, so requiring a loopback Host costs nothing.
         """
@@ -2122,11 +4348,23 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         self._log(code, started)
 
+    # Chatty routes whose success (2xx) is sampled so a ~1-2 fps poll can't
+    # scroll real diagnostics out of the journal's window (§3f). Errors and the
+    # first hit of a burst still log.
+    _SAMPLED_PATHS = ("/api/screen/frame",)
+    _sample_last = {}  # path -> monotonic time of last logged success
+    _SAMPLE_EVERY_S = 15
+
     def _log(self, code, started):
         dur_ms = int((time.monotonic() - started) * 1000)
         # Never log query strings: /ws/gamepad carries ?token=<secret>, and
         # this stdout lands in journald (which /api/journal serves back out).
         path = self.path.split("?", 1)[0]
+        if path in self._SAMPLED_PATHS and code < 400:
+            now = time.monotonic()
+            if now - Handler._sample_last.get(path, 0) < self._SAMPLE_EVERY_S:
+                return  # suppress this frame; a recent one already logged
+            Handler._sample_last[path] = now
         if "?" in self.path:
             path += "?<redacted>"
         print("%s %s %s %d %dms" % (
@@ -2154,6 +4392,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if body:
             self.wfile.write(body)
+        self._log(code, started)
+
+    def _send_bytes(self, code, data, content_type, started,
+                    cache_control=None, extra_headers=None):
+        """Write a raw binary body (image bytes: Steam covers, album art, later
+        screen frames) with an EXACT Content-Length (keep-alive safety under
+        protocol_version HTTP/1.1) and the same CORS headers as _send."""
+        self.send_response(code)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Methods",
+                         "GET, POST, DELETE, OPTIONS")
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        if cache_control:
+            self.send_header("Cache-Control", cache_control)
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        if data:
+            self.wfile.write(data)
         self._log(code, started)
 
     def _authorized(self):
@@ -2187,7 +4448,7 @@ class Handler(BaseHTTPRequestHandler):
                 # LOCALHOST-ONLY: /pair renders the pairing token as a QR, so a
                 # non-loopback client MUST NOT see it. Two gates, both required:
                 # peer IP must be loopback AND the Host header must name
-                # loopback (anti-DNS-rebinding; see _host_header_is_local).
+                # loopback (anti-DNS-rebinding, see _host_header_is_local).
                 if not self._is_loopback() or not self._host_header_is_local():
                     self._send(403, {"error": "forbidden"}, started)
                     return
@@ -2242,6 +4503,71 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"actions": actions}, started)
             elif path == "/api/launchers":
                 self._send(200, {"launchers": list_launchers()}, started)
+            elif path == "/api/downloads":
+                # Always 200 (list may be empty). Old agents lack this route and
+                # 404 -> the app hides the section (probe-and-appear via 404->null).
+                downloads = mock_downloads() if self.mock else steam_downloads()
+                self._send(200, {"downloads": downloads}, started)
+            elif path.startswith("/api/steam/") and path.endswith("/cover"):
+                appid = path[len("/api/steam/"):-len("/cover")]
+                self._handle_steam_cover(appid, started)
+            elif path == "/api/tv":
+                # Probe-and-appear: 404 when no TV backend so the app shows no
+                # TV strip; a body only when a backend is live.
+                info = tv_info()
+                if info is None:
+                    self._send(404, {"error": "not found"}, started)
+                else:
+                    self._send(200, info, started)
+            elif path == "/api/media":
+                # Probe-and-appear: 404 when no session bus / busctl so the app
+                # hides the Now Playing card; 200 with an empty list when idle.
+                info = mock_mpris_info() if self.mock else mpris_info()
+                if info is None:
+                    self._send(404, {"error": "not found"}, started)
+                else:
+                    self._send(200, info, started)
+            elif path == "/api/media/art":
+                # Album art bytes for a player's CURRENT track. The client passes
+                # only player id + art_key (a cache-buster) — never a path.
+                q = parse_qs(parsed.query)
+                player = (q.get("player") or [""])[0]
+                key = (q.get("k") or [""])[0]
+                art = None
+                if player:
+                    art = (mock_mpris_art(player, key) if self.mock
+                           else (mpris_art(player, key) if BUSCTL else None))
+                if art is None:
+                    self._send(404, {"error": "not found"}, started)
+                else:
+                    data, mime = art
+                    self._send_bytes(200, data, mime, started,
+                                     cache_control="private, max-age=3600")
+            elif path == "/api/screen":
+                # Probe-and-appear: 404 when no capture path so the app hides the
+                # preview card; a body describes the session + backends.
+                info = {"available": True, "session": "mock",
+                        "backends": ["mock"], "formats": ["image/png"]} \
+                    if self.mock else screen_info()
+                if info is None:
+                    self._send(404, {"error": "not found"}, started)
+                else:
+                    self._send(200, info, started)
+            elif path == "/api/screen/frame":
+                # One fresh frame. Single-flight + 500ms cache cap captures at
+                # ~2/s server-side; no-store so frames (may show passwords) are
+                # never cached. High-frequency, so _log samples it.
+                frame = mock_screen_frame() if self.mock else real_screen_frame()
+                if frame is None:
+                    self._send(503, {"error": "capture failed"}, started)
+                else:
+                    data, mime = frame
+                    self._send_bytes(200, data, mime, started,
+                                     cache_control="no-store")
+            elif path == "/api/power/schedule":
+                # Always 200: reports the (volatile) sleep timer + the RTC wake
+                # alarm read from hardware. Old agents 404 -> app hides the rows.
+                self._send(200, power_schedule_info(), started)
             else:
                 self._send(404, {"error": "not found"}, started)
         except BrokenPipeError:
@@ -2251,6 +4577,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, {"error": e.__class__.__name__}, started)
             except Exception:
                 pass
+
+    def _handle_steam_cover(self, appid, started):
+        """Serve a Steam game's 600x900 cover art from the box's LOCAL Steam
+        cache. No CDN / third-party fetch: the phone talks only to this agent,
+        so the app stays LAN-only. 404 when the appid is malformed, the game
+        isn't installed, or Steam hasn't cached its portrait art yet (the app
+        then shows its text-card fallback)."""
+        cover = _steam_cover_path(appid)
+        if cover is None:
+            self._send(404, {"error": "no cover"}, started)
+            return
+        try:
+            with open(cover, "rb") as f:
+                body = f.read()
+        except OSError:
+            self._send(404, {"error": "no cover"}, started)
+            return
+        # Art is keyed by appid and effectively immutable; let the phone cache it.
+        self._send_bytes(200, body, "image/jpeg", started,
+                         extra_headers={"Cache-Control": "public, max-age=604800"})
 
     def _read_body(self):
         """Read and return the request body bytes (always drains it).
@@ -2314,6 +4660,171 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, result, started)
                 return
 
+            # POST /api/tv/volume: absolute volume {"level": 0-100, "target":
+            # "box"|"tv"}. Box converges via media-key steps (Game Mode OSD),
+            # TV via the RS-232 closed loop. Checked before /api/tv/<op>.
+            if path == "/api/tv/volume":
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(req, dict):
+                        raise ValueError("body must be a JSON object")
+                    lvl = int(req.get("level"))
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "level must be an integer"},
+                               started)
+                    return
+                if not 0 <= lvl <= 100:
+                    self._send(400, {"error": "level must be 0-100"}, started)
+                    return
+                tgt = req.get("target") or "box"
+                if tgt == "tv":
+                    if not panel_available():
+                        self._send(404, {"error": "no tv volume backend"},
+                                   started)
+                        return
+                    result = ({"ok": True, "exit_code": 0, "level": lvl,
+                               "stdout": "[mock] tv volume %d" % lvl,
+                               "stderr": "", "duration_ms": 100}
+                              if self.mock else panel_set_volume(lvl))
+                else:
+                    if not soft_available():
+                        self._send(404, {"error": "no box volume backend"},
+                                   started)
+                        return
+                    result = ({"ok": True, "exit_code": 0, "level": lvl,
+                               "stdout": "[mock] box volume %d" % lvl,
+                               "stderr": "", "duration_ms": 100}
+                              if self.mock else soft_set_volume(lvl))
+                self._send(200, result, started)
+                return
+
+            # POST /api/tv/key/<k>: factory-remote key (panel only).
+            keyprefix = "/api/tv/key/"
+            if path.startswith(keyprefix):
+                k = unquote(path[len(keyprefix):])
+                if not panel_available() or k not in PANEL_KEYS:
+                    self._send(404, {"error": "unknown key"}, started)
+                    return
+                if self.mock:
+                    result = {"ok": True, "exit_code": 0,
+                              "stdout": "[mock panel] key %s" % k,
+                              "stderr": "", "duration_ms": 100}
+                else:
+                    result = real_panel_key(k)
+                self._send(200, result, started)
+                return
+
+            # POST /api/tv/source/<id>: switch the display input (panel only).
+            # Checked before the generic /api/tv/ route since it is more specific.
+            srcprefix = "/api/tv/source/"
+            if path.startswith(srcprefix):
+                sid = unquote(path[len(srcprefix):])
+                if not panel_available() or sid not in PANEL_SOURCE_CODES:
+                    self._send(404, {"error": "unknown source"}, started)
+                    return
+                if self.mock:
+                    result = {"ok": True, "exit_code": 0,
+                              "stdout": "[mock panel] source %s" % sid,
+                              "stderr": "", "duration_ms": 100}
+                else:
+                    result = real_panel_source(sid)
+                self._send(200, result, started)
+                return
+
+            # POST /api/media/<player>/<op>: MPRIS transport. <op> is a fixed
+            # word; the seek op carries {"position_ms":int}. Unknown op / dead
+            # player -> 404. Placed before the generic /api/tv/ route.
+            mprefix = "/api/media/"
+            if path.startswith(mprefix):
+                rest = path[len(mprefix):]
+                parts = rest.rsplit("/", 1)
+                if len(parts) != 2 or not parts[0] or not parts[1]:
+                    self._send(404, {"error": "not found"}, started)
+                    return
+                player, op = unquote(parts[0]), parts[1]
+                if op not in MPRIS_OPS:
+                    self._send(404, {"error": "unknown media op"}, started)
+                    return
+                position_ms = None
+                if op == "seek":
+                    try:
+                        req = json.loads(body.decode("utf-8")) if body else {}
+                        if not isinstance(req, dict):
+                            raise ValueError("body must be a JSON object")
+                        position_ms = int(req.get("position_ms"))
+                    except (ValueError, TypeError, UnicodeDecodeError):
+                        self._send(400, {"error": "position_ms must be an integer"},
+                                   started)
+                        return
+                result = (mock_mpris_op(player, op, position_ms) if self.mock
+                          else real_mpris_op(player, op, position_ms))
+                if result is None:
+                    self._send(404, {"error": "unknown player"}, started)
+                    return
+                self._send(200, result, started)
+                return
+
+            # POST /api/power/sleep: arm a delayed suspend/poweroff.
+            if path == "/api/power/sleep":
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(req, dict):
+                        raise ValueError
+                    delay_s = int(req.get("delay_s"))
+                    action = req.get("action")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "delay_s (int) and action required"}, started)
+                    return
+                if not SLEEP_MIN_S <= delay_s <= SLEEP_MAX_S:
+                    self._send(400, {"error": "delay_s out of range"}, started)
+                    return
+                ok, err = sleep_can_arm(action)
+                if not ok:
+                    self._send(400, {"error": err}, started)
+                    return
+                self._send(200, {"sleep": sleep_arm(delay_s, action)}, started)
+                return
+
+            # POST /api/power/wake: set the RTC wake alarm to an absolute time.
+            if path == "/api/power/wake":
+                if not rtc_available():
+                    self._send(409, {"error": "no writable /dev/rtc0"}, started)
+                    return
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    at = int(req.get("at"))
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "at (epoch seconds) required"}, started)
+                    return
+                now = time.time()
+                if not now + WAKE_MIN_S <= at <= now + WAKE_MAX_S:
+                    self._send(400, {"error": "at must be %d-%ds out"
+                                     % (WAKE_MIN_S, WAKE_MAX_S)}, started)
+                    return
+                if not rtc_set_wake(at):
+                    self._send(500, {"error": "rtc set failed"}, started)
+                    return
+                self._send(200, {"wake": rtc_wake_info()}, started)
+                return
+
+            # POST /api/tv/<op>: TV power / volume. Volume defaults to the box's
+            # own OS volume; ?target=tv routes it to the panel/CEC backend.
+            tprefix = "/api/tv/"
+            if path.startswith(tprefix):
+                op = path[len(tprefix):]
+                # source_box/screen_toggle ride the same route but are not
+                # volume/power ops, so they are not in TV_OPS; allow explicitly.
+                if op not in TV_OPS and op not in _PANEL_ONLY_OPS:
+                    self._send(404, {"error": "unknown tv op"}, started)
+                    return
+                target = parse_qs(parsed.query).get("target", [None])[0]
+                result = tv_send(op, self.mock, target)
+                if result is None:  # nothing can handle this op
+                    self._send(404, {"error": "not found"}, started)
+                    return
+                self._send(200, result, started)
+                return
+
             self._send(404, {"error": "not found"}, started)
         except BrokenPipeError:
             pass
@@ -2353,6 +4864,17 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(404, {"error": "unknown launcher"}, started)
                     return
                 self._send(200, {"ok": True}, started)
+                return
+
+            # DELETE /api/power/sleep: cancel the armed sleep timer (idempotent).
+            if path == "/api/power/sleep":
+                sleep_cancel()
+                self._send(200, {"sleep": None}, started)
+                return
+            # DELETE /api/power/wake: clear the RTC wake alarm (idempotent).
+            if path == "/api/power/wake":
+                rtc_clear_wake()
+                self._send(200, {"wake": None}, started)
                 return
 
             self._send(404, {"error": "not found"}, started)
@@ -2476,7 +4998,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             entry["device"] = device
             print("[gamepad] connected (%s)" % device.name, flush=True)
-            ws_send_json(conn, {"t": "hello", "dev": device.name})
+            ws_send_json(conn, {"t": "hello", "dev": device.name,
+                                "text": _text_caps(self.mock)})
 
             conn.settimeout(60.0)
             buf = bytearray()
@@ -2534,6 +5057,51 @@ class Handler(BaseHTTPRequestHandler):
     _MOUSE_TYPES = frozenset(("m", "mb", "mw"))
     _KEYBOARD_TYPES = frozenset(("kt", "k"))
 
+    def _handle_kt(self, conn, entry, msg):
+        """Type text tolerantly and keep the session alive no matter what.
+
+        Typeable chars go through the uinput keyboard; genuine non-ASCII goes
+        through the clipboard-paste path. A missing keyboard device or an
+        unavailable paste path just drops the affected chars (logged once) — no
+        err frame, no close. Only a malformed message (non-string text) still
+        err+closes, preserving the protocol contract.
+        """
+        text = msg.get("text")
+        if not isinstance(text, str):
+            ws_send_json(conn, {"t": "err", "msg": "kt text must be a string"})
+            ws_send(conn, WS_OP_CLOSE)
+            return False
+        if not text:
+            return True
+        if len(text) > _KT_MAX_CHARS:
+            _paste_log_once(entry, "kt text too long (%d chars); truncated" % len(text))
+            text = text[:_KT_MAX_CHARS]
+        kbd = entry.get("keyboard")
+        if kbd is None:
+            try:
+                kbd = MockKeyboard() if self.mock else UInputKeyboard()
+            except Exception as e:
+                _paste_log_once(entry, "keyboard unavailable (%s); text dropped" % e)
+                return True
+            entry["keyboard"] = kbd
+            print("[gamepad] keyboard device created (%s)" % kbd.name, flush=True)
+        paste_runs = 0
+        for kind, chunk in _split_typeable(text):
+            if kind == "type":
+                events = _type_events(chunk)
+                if events:
+                    try:
+                        kbd.emit(events)
+                    except Exception as e:
+                        _paste_log_once(entry, "type emit failed: %s" % e)
+            else:
+                paste_runs += 1
+                if paste_runs > _KT_MAX_PASTE_RUNS:
+                    _paste_log_once(entry, "too many paste runs; remaining non-ASCII dropped")
+                    continue
+                clipboard_paste(chunk, kbd, self.mock, entry)
+        return True
+
     def _gamepad_message(self, conn, entry, device, payload):
         """Handle one text frame. Returns False when the session must end.
 
@@ -2553,6 +5121,11 @@ class Handler(BaseHTTPRequestHandler):
         if t == "ping":
             ws_send_json(conn, {"t": "pong"})
             return True
+        if t == "kt":
+            # Text passthrough is handled here, BEFORE the decode table, so it
+            # can never close the session: unmappable chars are dropped and
+            # genuine non-ASCII is pasted, all tolerantly.
+            return self._handle_kt(conn, entry, msg)
 
         # Select decoder, target device slot, and lazy device factory.
         if t in self._MOUSE_TYPES:
@@ -2631,6 +5204,11 @@ def main():
 
     load_config(args.config)
     _inject_session_actions()
+    _inject_suspend_action(args.mock)
+    set_tv(args.mock)
+    set_mpris(args.mock)
+    set_screen(args.mock)
+    set_power_schedule(args.mock)
     port = args.port if args.port is not None else (CONFIG_PORT or DEFAULT_PORT)
 
     Handler.token = load_token(args)
@@ -2645,6 +5223,12 @@ def main():
     mode = "mock" if args.mock else "real"
     print("%s %s listening on %s:%d (%s mode)" % (
         APP_NAME, VERSION, args.host, port, mode), flush=True)
+    info = tv_info()
+    print("tv: %s" % ("%s (%s)" % (info["backend"], info["adapter"])
+                      if info else "unavailable"), flush=True)
+    print("mpris: %s" % ("available" if BUSCTL else "unavailable"), flush=True)
+    print("screen: %s" % (("%s (%s)" % (_SCREEN["session"], ",".join(_SCREEN["backends"])))
+                          if _SCREEN else "unavailable"), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

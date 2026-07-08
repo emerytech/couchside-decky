@@ -44,6 +44,12 @@ SUDOERS_FILE = "/etc/sudoers.d/couchside"
 UNIT_DST = "/etc/systemd/system/couchside.service"
 UINPUT_UDEV = "/etc/udev/rules.d/99-couchside-uinput.rules"
 UINPUT_MODLOAD = "/etc/modules-load.d/couchside-uinput.conf"
+RTC_UDEV = "/etc/udev/rules.d/99-couchside-rtc.rules"
+
+# The current agent on main. Installed by preference so a plugin release can
+# never downgrade the daemon; the bundled defaults/couchsided.py is the offline
+# fallback only. (Mirrors install.sh's DAEMON_URL.)
+DAEMON_URL = "https://raw.githubusercontent.com/emerytech/couchside/main/agent/couchsided.py"
 
 # Pre-rename installs to retire: "etc_dir|unit|sudoers".
 OLD_INSTALLS = [
@@ -207,10 +213,30 @@ class Plugin:
         _run(["python3", "-m", "py_compile", src_daemon], check=True)
 
         # (c) daemon -> ~/.local/opt/couchside
+        # Prefer the CURRENT agent from GitHub main so a plugin release can never
+        # DOWNGRADE the daemon on a box already running a newer build. The bundled
+        # defaults/couchsided.py is the offline fallback (no network / fetch fails /
+        # fetched file won't compile).
         install_dir = os.path.join(home, ".local", "opt", "couchside")
         os.makedirs(install_dir, exist_ok=True)
         dst_daemon = os.path.join(install_dir, "couchsided.py")
-        shutil.copyfile(src_daemon, dst_daemon)
+        fetched = None
+        try:
+            import urllib.request
+            req = urllib.request.Request(DAEMON_URL, headers={"User-Agent": "couchside-decky"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = r.read()
+            tmp_dl = dst_daemon + ".dl"
+            with open(tmp_dl, "wb") as f:
+                f.write(data)
+            _run(["python3", "-m", "py_compile", tmp_dl], check=True)  # trust only if it compiles
+            fetched = tmp_dl
+        except Exception:
+            fetched = None
+        if fetched:
+            os.replace(fetched, dst_daemon)
+        else:
+            shutil.copyfile(src_daemon, dst_daemon)  # offline fallback: bundled copy
         os.chmod(dst_daemon, 0o755)
         # Only fix ownership of what we just created. Chowning all of ~/.local
         # would recurse into the user's Steam library (tens of GB) and blow up
@@ -262,6 +288,7 @@ class Plugin:
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl restart sddm\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl reboot\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff\n"
+            f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl suspend\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/journalctl *\n"
         )
         tmp_sudoers = os.path.join(pdir, ".couchside-sudoers.tmp")
@@ -284,6 +311,13 @@ class Plugin:
         _run(["usermod", "-aG", "input", user])
         _run(["udevadm", "control", "--reload-rules"])
         _run(["udevadm", "trigger", "--name-match=uinput"])
+
+        # (f3) /dev/rtc0 access for scheduled wake (RTC alarm). The agent is already
+        # in group 'input' (added above), so this grant needs no sudoers change.
+        with open(RTC_UDEV, "w") as f:
+            f.write('KERNEL=="rtc0", SUBSYSTEM=="rtc", GROUP="input", MODE="0660"\n')
+        _run(["udevadm", "control", "--reload-rules"])
+        _run(["udevadm", "trigger", "--subsystem-match=rtc", "--action=change"])
 
         # (g) systemd unit (render __USER__/__UID__)
         with open(src_unit) as f:
@@ -374,7 +408,7 @@ class Plugin:
             user = _target_user()
             home = pwd.getpwnam(user).pw_dir
             _run(["systemctl", "disable", "--now", "couchside.service"])
-            for p in (UNIT_DST, UINPUT_UDEV, UINPUT_MODLOAD):
+            for p in (UNIT_DST, UINPUT_UDEV, UINPUT_MODLOAD, RTC_UDEV):
                 if os.path.exists(p):
                     os.remove(p)
             _run(["systemctl", "daemon-reload"])
