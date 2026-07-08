@@ -40,6 +40,10 @@ PORT_DEFAULT = 8787
 ETC_DIR = "/etc/couchside"
 TOKEN_FILE = f"{ETC_DIR}/token"
 CONFIG_FILE = f"{ETC_DIR}/config.json"
+# Fixed-arg, root-owned journal wrapper the sudoers rule grants (no wildcards);
+# it validates its inputs so --file/--directory can't be injected. Mirrors
+# install.sh. Lives in the root-owned ETC_DIR (user can execute, not modify).
+JOURNAL_WRAPPER = f"{ETC_DIR}/couchside-journal"
 SUDOERS_FILE = "/etc/sudoers.d/couchside"
 UNIT_DST = "/etc/systemd/system/couchside.service"
 UINPUT_UDEV = "/etc/udev/rules.d/99-couchside-uinput.rules"
@@ -57,6 +61,33 @@ OLD_INSTALLS = [
     ("/etc/rescue-agent", "rescue-agent.service", "/etc/sudoers.d/rescue-agent"),
     ("/etc/couchpilot", "couchpilot.service", "/etc/sudoers.d/couchpilot"),
 ]
+
+# Written to JOURNAL_WRAPPER (root:root 0755) at install. Kept byte-identical to
+# install.sh's copy: a fixed-arg wrapper so the sudoers grant on THIS script
+# (not journalctl) can't be used to read arbitrary files as root.
+_JOURNAL_WRAPPER_SRC = """#!/usr/bin/env bash
+# couchside-journal <unit> <lines>: read ONE system unit's journal, safely.
+# The Couchside sudoers rule grants ONLY this script. It validates its inputs
+# and calls journalctl with a fixed option set, so --file/--directory can never
+# be injected (arbitrary-file read as root) the way a wildcard rule on
+# journalctl itself would allow.
+set -euo pipefail
+unit="${1:-}"
+lines="${2:-200}"
+# Unit: a strict systemd unit name — no leading dash, slash, space, or option.
+case "$unit" in
+    ''|-*|*/*|*[[:space:]]*) echo "couchside-journal: invalid unit" >&2; exit 2 ;;
+esac
+case "$unit" in
+    *.service|*.socket|*.target|*.timer|*.mount|*.scope|*.slice|*.path|*.device|*.swap|*.automount) : ;;
+    *) echo "couchside-journal: invalid unit" >&2; exit 2 ;;
+esac
+# Lines: positive integer, clamped to 1..2000.
+case "$lines" in ''|*[!0-9]*) lines=200 ;; esac
+if [ "$lines" -lt 1 ]; then lines=1; fi
+if [ "$lines" -gt 2000 ]; then lines=2000; fi
+exec journalctl -u "$unit" -n "$lines" --no-pager -o short-iso
+"""
 
 
 def _plugin_dir() -> str:
@@ -318,6 +349,14 @@ class Plugin:
             # not rewrite which privileged commands it is permitted to run.
             os.chown(CONFIG_FILE, 0, 0)
 
+        # (f0) Fixed-arg journal wrapper the sudoers rule grants. Root-owned
+        # (0755) in the root-owned ETC_DIR so the desktop user can execute but
+        # never modify it (a modifiable target would be root-code injection).
+        with open(JOURNAL_WRAPPER, "w") as f:
+            f.write(_JOURNAL_WRAPPER_SRC)
+        os.chmod(JOURNAL_WRAPPER, 0o755)
+        os.chown(JOURNAL_WRAPPER, 0, 0)
+
         # (f) sudoers rule, validated with visudo before install
         sudoers = (
             f"# couchside: passwordless sudo for EXACTLY the agent's privileged commands.\n"
@@ -325,7 +364,9 @@ class Plugin:
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl reboot\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl suspend\n"
-            f"{user} ALL=(root) NOPASSWD: /usr/bin/journalctl -u *\n"
+            # Grant the wrapper, never journalctl itself — the only way to block
+            # --file/--directory injection a wildcard journalctl rule would allow.
+            f"{user} ALL=(root) NOPASSWD: {JOURNAL_WRAPPER}\n"
         )
         tmp_sudoers = os.path.join(pdir, ".couchside-sudoers.tmp")
         with open(tmp_sudoers, "w") as f:
@@ -445,7 +486,7 @@ class Plugin:
             user = _target_user()
             home = pwd.getpwnam(user).pw_dir
             _run(["systemctl", "disable", "--now", "couchside.service"])
-            for p in (UNIT_DST, UINPUT_UDEV, UINPUT_MODLOAD, RTC_UDEV):
+            for p in (UNIT_DST, UINPUT_UDEV, UINPUT_MODLOAD, RTC_UDEV, JOURNAL_WRAPPER):
                 if os.path.exists(p):
                     os.remove(p)
             _run(["systemctl", "daemon-reload"])
