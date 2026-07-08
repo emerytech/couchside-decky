@@ -662,12 +662,6 @@ def real_journal(unit, scope, lines):
 
 
 def real_action(action_id):
-    """Run a configured action; return {ok, exit_code, stdout, stderr, duration_ms}.
-
-    Detached actions report ok=True after a ~200ms liveness probe, i.e. "not
-    already dead", NOT "succeeded"; only an already-crashed non-zero child is a
-    failure. Non-detached actions wait (timeout=15) and report the real exit code.
-    """
     spec = ACTIONS[action_id]
     env = _user_env() if spec["user_env"] else None
     start = time.monotonic()
@@ -4374,10 +4368,6 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, code, payload, started, extra_headers=None):
         body = b"" if payload is None else json.dumps(payload).encode("utf-8")
         self.send_response(code)
-        # Wildcard is safe: every /api/* data route is gated by _authorized()
-        # (a secret Bearer token the attacker's page cannot supply) before any
-        # handler runs; ACAO only governs whether JS may READ the response.
-        # /api/ping is the one intentional pre-auth route.
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers",
                          "Authorization, Content-Type")
@@ -4418,10 +4408,6 @@ class Handler(BaseHTTPRequestHandler):
         self._log(code, started)
 
     def _authorized(self):
-        # Intentionally checks self.token (startup token), not _current_token:
-        # /pair advertises a file-regenerated token live, but the API and the
-        # gamepad WS only honor the startup token until the service restarts.
-        # Keep all three in sync if you change this.
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return False
