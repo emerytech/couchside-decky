@@ -103,7 +103,12 @@ jobs:
           rm -rf pkg && mkdir -p pkg/Couchside
           cp -r LICENSE README.md plugin.json package.json main.py dist defaults pkg/Couchside/
           rm -f pkg/Couchside/dist/index.js.map
-          tar -C pkg -czf Couchside.tar.gz Couchside
+          # Store root ownership in the archive. Without this, tar records the CI
+          # runner's UID/GID (1001) and `sudo tar -x` on-box preserves it, leaving
+          # the plugin owned by a phantom user — Decky Loader then skips it at scan
+          # (it only loads root-owned plugins). install.sh also re-chowns as a
+          # belt-and-suspenders for any already-published archive.
+          tar --owner=0 --group=0 --numeric-owner -C pkg -czf Couchside.tar.gz Couchside
 
       - name: Commit synced agent + version bump
         if: steps.decide.outputs.release == 'true'
