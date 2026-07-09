@@ -51,11 +51,6 @@ UINPUT_MODLOAD = "/etc/modules-load.d/couchside-uinput.conf"
 RTC_UDEV = "/etc/udev/rules.d/99-couchside-rtc.rules"
 WOL_LINK = "/etc/systemd/network/50-couchside-wol.link"
 
-# The current agent on main. Installed by preference so a plugin release can
-# never downgrade the daemon; the bundled defaults/couchsided.py is the offline
-# fallback only. (Mirrors install.sh's DAEMON_URL.)
-DAEMON_URL = "https://raw.githubusercontent.com/emerytech/couchside/main/agent/couchsided.py"
-
 # Pre-rename installs to retire: "etc_dir|unit|sudoers".
 OLD_INSTALLS = [
     ("/etc/rescue-agent", "rescue-agent.service", "/etc/sudoers.d/rescue-agent"),
@@ -94,22 +89,115 @@ def _plugin_dir() -> str:
     return os.environ.get("DECKY_PLUGIN_DIR", os.path.dirname(os.path.abspath(__file__)))
 
 
+def _daemon_version(path: str):
+    """Parse the top-level `VERSION = "x.y.z"` string from a couchsided.py file.
+    Returns the version string, or None if the file is missing/unreadable or has
+    no recognizable VERSION line. Used for the no-downgrade check at install."""
+    import re
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(r'''\s*VERSION\s*=\s*["']([^"']+)["']''', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def _ver_tuple(v: str):
+    """A comparable tuple from a dotted version like "2.8.1". Non-numeric trailers
+    (e.g. "2.8.1-rc1") are dropped so the numeric core still compares sanely."""
+    parts = []
+    for chunk in str(v).split("."):
+        num = ""
+        for ch in chunk:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num) if num else 0)
+    return tuple(parts)
+
+
+def _ver_gt(a: str, b: str) -> bool:
+    """True if version a is strictly newer than version b."""
+    return _ver_tuple(a) > _ver_tuple(b)
+
+
+def _seat_owner() -> str:
+    """The user who owns the active graphical seat, per loginctl. Empty string if
+    it can't be determined unambiguously. This is the box's real desktop user and
+    the only trustworthy signal on a multi-user box — we grant that user
+    passwordless sudo + the input group, so we must not guess who it is."""
+    try:
+        p = _run(["loginctl", "list-sessions", "--no-legend"])
+        if p.returncode != 0:
+            return ""
+        # Prefer an active graphical seat session; fall back to any session on a
+        # seat. Collect the owning users so we can refuse to guess if ambiguous.
+        active_seat, seat_users = "", set()
+        for line in p.stdout.splitlines():
+            sid = line.split()[0] if line.split() else ""
+            if not sid:
+                continue
+            d = {}
+            s = _run(["loginctl", "show-session", sid,
+                      "-p", "Name", "-p", "Active", "-p", "Seat", "-p", "Type"])
+            if s.returncode != 0:
+                continue
+            for kv in s.stdout.splitlines():
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    d[k] = v
+            name, seat = d.get("Name", ""), d.get("Seat", "")
+            if not name or not seat:  # no seat => not a graphical local session
+                continue
+            seat_users.add(name)
+            if d.get("Active") == "yes" and d.get("Type") in ("x11", "wayland", "mir"):
+                active_seat = name
+        if active_seat:
+            return active_seat
+        # No clearly-active graphical session: only trust it if exactly one user
+        # owns a seat; otherwise stay silent so the caller aborts rather than guess.
+        if len(seat_users) == 1:
+            return next(iter(seat_users))
+        return ""
+    except Exception:
+        return ""
+
+
 def _target_user() -> str:
-    """The desktop user the agent runs as. Decky exposes it; fall back to a guess."""
-    u = os.environ.get("DECKY_USER")
-    if u:
-        return u
-    for cand in ("deck", "bazzite"):
+    """The desktop user the agent runs as — the one we grant passwordless sudo and
+    the input group. Resolve it from an authoritative source, never a guess:
+      1. DECKY_USER if set and a real account.
+      2. The owner of the active graphical seat (loginctl).
+    The deck/bazzite fast-path is used ONLY when it agrees with one of those; on a
+    multi-user box, picking an arbitrary /home user would grant privesc to the
+    wrong account, so if the source is ambiguous we raise instead of guessing."""
+    def _valid(name: str) -> bool:
+        if not name:
+            return False
         try:
-            pwd.getpwnam(cand)
-            return cand
+            pwd.getpwnam(name)
+            return True
         except KeyError:
-            continue
-    # last resort: the first regular login user
-    for p in pwd.getpwall():
-        if 1000 <= p.pw_uid < 65000 and p.pw_dir.startswith("/home/"):
-            return p.pw_name
-    return "deck"
+            return False
+
+    u = os.environ.get("DECKY_USER")
+    if _valid(u):
+        return u
+
+    seat = _seat_owner()
+    if _valid(seat):
+        # deck/bazzite fast-path only if it matches the real seat owner.
+        return seat
+
+    raise RuntimeError(
+        "couchside: cannot determine the desktop user (DECKY_USER unset and no "
+        "unambiguous active graphical seat from loginctl). Refusing to guess — "
+        "set DECKY_USER to the intended account and retry, so passwordless sudo "
+        "and the input group are never granted to the wrong user.")
 
 
 def _run(cmd, check=False):
@@ -242,7 +330,13 @@ def _gen_config(have_sddm: bool, have_kodi: bool) -> dict:
 class Plugin:
     # ---- lifecycle -------------------------------------------------------
     async def _main(self):
-        log.info("Couchside plugin loaded (target user: %s)", _target_user())
+        # _target_user() now RAISES rather than guess on an ambiguous box, so keep
+        # it out of the load path — a log line must never fail the plugin load.
+        try:
+            who = _target_user()
+        except Exception as e:
+            who = f"<unresolved: {e}>"
+        log.info("Couchside plugin loaded (target user: %s)", who)
 
     async def _unload(self):
         log.info("Couchside plugin unloaded")
@@ -271,37 +365,30 @@ class Plugin:
         _run(["python3", "-m", "py_compile", src_daemon], check=True)
 
         # (c) daemon -> ~/.local/opt/couchside
-        # Prefer the CURRENT agent from GitHub main so a plugin release can never
-        # DOWNGRADE the daemon on a box already running a newer build. The bundled
-        # defaults/couchsided.py is the offline fallback (no network / fetch fails /
-        # fetched file won't compile).
+        # Install the VENDORED, release-reviewed defaults/couchsided.py that ships
+        # in this plugin tarball. We deliberately do NOT fetch the agent live from
+        # GitHub main at install time: this backend runs as ROOT, and a live fetch
+        # would have root execute whatever happens to be on main at that moment —
+        # unreviewed, unpinned code. The release automation refreshes this vendored
+        # copy on every plugin release, so it is always the current reviewed agent
+        # and a live fetch is both unnecessary and unsafe.
+        #
+        # Preserve the original no-downgrade intent by version, not by network:
+        # compare the vendored VERSION against any already-installed agent and
+        # install the vendored one only when it is newer-or-equal. Never downgrade
+        # a box whose installed agent is somehow newer than the vendored copy.
         install_dir = os.path.join(home, ".local", "opt", "couchside")
         os.makedirs(install_dir, exist_ok=True)
         dst_daemon = os.path.join(install_dir, "couchsided.py")
-        fetched = None
-        tmp_dl = dst_daemon + ".dl"
-        try:
-            req = urllib.request.Request(DAEMON_URL, headers={"User-Agent": "couchside-decky"})
-            with urllib.request.urlopen(req, timeout=15) as r:
-                data = r.read()
-            with open(tmp_dl, "wb") as f:
-                f.write(data)
-            _run(["python3", "-m", "py_compile", tmp_dl], check=True)  # trust only if it compiles
-            fetched = tmp_dl
-        except Exception:
-            fetched = None
-        finally:
-            # A fetch/compile failure can leave a partial .dl behind; never let it
-            # linger. Only remove it here if we're NOT about to promote it below.
-            if fetched is None and os.path.exists(tmp_dl):
-                try:
-                    os.remove(tmp_dl)
-                except OSError:
-                    pass
-        if fetched:
-            os.replace(fetched, dst_daemon)
+        vendored_ver = _daemon_version(src_daemon)
+        installed_ver = _daemon_version(dst_daemon) if os.path.exists(dst_daemon) else None
+        # Install the vendored copy unless a strictly-newer agent is already there.
+        # Unknown installed version (can't parse) => treat as older and (re)install.
+        if installed_ver is not None and _ver_gt(installed_ver, vendored_ver):
+            log.info("couchside: keeping installed agent %s (newer than vendored %s)",
+                     installed_ver, vendored_ver)
         else:
-            shutil.copyfile(src_daemon, dst_daemon)  # offline fallback: bundled copy
+            shutil.copyfile(src_daemon, dst_daemon)
         os.chmod(dst_daemon, 0o755)
         # Only fix ownership of what we just created. Chowning all of ~/.local
         # would recurse into the user's Steam library (tens of GB) and blow up

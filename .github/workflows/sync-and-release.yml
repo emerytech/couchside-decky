@@ -1,10 +1,11 @@
 name: Sync agent & release plugin
 
 # Keeps this Decky plugin in lockstep with the agent in emerytech/couchside so
-# the bundled fallback never goes stale and a release is cut automatically when
-# the agent changes. Correctness does not depend on this: main.py fetches the
-# CURRENT agent from main at install time, so a box is never downgraded even if
-# a release lags. This workflow keeps the offline fallback + frontend fresh.
+# the bundled agent never goes stale and a release is cut automatically when the
+# agent changes. The plugin installs THIS bundled (release-current) agent on-box
+# with a no-downgrade check — it does NOT fetch code from main at install time
+# (that would run unreviewed code as root), so keeping this bundle fresh is what
+# keeps installs current.
 #
 # Triggers:
 #   - repository_dispatch (agent-updated): fired by couchside's notify-decky
@@ -109,6 +110,10 @@ jobs:
           # (it only loads root-owned plugins). install.sh also re-chowns as a
           # belt-and-suspenders for any already-published archive.
           tar --owner=0 --group=0 --numeric-owner -C pkg -czf Couchside.tar.gz Couchside
+          # Supply-chain integrity: publish a checksum so install.sh can verify
+          # the tarball wasn't corrupted, MITM'd, or swapped before extracting.
+          # Format: "<hash>  Couchside.tar.gz" (two spaces = `sha256sum -c` binary mode).
+          sha256sum Couchside.tar.gz > SHA256SUMS
 
       - name: Commit synced agent + version bump
         if: steps.decide.outputs.release == 'true'
@@ -129,11 +134,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v${{ steps.build.outputs.version }}"
-          notes="Auto-built plugin bundling agent ${{ steps.build.outputs.agent_ver }}. On install the plugin fetches the current agent from main; this bundle is the offline fallback."
+          notes="Auto-built plugin bundling agent ${{ steps.build.outputs.agent_ver }}. The plugin installs this bundled agent on-box with a no-downgrade check; it does not fetch code at install time. Verify Couchside.tar.gz against SHA256SUMS."
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" Couchside.tar.gz --clobber
+            gh release upload "$tag" Couchside.tar.gz SHA256SUMS --clobber
           else
-            gh release create "$tag" Couchside.tar.gz \
+            gh release create "$tag" Couchside.tar.gz SHA256SUMS \
               --title "Couchside Decky plugin $tag" \
               --notes "$notes"
           fi
