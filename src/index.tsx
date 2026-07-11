@@ -10,13 +10,15 @@ import {
 } from "@decky/ui";
 import { callable, definePlugin, toaster } from "@decky/api";
 import { useEffect, useState } from "react";
-import { FaCouch, FaRotate, FaKey, FaTrash } from "react-icons/fa6";
+import { FaCouch, FaDownload, FaRotate, FaKey, FaTrash } from "react-icons/fa6";
 import { QRCodeSVG } from "qrcode.react";
 
 // ---- backend bridges (names match main.py's Plugin methods) --------------
 type Status = { installed: boolean; running: boolean; port: number; agent_version?: string | null; uinput_ready?: boolean };
 type Pairing = { ok: boolean; host?: string; port?: number; token?: string; pair_url?: string; error?: string };
 type Result = { ok: boolean; error?: string };
+type UpdateCheck = { ok: boolean; current: string; latest?: string; update_available: boolean; error?: string };
+type UpdateResult = { ok: boolean; updated?: boolean; version?: string; error?: string };
 
 const bInstall = callable<[], Result>("install");
 const bStatus = callable<[], Status>("status");
@@ -24,11 +26,14 @@ const bPairing = callable<[], Pairing>("get_pairing");
 const bRestart = callable<[], Result>("restart_agent");
 const bRegen = callable<[], Result & { token?: string }>("regenerate_token");
 const bUninstall = callable<[boolean], Result>("uninstall");
+const bCheckUpdate = callable<[], UpdateCheck>("check_update");
+const bSelfUpdate = callable<[], UpdateResult>("self_update");
 
 function Content() {
   const [status, setStatus] = useState<Status | null>(null);
   const [pairing, setPairing] = useState<Pairing | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [upd, setUpd] = useState<UpdateCheck | null>(null);
 
   const refresh = async () => {
     try {
@@ -47,6 +52,10 @@ function Content() {
     // is mid-restart) and never update. Re-poll so the status corrects itself
     // instead of waiting for a button tap.
     const timer = setInterval(refresh, 5000);
+    // Update check is ONCE per mount, deliberately outside the 5s poll: it hits
+    // the GitHub API (60 req/h unauthenticated) and a new release mid-session
+    // is rare — reopening the panel after a Decky restart re-checks anyway.
+    bCheckUpdate().then(setUpd).catch(() => {});
     return () => clearInterval(timer);
   }, []);
 
@@ -210,6 +219,29 @@ function Content() {
             {busy === "install" ? "Updating…" : "Re-install / update"}
           </ButtonItem>
         </PanelSectionRow>
+        {upd?.update_available && (
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              disabled={busy !== null}
+              onClick={() =>
+                confirmThen(
+                  `Update plugin to v${upd.latest}?`,
+                  "Downloads the latest signed release from GitHub, verifies its signature, replaces this plugin (and the bundled agent), then restarts Decky. The Steam overlay will reload for a few seconds. After updating, tap Re-install / update to roll the new agent onto the box.",
+                  "Update",
+                  () =>
+                    withBusy("selfupdate", async () => {
+                      const r = await bSelfUpdate();
+                      return { ok: r.ok, error: r.error };
+                    }, `Updated to v${upd.latest}. Decky is reloading…`),
+                )
+              }
+            >
+              <FaDownload style={{ marginRight: 8 }} />
+              {busy === "selfupdate" ? "Updating plugin…" : `Update plugin (v${upd.current} → v${upd.latest})`}
+            </ButtonItem>
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <ButtonItem
             layout="below"
