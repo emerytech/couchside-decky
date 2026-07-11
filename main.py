@@ -510,6 +510,13 @@ class Plugin:
         else:
             shutil.copyfile(src_daemon, dst_daemon)
         os.chmod(dst_daemon, 0o755)
+        # Aerial-screensaver player (optional: only bundled in plugin >= 0.2.10).
+        # The agent's /api/screensaver launches it through a Steam shortcut.
+        src_saver = os.path.join(pdir, "defaults", "couchside-screensaver.sh")
+        if os.path.isfile(src_saver):
+            dst_saver = os.path.join(install_dir, "couchside-screensaver.sh")
+            shutil.copyfile(src_saver, dst_saver)
+            os.chmod(dst_saver, 0o755)
         # Only fix ownership of what we just created. Chowning all of ~/.local
         # would recurse into the user's Steam library (tens of GB) and blow up
         # on the broken symlinks in old steam-runtime trees. makedirs may have

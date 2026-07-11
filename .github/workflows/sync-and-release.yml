@@ -58,12 +58,21 @@ jobs:
             https://raw.githubusercontent.com/emerytech/couchside/main/agent/couchsided.py \
             -o defaults/couchsided.py
           python3 -m py_compile defaults/couchsided.py   # never ship a broken bundle
+          # Aerial-screensaver player the agent's /api/screensaver drives.
+          # Optional in older mains; required to parse when present.
+          if curl -fsSL \
+              https://raw.githubusercontent.com/emerytech/couchside/main/agent/couchside-screensaver.sh \
+              -o defaults/couchside-screensaver.sh; then
+            bash -n defaults/couchside-screensaver.sh
+          else
+            rm -f defaults/couchside-screensaver.sh
+          fi
 
       - name: Decide whether to release
         id: decide
         run: |
           agent_changed=false
-          git diff --quiet -- defaults/couchsided.py || agent_changed=true
+          git diff --quiet -- defaults/couchsided.py defaults/couchside-screensaver.sh || agent_changed=true
           release=false
           case "${{ github.event_name }}" in
             push|repository_dispatch|workflow_dispatch) release=true ;;
@@ -121,6 +130,7 @@ jobs:
           git config user.name  "couchside-bot"
           git config user.email "actions@users.noreply.github.com"
           git add defaults/couchsided.py package.json
+          git add defaults/couchside-screensaver.sh 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "nothing to commit"
           else
