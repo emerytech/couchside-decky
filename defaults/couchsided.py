@@ -23,6 +23,7 @@ import random
 import select
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -33,7 +34,7 @@ import time
 import urllib.request
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, quote, unquote
 
 try:
     import fcntl  # POSIX only; uinput needs it (Linux), absent on Windows
@@ -41,7 +42,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.5"
+VERSION = "2.9.9"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -170,6 +171,9 @@ ACTIONS = dict(DEFAULT_ACTIONS)
 ACTION_ORDER = list(DEFAULT_ACTION_ORDER)
 CONFIG_PORT = None  # optional "port" from config.json
 CONFIG_PANEL = None  # optional {"device","baud"} RS-232 panel-control config
+CONFIG_WEBOS = None  # optional {"host","mac","client_key"} LG webOS TV config
+CONFIG_SAMSUNG = None  # optional {"host","mac","token"} Samsung Tizen TV config
+CONFIG_ROKU = None  # optional {"host","name"} Roku (ECP) TV config
 # When true, the app may trigger a box-side agent update via POST
 # /api/update/apply. OFF BY DEFAULT: enabling it lets any holder of the bearer
 # token cause a (signature-verified) install + restart, so it is opt-in and can
@@ -338,13 +342,78 @@ def _parse_config(raw):
             raise ConfigError("panel.protocol must be \"newline\"")
         panel = {"device": device, "baud": int(baud), "protocol": proto}
 
-    return units, actions, order, port, launchers, panel
+    # Optional LG webOS TV (SSAP over the network). host is an IP/hostname; the
+    # optional client_key is written back here by the pairing endpoint so later
+    # starts reconnect silently; the optional mac enables Wake-on-LAN power-on.
+    webos = None
+    webos_raw = raw.get("webos")
+    if webos_raw is not None:
+        if not isinstance(webos_raw, dict):
+            raise ConfigError("webos must be an object")
+        host = webos_raw.get("host")
+        if not isinstance(host, str) or not host:
+            raise ConfigError("webos.host must be a non-empty string")
+        webos = {"host": host}
+        ck = webos_raw.get("client_key")
+        if ck is not None:
+            if not isinstance(ck, str):
+                raise ConfigError("webos.client_key must be a string")
+            webos["client_key"] = ck
+        mac = webos_raw.get("mac")
+        if mac is not None:
+            if not isinstance(mac, str):
+                raise ConfigError("webos.mac must be a string")
+            webos["mac"] = mac
+
+    # Optional Samsung Tizen TV (WS remote). host is an IP/hostname; the optional
+    # token is written back by the pairing endpoint for silent reconnects; the
+    # optional mac enables Wake-on-LAN power-on.
+    samsung = None
+    samsung_raw = raw.get("samsung")
+    if samsung_raw is not None:
+        if not isinstance(samsung_raw, dict):
+            raise ConfigError("samsung must be an object")
+        host = samsung_raw.get("host")
+        if not isinstance(host, str) or not host:
+            raise ConfigError("samsung.host must be a non-empty string")
+        samsung = {"host": host}
+        tok = samsung_raw.get("token")
+        if tok is not None:
+            if not isinstance(tok, str):
+                raise ConfigError("samsung.token must be a string")
+            samsung["token"] = tok
+        mac = samsung_raw.get("mac")
+        if mac is not None:
+            if not isinstance(mac, str):
+                raise ConfigError("samsung.mac must be a string")
+            samsung["mac"] = mac
+
+    # Optional Roku TV (ECP over HTTP). host is an IP/hostname; the optional
+    # name is a friendly label captured when the device was added. No pairing.
+    roku = None
+    roku_raw = raw.get("roku")
+    if roku_raw is not None:
+        if not isinstance(roku_raw, dict):
+            raise ConfigError("roku must be an object")
+        host = roku_raw.get("host")
+        if not isinstance(host, str) or not host:
+            raise ConfigError("roku.host must be a non-empty string")
+        roku = {"host": host}
+        name = roku_raw.get("name")
+        if name is not None:
+            if not isinstance(name, str):
+                raise ConfigError("roku.name must be a string")
+            roku["name"] = name
+
+    return (units, actions, order, port, launchers, panel, webos, samsung,
+            roku)
 
 
 def load_config(path):
     """Load config.json into the module globals; fall back to defaults."""
     global WATCHLIST, WATCHLIST_NAMES, ACTIONS, ACTION_ORDER, CONFIG_PORT
-    global LAUNCHERS, CONFIG_PATH, CONFIG_PANEL, ALLOW_APP_UPDATE
+    global LAUNCHERS, CONFIG_PATH, CONFIG_PANEL, CONFIG_WEBOS, CONFIG_SAMSUNG
+    global CONFIG_ROKU, ALLOW_APP_UPDATE
     CONFIG_PATH = path  # remembered so launcher POST/DELETE can rewrite it
     try:
         with open(path) as f:
@@ -353,7 +422,8 @@ def load_config(path):
         # it must be honored even if _parse_config later rejects some other field.
         if isinstance(raw, dict):
             ALLOW_APP_UPDATE = bool(raw.get("allow_app_update", False))
-        units, actions, order, port, launchers, panel = _parse_config(raw)
+        (units, actions, order, port, launchers, panel, webos, samsung,
+         roku) = _parse_config(raw)
     except FileNotFoundError:
         print("warning: config %s not found, using built-in generic defaults"
               % path, file=sys.stderr, flush=True)
@@ -369,6 +439,9 @@ def load_config(path):
     CONFIG_PORT = port
     LAUNCHERS = launchers
     CONFIG_PANEL = panel
+    CONFIG_WEBOS = webos
+    CONFIG_SAMSUNG = samsung
+    CONFIG_ROKU = roku
     print("config loaded from %s: %d units, %d actions, %d launchers"
           % (path, len(WATCHLIST), len(ACTIONS), len(LAUNCHERS)), flush=True)
 
@@ -3173,6 +3246,740 @@ def mock_soft(op):
             "stderr": "", "duration_ms": 100}
 
 
+# ---- webOS backend (LG consumer TVs, SSAP over a stdlib WebSocket) ---------
+# Consumer webOS TVs speak SSAP: JSON request/response over a TLS WebSocket on
+# port 3001 (the TV serves a self-signed cert). The WebSocket (RFC 6455) is
+# hand-rolled below so the agent stays pure-stdlib (see the module docstring) —
+# Bazzite/SteamOS are immutable, so a pip dependency is not an option. The
+# pywebostv project was the protocol oracle; nothing from it ships here.
+#
+# Pairing: the first connect raises an Accept prompt on the TV and returns a
+# client-key, which the pairing endpoint persists in config.json (webos.
+# client_key) so later reconnects are silent. power_off is an SSAP call;
+# power_ON is impossible over the socket (a TV that is off has dropped its
+# network stack), so it is a Wake-on-LAN magic packet to webos.mac. D-pad and
+# media buttons ride a SECOND "pointer" WebSocket whose URL the TV returns from
+# getPointerInputSocket.
+#
+# CONFIG-DRIVEN like the panel backend: present only when config named a webos
+# host AND a client_key has been paired (or in --mock). The socket is opened
+# lazily so a powered-off TV never blocks startup or the appear-probe.
+WEBOS_PORT = 3001
+_WEBOS_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# Register manifest — verbatim LG/pywebostv value. The `signed` sub-object is
+# covered by the static `signature`, so it must be byte-for-byte identical or
+# the TV rejects the session with "401 insufficient permissions". Embedded as
+# an ASCII (\uXXXX-escaped) JSON string so no multibyte source bytes can drift;
+# json.loads() reconstitutes the exact object at pairing time.
+_WEBOS_REGISTER_JSON = '{"forcePairing":false,"manifest":{"appVersion":"1.1","manifestVersion":1,"permissions":["LAUNCH","LAUNCH_WEBAPP","APP_TO_APP","CLOSE","TEST_OPEN","TEST_PROTECTED","CONTROL_AUDIO","CONTROL_DISPLAY","CONTROL_INPUT_JOYSTICK","CONTROL_INPUT_MEDIA_RECORDING","CONTROL_INPUT_MEDIA_PLAYBACK","CONTROL_INPUT_TV","CONTROL_POWER","READ_APP_STATUS","READ_CURRENT_CHANNEL","READ_INPUT_DEVICE_LIST","READ_NETWORK_STATE","READ_RUNNING_APPS","READ_TV_CHANNEL_LIST","WRITE_NOTIFICATION_TOAST","READ_POWER_STATE","READ_COUNTRY_INFO","READ_SETTINGS","CONTROL_TV_SCREEN","CONTROL_TV_STANBY","CONTROL_FAVORITE_GROUP","CONTROL_USER_INFO","CHECK_BLUETOOTH_DEVICE","CONTROL_BLUETOOTH","CONTROL_TIMER_INFO","STB_INTERNAL_CONNECTION","CONTROL_RECORDING","READ_RECORDING_STATE","WRITE_RECORDING_LIST","READ_RECORDING_LIST","READ_RECORDING_SCHEDULE","WRITE_RECORDING_SCHEDULE","READ_STORAGE_DEVICE_LIST","READ_TV_PROGRAM_INFO","CONTROL_BOX_CHANNEL","READ_TV_ACR_AUTH_TOKEN","READ_TV_CONTENT_STATE","READ_TV_CURRENT_TIME","ADD_LAUNCHER_CHANNEL","SET_CHANNEL_SKIP","RELEASE_CHANNEL_SKIP","CONTROL_CHANNEL_BLOCK","DELETE_SELECT_CHANNEL","CONTROL_CHANNEL_GROUP","SCAN_TV_CHANNELS","CONTROL_TV_POWER","CONTROL_WOL"],"signatures":[{"signature":"eyJhbGdvcml0aG0iOiJSU0EtU0hBMjU2Iiwia2V5SWQiOiJ0ZXN0LXNpZ25pbmctY2VydCIsInNpZ25hdHVyZVZlcnNpb24iOjF9.hrVRgjCwXVvE2OOSpDZ58hR+59aFNwYDyjQgKk3auukd7pcegmE2CzPCa0bJ0ZsRAcKkCTJrWo5iDzNhMBWRyaMOv5zWSrthlf7G128qvIlpMT0YNY+n/FaOHE73uLrS/g7swl3/qH/BGFG2Hu4RlL48eb3lLKqTt2xKHdCs6Cd4RMfJPYnzgvI4BNrFUKsjkcu+WD4OO2A27Pq1n50cMchmcaXadJhGrOqH5YmHdOCj5NSHzJYrsW0HPlpuAx/ECMeIZYDh6RMqaFM2DXzdKX9NmmyqzJ3o/0lkk/N97gfVRLW5hA29yeAwaCViZNCP8iC9aO0q9fQojoa7NQnAtw==","signatureVersion":1}],"signed":{"appId":"com.lge.test","created":"20140509","localizedAppNames":{"":"LG Remote App","ko-KR":"\\ub9ac\\ubaa8\\ucee8 \\uc571","zxx-XX":"\\u041b\\u0413 R\\u044d\\u043cot\\u044d A\\u041f\\u041f"},"localizedVendorNames":{"":"LG Electronics"},"permissions":["TEST_SECURE","CONTROL_INPUT_TEXT","CONTROL_MOUSE_AND_KEYBOARD","READ_INSTALLED_APPS","READ_LGE_SDX","READ_NOTIFICATIONS","SEARCH","WRITE_SETTINGS","WRITE_NOTIFICATION_ALERT","CONTROL_POWER","READ_CURRENT_CHANNEL","READ_RUNNING_APPS","READ_UPDATE_INFO","UPDATE_FROM_REMOTE_APP","READ_LGE_TV_INPUT_EVENTS","READ_TV_CURRENT_TIME"],"serial":"2f930e2d2cfe083771f68e4fe7bb07","vendorId":"com.lge"}},"pairingType":"PROMPT"}'
+
+# Unified TV op -> (ssap uri, payload or None). "mute" (a toggle) and "power_on"
+# (Wake-on-LAN) are handled specially in real_webos, so they are not here.
+_WEBOS_OP_URI = {
+    "power_off": ("ssap://system/turnOff", None),
+    "volume_up": ("ssap://audio/volumeUp", None),
+    "volume_down": ("ssap://audio/volumeDown", None),
+}
+
+# Factory-remote key (shared PANEL_KEYS vocabulary) -> webOS pointer button name.
+_WEBOS_KEYS = {
+    "up": "UP", "down": "DOWN", "left": "LEFT", "right": "RIGHT", "ok": "ENTER",
+    "menu": "MENU", "home": "HOME", "back": "BACK", "exit": "EXIT", "info": "INFO",
+    "play": "PLAY", "pause": "PAUSE", "stop": "STOP", "rewind": "REWIND",
+    "fast_forward": "FASTFORWARD",
+}
+
+
+class _WebOSWS:
+    """Barebones RFC 6455 text-frame client over TLS (accepts the TV's
+    self-signed cert). One frame per message; server frames are never masked."""
+
+    def __init__(self, url, timeout=6):
+        u = urlparse(url)
+        host, port = u.hostname, (u.port or WEBOS_PORT)
+        sock = socket.create_connection((host, port), timeout=timeout)
+        if u.scheme == "wss":
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+        sock.settimeout(timeout)
+        self.sock = sock
+        req_path = (u.path or "/") + (("?" + u.query) if u.query else "")
+        self._handshake(host, port, req_path)
+
+    def _handshake(self, host, port, path):
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = ("GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n" % (path, host, port, key))
+        self.sock.sendall(req.encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = self.sock.recv(1)
+            if not chunk:
+                raise IOError("websocket closed during handshake")
+            resp += chunk
+        accept = base64.b64encode(
+            hashlib.sha1((key + _WEBOS_WS_GUID).encode()).digest()).decode()
+        if b" 101 " not in resp.split(b"\r\n", 1)[0] or accept.encode() not in resp:
+            raise IOError("websocket handshake rejected")
+
+    def _recv_exact(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise IOError("websocket closed mid-frame")
+            buf += chunk
+        return buf
+
+    def send_text(self, text):
+        data = text.encode()
+        n = len(data)
+        hdr = bytes([0x81])                       # FIN + text opcode
+        if n < 126:
+            hdr += bytes([0x80 | n])
+        elif n < 65536:
+            hdr += bytes([0x80 | 126]) + struct.pack("!H", n)
+        else:
+            hdr += bytes([0x80 | 127]) + struct.pack("!Q", n)
+        mask = os.urandom(4)
+        self.sock.sendall(hdr + mask
+                          + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv_text(self):
+        while True:
+            b0, b1 = self._recv_exact(2)
+            opcode, length = b0 & 0x0F, b1 & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._recv_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._recv_exact(8))[0]
+            payload = self._recv_exact(length) if length else b""
+            if opcode == 0x8:                     # close
+                raise IOError("websocket closed by TV")
+            if opcode in (0x9, 0xA):              # ping / pong -> ignore
+                continue
+            return payload.decode(errors="ignore")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class _WebOSSession:
+    """One SSAP session: the control socket plus a lazily-opened pointer socket
+    for button presses. Not internally locked — callers serialize via
+    WEBOS_LOCK."""
+
+    def __init__(self, host):
+        self.ws = _WebOSWS("wss://%s:%d/" % (host, WEBOS_PORT))
+        self._id = 0
+        self.pointer = None
+
+    def _send(self, obj):
+        self._id += 1
+        obj["id"] = "cs_%d" % self._id
+        self.ws.send_text(json.dumps(obj))
+        return obj["id"]
+
+    def register(self, client_key, timeout=60):
+        """Send the register handshake; return (client_key, prompted). A valid
+        client_key registers silently; otherwise the TV shows an Accept prompt
+        and the returned key must be persisted."""
+        payload = json.loads(_WEBOS_REGISTER_JSON)
+        if client_key:
+            payload["client-key"] = client_key
+        self._send({"type": "register", "payload": payload})
+        prompted = False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = json.loads(self.ws.recv_text())
+            if msg.get("payload", {}).get("pairingType") == "PROMPT":
+                prompted = True
+            elif msg.get("type") == "registered":
+                return msg["payload"]["client-key"], prompted
+            elif msg.get("type") == "error":
+                raise IOError(msg.get("error", "register failed"))
+        raise IOError("pairing timed out")
+
+    def request(self, uri, payload=None, timeout=6):
+        obj = {"type": "request", "uri": uri}
+        if payload is not None:
+            obj["payload"] = payload
+        rid = self._send(obj)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = json.loads(self.ws.recv_text())
+            if msg.get("id") == rid:
+                if msg.get("type") == "error":
+                    raise IOError(msg.get("error", "ssap error"))
+                return msg.get("payload", {})
+        raise IOError("ssap request timed out: %s" % uri)
+
+    def button(self, name):
+        if self.pointer is None:
+            p = self.request(
+                "ssap://com.webos.service.networkinput/getPointerInputSocket")
+            path = p.get("socketPath")
+            if not path:
+                raise IOError("no pointer socket path")
+            self.pointer = _WebOSWS(path)
+        self.pointer.send_text("type:button\nname:%s\n\n" % name)
+
+    def close(self):
+        if self.pointer:
+            self.pointer.close()
+        self.ws.close()
+
+
+WEBOS = None            # active _WebOSSession, or None until first use
+WEBOS_LOCK = threading.Lock()
+_WEBOS_MOCK = False
+# Last mute state we applied. webOS reports muted=None when no audio session is
+# active (e.g. the home screen), so a read-then-invert toggle would re-mute
+# forever; we fall back to this tracked value when the TV can't report.
+_WEBOS_LAST_MUTE = False
+
+
+def set_webos(mock):
+    """Prepare the webos backend. In --mock it is always 'available' and ops are
+    logged (no socket). Real availability is decided by config (see
+    webos_available); the socket is opened lazily on first use, not here."""
+    global WEBOS, _WEBOS_MOCK
+    _WEBOS_MOCK = mock
+    if WEBOS is not None:
+        WEBOS.close()
+    WEBOS = None
+
+
+def webos_available():
+    """True when the webos backend can serve requests: --mock, or config named a
+    host and a client_key is present (i.e. the TV has been paired)."""
+    if _WEBOS_MOCK:
+        return True
+    return bool(CONFIG_WEBOS and CONFIG_WEBOS.get("client_key"))
+
+
+def _webos_conn():
+    """Return a live registered _WebOSSession, (re)connecting as needed. Caller
+    MUST hold WEBOS_LOCK."""
+    global WEBOS
+    if WEBOS is None:
+        sess = _WebOSSession(CONFIG_WEBOS["host"])
+        sess.register(CONFIG_WEBOS.get("client_key"))
+        WEBOS = sess
+    return WEBOS
+
+
+def _webos_result(start, ok, note):
+    return {"ok": ok, "exit_code": 0 if ok else -1,
+            "stdout": note if ok else "", "stderr": "" if ok else note,
+            "duration_ms": int((time.monotonic() - start) * 1000)}
+
+
+def _webos_do(fn):
+    """Run fn(session) under the lock, with one reconnect+retry on a socket
+    error (the TV drops idle sockets and may have rebooted). ActionResult."""
+    global WEBOS
+    start = time.monotonic()
+    with WEBOS_LOCK:
+        for attempt in (1, 2):
+            try:
+                return _webos_result(start, True, fn(_webos_conn()) or "ok")
+            except (IOError, OSError, ValueError, KeyError) as e:
+                if WEBOS is not None:
+                    WEBOS.close()
+                WEBOS = None                      # force reconnect on retry
+                if attempt == 2:
+                    return _webos_result(
+                        start, False, "%s: %s" % (e.__class__.__name__, e))
+
+
+def real_webos(op):
+    """Dispatch a unified TV op. power_on is Wake-on-LAN (the TV is
+    unreachable when off); mute toggles; the rest are SSAP calls."""
+    if op == "power_on":
+        return _webos_wol()
+    if op == "mute":
+        def toggle(s):
+            global _WEBOS_LAST_MUTE
+            reported = s.request("ssap://audio/getVolume").get("muted")
+            muted = _WEBOS_LAST_MUTE if reported is None else bool(reported)
+            _WEBOS_LAST_MUTE = not muted
+            s.request("ssap://audio/setMute", {"mute": _WEBOS_LAST_MUTE})
+            return "mute -> %s" % _WEBOS_LAST_MUTE
+        return _webos_do(toggle)
+    uri_payload = _WEBOS_OP_URI.get(op)
+    if uri_payload is None:
+        return _webos_result(time.monotonic(), False, "unsupported op %s" % op)
+    uri, payload = uri_payload
+    return _webos_do(lambda s: (s.request(uri, payload), op)[1])
+
+
+def real_webos_key(k):
+    """Send one factory-remote key (PANEL_KEYS vocabulary) as a pointer button."""
+    name = _WEBOS_KEYS.get(k)
+    if name is None:
+        return _webos_result(time.monotonic(), False, "unknown key %s" % k)
+    return _webos_do(lambda s: (s.button(name), "key %s" % k)[1])
+
+
+def real_webos_text(text):
+    """Insert text into the focused webOS field via the IME."""
+    return _webos_do(lambda s: (s.request(
+        "ssap://com.webos.service.ime/insertText",
+        {"text": text, "replace": 0}), "text (%d chars)" % len(text))[1])
+
+
+def _webos_wol():
+    """Wake-on-LAN magic packet to webos.mac. power_on has no SSAP form (a TV
+    that is off has no live socket), so WoL is the only wake path; it works only
+    when the TV has 'Mobile TV On'/'Quick Start+' enabled."""
+    start = time.monotonic()
+    mac = (CONFIG_WEBOS or {}).get("mac")
+    if not mac:
+        return _webos_result(start, False, "no webos.mac configured for wake")
+    try:
+        raw = bytes.fromhex(mac.replace(":", "").replace("-", ""))
+        if len(raw) != 6:
+            raise ValueError("mac must be 6 bytes")
+        packet = b"\xff" * 6 + raw * 16
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(packet, ("255.255.255.255", 9))
+        finally:
+            s.close()
+        return _webos_result(start, True, "wol -> %s" % mac)
+    except (ValueError, OSError) as e:
+        return _webos_result(start, False, "wol failed: %s" % e)
+
+
+def mock_webos(op):
+    """--mock stand-in: log the op, open no socket, succeed."""
+    time.sleep(0.05)
+    print("[webos] %s" % op, flush=True)
+    return {"ok": True, "exit_code": 0, "stdout": "[mock webos] %s\n" % op,
+            "stderr": "", "duration_ms": 50}
+
+
+def webos_pair(host, timeout=60):
+    """Open a fresh session to <host> (the TV shows an Accept prompt) and return
+    the granted client_key. Raises IOError on rejection/timeout. The caller
+    persists host+key to config so later sessions register silently."""
+    sess = _WebOSSession(host)
+    try:
+        client_key, _prompted = sess.register(
+            (CONFIG_WEBOS or {}).get("client_key"), timeout=timeout)
+        return client_key
+    finally:
+        sess.close()
+
+
+def _webos_save(host, client_key, mac=None):
+    """Persist the paired webOS config to CONFIG_PATH atomically (same temp-file
+    + os.replace pattern as the launcher writer) and update CONFIG_WEBOS. Holds
+    CONFIG_LOCK so a concurrent config rewrite can't clobber it. The caller
+    refreshes set_webos/set_caps afterwards."""
+    cfg = {"host": host, "client_key": client_key}
+    if mac:
+        cfg["mac"] = mac
+    global CONFIG_WEBOS
+    with CONFIG_LOCK:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            raw = None
+        if not isinstance(raw, dict):
+            raw = {"units": [{"name": n, "scope": s} for n, s in WATCHLIST]}
+        raw["webos"] = cfg
+        directory = os.path.dirname(CONFIG_PATH) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".couchside-config-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(raw, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CONFIG_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        CONFIG_WEBOS = cfg
+
+
+# ---- shared helpers for the network TV backends ---------------------------
+def _wol_send(mac):
+    """Send a Wake-on-LAN magic packet to <mac> (broadcast :9). ActionResult.
+    Shared by the network TV backends: a TV that is off has no live socket, so
+    WoL is the only way to power it on (needs the TV's fast-wake setting on)."""
+    start = time.monotonic()
+    if not mac:
+        return _webos_result(start, False, "no mac configured for wake")
+    try:
+        raw = bytes.fromhex(mac.replace(":", "").replace("-", ""))
+        if len(raw) != 6:
+            raise ValueError("mac must be 6 bytes")
+        packet = b"\xff" * 6 + raw * 16
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(packet, ("255.255.255.255", 9))
+        finally:
+            s.close()
+        return _webos_result(start, True, "wol -> %s" % mac)
+    except (ValueError, OSError) as e:
+        return _webos_result(start, False, "wol failed: %s" % e)
+
+
+def _config_set_field(field, value):
+    """Read-modify-write CONFIG_PATH, setting top-level <field> = value, via the
+    same atomic temp-file + os.replace pattern as the launcher writer. Caller
+    MUST hold CONFIG_LOCK."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = None
+    if not isinstance(raw, dict):
+        raw = {"units": [{"name": n, "scope": s} for n, s in WATCHLIST]}
+    raw[field] = value
+    directory = os.path.dirname(CONFIG_PATH) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".couchside-config-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(raw, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ---- Samsung backend (Tizen Smart TVs, WS remote over the stdlib WebSocket) -
+# Samsung Tizen TVs expose a WebSocket remote at
+# wss://<host>:8002/api/v2/channels/samsung.remote.control?name=<b64>[&token=].
+# It reuses the _WebOSWS transport built for webOS (self-signed cert, same RFC
+# 6455 framing) — only the message schema differs, so no new dependency
+# (samsungtvws was the protocol oracle; nothing from it ships). Pre-2016 sets
+# use plaintext ws://<host>:8001 and are not handled.
+#
+# Pairing: the first connect (no token) raises an Allow prompt on the TV; once
+# accepted, the TV's ms.channel.connect event carries a token that the pairing
+# endpoint persists (config.json samsung.token) for silent reconnects. Keys are
+# fire-and-forget ms.remote.control commands. power_off is KEY_POWER (a toggle);
+# power_ON is a Wake-on-LAN magic packet to samsung.mac.
+SAMSUNG_PORT = 8002
+_SAMSUNG_NAME_B64 = base64.b64encode(b"Couchside").decode()
+
+# Unified TV op -> Samsung key. KEY_MUTE is itself a toggle (no state tracking);
+# power_on is Wake-on-LAN, not a key.
+_SAMSUNG_OP_KEY = {
+    "power_off": "KEY_POWER",
+    "volume_up": "KEY_VOLUP",
+    "volume_down": "KEY_VOLDOWN",
+    "mute": "KEY_MUTE",
+}
+
+# Factory-remote key (shared PANEL_KEYS/_WEBOS_KEYS vocabulary) -> Samsung code.
+_SAMSUNG_KEYS = {
+    "up": "KEY_UP", "down": "KEY_DOWN", "left": "KEY_LEFT", "right": "KEY_RIGHT",
+    "ok": "KEY_ENTER", "menu": "KEY_MENU", "home": "KEY_HOME", "back": "KEY_RETURN",
+    "exit": "KEY_EXIT", "info": "KEY_INFO", "play": "KEY_PLAY", "pause": "KEY_PAUSE",
+    "stop": "KEY_STOP", "rewind": "KEY_REWIND", "fast_forward": "KEY_FF",
+}
+
+
+class _SamsungSession:
+    """One Tizen WS remote session. After the ms.channel.connect handshake the
+    socket accepts fire-and-forget commands. Not internally locked — callers
+    serialize via SAMSUNG_LOCK."""
+
+    def __init__(self, host, token=None):
+        url = ("wss://%s:%d/api/v2/channels/samsung.remote.control?name=%s"
+               % (host, SAMSUNG_PORT, _SAMSUNG_NAME_B64))
+        if token:
+            url += "&token=" + token
+        self.ws = _WebOSWS(url)
+        self.token = token
+        self._connect()
+
+    def _connect(self, timeout=60):
+        """Read events until the channel is authorized. Captures the token the
+        TV grants on first pairing (or rotates)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = json.loads(self.ws.recv_text())
+            event = msg.get("event")
+            if event == "ms.channel.connect":
+                tok = msg.get("data", {}).get("token")
+                if tok:
+                    self.token = str(tok)
+                return
+            if event == "ms.channel.unauthorized":
+                raise IOError("authorization denied on the TV")
+        raise IOError("Samsung authorization timed out")
+
+    def send_key(self, key):
+        self.ws.send_text(json.dumps({
+            "method": "ms.remote.control",
+            "params": {"Cmd": "Click", "DataOfCmd": key, "Option": "false",
+                       "TypeOfRemote": "SendRemoteKey"}}))
+
+    def send_text(self, text):
+        enc = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        self.ws.send_text(json.dumps({
+            "method": "ms.remote.control",
+            "params": {"Cmd": enc, "DataOfCmd": "base64",
+                       "TypeOfRemote": "SendInputString"}}))
+
+    def close(self):
+        self.ws.close()
+
+
+SAMSUNG = None            # active _SamsungSession, or None until first use
+SAMSUNG_LOCK = threading.Lock()
+_SAMSUNG_MOCK = False
+
+
+def set_samsung(mock):
+    """Prepare the Samsung backend (mirrors set_webos)."""
+    global SAMSUNG, _SAMSUNG_MOCK
+    _SAMSUNG_MOCK = mock
+    if SAMSUNG is not None:
+        SAMSUNG.close()
+    SAMSUNG = None
+
+
+def samsung_available():
+    """True in --mock, or when config named a host and a token is present (i.e.
+    the TV has been paired)."""
+    if _SAMSUNG_MOCK:
+        return True
+    return bool(CONFIG_SAMSUNG and CONFIG_SAMSUNG.get("token"))
+
+
+def _samsung_conn():
+    """Return a live connected _SamsungSession. Caller MUST hold SAMSUNG_LOCK."""
+    global SAMSUNG
+    if SAMSUNG is None:
+        SAMSUNG = _SamsungSession(CONFIG_SAMSUNG["host"],
+                                  CONFIG_SAMSUNG.get("token"))
+    return SAMSUNG
+
+
+def _samsung_do(fn):
+    """Run fn(session) under the lock, with one reconnect+retry. ActionResult."""
+    global SAMSUNG
+    start = time.monotonic()
+    with SAMSUNG_LOCK:
+        for attempt in (1, 2):
+            try:
+                return _webos_result(start, True, fn(_samsung_conn()) or "ok")
+            except (IOError, OSError, ValueError, KeyError) as e:
+                if SAMSUNG is not None:
+                    SAMSUNG.close()
+                SAMSUNG = None
+                if attempt == 2:
+                    return _webos_result(
+                        start, False, "%s: %s" % (e.__class__.__name__, e))
+
+
+def real_samsung(op):
+    """Dispatch a unified TV op. power_on is Wake-on-LAN; the rest are keys."""
+    if op == "power_on":
+        return _wol_send((CONFIG_SAMSUNG or {}).get("mac"))
+    key = _SAMSUNG_OP_KEY.get(op)
+    if key is None:
+        return _webos_result(time.monotonic(), False, "unsupported op %s" % op)
+    return _samsung_do(lambda s: (s.send_key(key), op)[1])
+
+
+def real_samsung_key(k):
+    """Send one factory-remote key (PANEL_KEYS vocabulary) as a Tizen key."""
+    code = _SAMSUNG_KEYS.get(k)
+    if code is None:
+        return _webos_result(time.monotonic(), False, "unknown key %s" % k)
+    return _samsung_do(lambda s: (s.send_key(code), "key %s" % k)[1])
+
+
+def real_samsung_text(text):
+    """Send text to a focused on-TV field (Tizen SendInputString)."""
+    return _samsung_do(
+        lambda s: (s.send_text(text), "text (%d chars)" % len(text))[1])
+
+
+def mock_samsung(op):
+    """--mock stand-in: log the op, open no socket, succeed."""
+    time.sleep(0.05)
+    print("[samsung] %s" % op, flush=True)
+    return {"ok": True, "exit_code": 0, "stdout": "[mock samsung] %s\n" % op,
+            "stderr": "", "duration_ms": 50}
+
+
+def samsung_pair(host, timeout=60):
+    """Connect without a saved token so the TV shows an Allow prompt; return the
+    token the TV grants once the user accepts. Raises IOError on rejection or
+    timeout. The caller persists host+token to config for silent reconnects."""
+    sess = _SamsungSession(host, (CONFIG_SAMSUNG or {}).get("token"))
+    try:
+        if not sess.token:
+            raise IOError("TV did not grant a token")
+        return sess.token
+    finally:
+        sess.close()
+
+
+def _samsung_save(host, token, mac=None):
+    """Persist the paired Samsung config to CONFIG_PATH atomically and update
+    CONFIG_SAMSUNG. Holds CONFIG_LOCK."""
+    cfg = {"host": host, "token": token}
+    if mac:
+        cfg["mac"] = mac
+    global CONFIG_SAMSUNG
+    with CONFIG_LOCK:
+        _config_set_field("samsung", cfg)
+        CONFIG_SAMSUNG = cfg
+
+
+# ---- Roku backend (ECP over plain HTTP) -----------------------------------
+# Roku devices expose the External Control Protocol (ECP) as an unauthenticated
+# HTTP service on port 8060 — no pairing, no token, no WebSocket. Key presses
+# are POST /keypress/<KEY>; power on/off are ECP keys too (Roku TVs stay
+# reachable in standby, so unlike webOS/Samsung there is no Wake-on-LAN).
+# Stateless: each op is a one-shot POST, so there is no session or lock.
+# Config-driven; a reachable host is enough (nothing to pair).
+ROKU_PORT = 8060
+
+# Unified TV op -> ECP key. Roku TVs wake over the network, so power_on is the
+# PowerOn key (not Wake-on-LAN); mute (VolumeMute) self-toggles.
+_ROKU_OP_KEY = {
+    "power_off": "PowerOff", "power_on": "PowerOn",
+    "volume_up": "VolumeUp", "volume_down": "VolumeDown", "mute": "VolumeMute",
+}
+
+# Factory-remote key (shared vocabulary) -> ECP key. Roku has no distinct
+# pause/stop (Play toggles) and no menu (Info is the "*" options key).
+_ROKU_KEYS = {
+    "up": "Up", "down": "Down", "left": "Left", "right": "Right", "ok": "Select",
+    "menu": "Info", "home": "Home", "back": "Back", "exit": "Home", "info": "Info",
+    "play": "Play", "pause": "Play", "stop": "Play", "rewind": "Rev",
+    "fast_forward": "Fwd",
+}
+
+
+def _roku_tag(xml, tag):
+    """Extract <tag>...</tag> text from a Roku ECP XML blob, or None."""
+    open_t, close_t = "<%s>" % tag, "</%s>" % tag
+    a = xml.find(open_t)
+    if a < 0:
+        return None
+    a += len(open_t)
+    b = xml.find(close_t, a)
+    return xml[a:b].strip() if b > a else None
+
+
+def _roku_post(host, path, timeout=4):
+    """POST an empty body to a Roku ECP path. ActionResult-shaped."""
+    start = time.monotonic()
+    url = "http://%s:%d/%s" % (host, ROKU_PORT, path)
+    try:
+        req = urllib.request.Request(url, data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read()
+        return _webos_result(start, True, path)
+    except OSError as e:            # URLError / HTTPError are OSError subclasses
+        return _webos_result(start, False, "%s: %s" % (e.__class__.__name__, e))
+
+
+ROKU_MOCK = False
+
+
+def set_roku(mock):
+    """Prepare the Roku backend. Nothing to open (stateless HTTP)."""
+    global ROKU_MOCK
+    ROKU_MOCK = mock
+
+
+def roku_available():
+    """True in --mock, or when config named a Roku host (no pairing needed)."""
+    if ROKU_MOCK:
+        return True
+    return bool(CONFIG_ROKU and CONFIG_ROKU.get("host"))
+
+
+def real_roku(op):
+    """Dispatch a unified TV op to an ECP keypress (power on/off included)."""
+    key = _ROKU_OP_KEY.get(op)
+    if key is None:
+        return _webos_result(time.monotonic(), False, "unsupported op %s" % op)
+    return _roku_post(CONFIG_ROKU["host"], "keypress/" + key)
+
+
+def real_roku_key(k):
+    """Send one factory-remote key (PANEL_KEYS vocabulary) as an ECP keypress."""
+    key = _ROKU_KEYS.get(k)
+    if key is None:
+        return _webos_result(time.monotonic(), False, "unknown key %s" % k)
+    return _roku_post(CONFIG_ROKU["host"], "keypress/" + key)
+
+
+def real_roku_text(text):
+    """Type text via ECP Lit_ keypresses, one character at a time."""
+    host = CONFIG_ROKU["host"]
+    for ch in text:
+        r = _roku_post(host, "keypress/Lit_" + quote(ch, safe=""))
+        if not r["ok"]:
+            return r
+    return _webos_result(time.monotonic(), True, "text (%d chars)" % len(text))
+
+
+def mock_roku(op):
+    """--mock stand-in: log the op, touch no network, succeed."""
+    time.sleep(0.02)
+    print("[roku] %s" % op, flush=True)
+    return {"ok": True, "exit_code": 0, "stdout": "[mock roku] %s\n" % op,
+            "stderr": "", "duration_ms": 20}
+
+
+def roku_add(host, timeout=4):
+    """Verify a Roku answers ECP at <host> and return its friendly name (Roku
+    needs no pairing). Raises IOError when it does not respond."""
+    url = "http://%s:%d/query/device-info" % (host, ROKU_PORT)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            xml = r.read().decode(errors="ignore")
+    except OSError as e:
+        raise IOError("Roku not reachable at %s: %s" % (host, e))
+    return (_roku_tag(xml, "user-device-name")
+            or _roku_tag(xml, "friendly-device-name")
+            or _roku_tag(xml, "default-device-name")
+            or _roku_tag(xml, "model-name") or host)
+
+
+def _roku_save(host, name):
+    """Persist the Roku config to CONFIG_PATH atomically and update CONFIG_ROKU."""
+    cfg = {"host": host, "name": name}
+    global CONFIG_ROKU
+    with CONFIG_LOCK:
+        _config_set_field("roku", cfg)
+        CONFIG_ROKU = cfg
+
+
 # ---- unified dispatch -----------------------------------------------------
 # CEC has no discrete power-off; its standby command IS the off state.
 _TV_TO_CEC = {"power_on": "power_on", "power_off": "standby",
@@ -3190,15 +3997,25 @@ def set_tv(mock):
     """Probe every TV backend at startup (call after load_config)."""
     set_cec(mock)
     set_panel(mock)
+    set_webos(mock)
+    set_samsung(mock)
+    set_roku(mock)
     set_soft(mock)
 
 
 def _tv_hw_backend():
     """The external TV backend for power (and TV volume, when chosen): the serial
-    panel first (it can power on from standby), then CEC. None when neither
-    exists. Kept separate from box volume, which the soft backend handles."""
+    panel first (it can power on from standby), then a paired webOS TV (explicit
+    config + a strict superset of CEC), then CEC. None when none exist. Kept
+    separate from box volume, which the soft backend handles."""
     if panel_available():
         return "panel"
+    if webos_available():
+        return "webos"
+    if samsung_available():
+        return "samsung"
+    if roku_available():
+        return "roku"
     if cec_available():
         return "cec"
     return None
@@ -3216,6 +4033,16 @@ def tv_info():
     if hw == "panel":
         backend, adapter = "panel", "Newline RS-232 (%s @ %d)" % (
             PANEL["device"], PANEL["baud"])
+    elif hw == "webos":
+        backend, adapter = "webos", ("LG webOS (%s)" % CONFIG_WEBOS["host"]
+                                     if CONFIG_WEBOS else "LG webOS")
+    elif hw == "samsung":
+        backend, adapter = "samsung", ("Samsung Tizen (%s)" % CONFIG_SAMSUNG["host"]
+                                       if CONFIG_SAMSUNG else "Samsung Tizen")
+    elif hw == "roku":
+        backend, adapter = "roku", ("Roku (%s)" % (CONFIG_ROKU.get("name")
+                                    or CONFIG_ROKU["host"]) if CONFIG_ROKU
+                                    else "Roku")
     elif hw == "cec":
         cec = cec_current()
         backend, adapter = "cec", (cec["adapter"] if cec else "CEC")
@@ -3241,9 +4068,16 @@ def tv_info():
         # Screen blank/unblank without cutting power (keeps the box alive when an
         # OPS display would otherwise power the box off in standby). Panel-only.
         "screen_toggle": panel_available(),
-        # Factory-remote key emulation (arrows/ok/menu/home/back/settings) over
-        # RS-232, so the app's Remote view can drive the panel OSD. Panel-only.
-        "keys": panel_available(),
+        # Factory-remote key emulation (arrows/ok/menu/home/back/settings): the
+        # RS-232 panel drives the OSD, a paired webOS TV drives its pointer/nav.
+        # Either lights up the app's Remote view D-pad cluster.
+        "keys": (panel_available() or webos_available()
+                 or samsung_available() or roku_available()),
+        # Text entry into a focused on-TV field. webOS (IME), Samsung
+        # (SendInputString) and Roku (Lit_ keypresses) support it; the panel
+        # and CEC have no text channel.
+        "text": (webos_available() or samsung_available()
+                 or roku_available()),
         # Box mute state, so the app shows the right mute indicator on connect.
         "muted": _soft_muted() if box_vol else None,
         # Current levels (0-100 or null) so the app's volume slider can show and
@@ -3256,10 +4090,16 @@ def tv_info():
 
 
 def _send_tv_hw(op, mock):
-    """Route an op to the external TV backend (panel/CEC), or None if neither."""
+    """Route an op to the external TV backend (panel/webos/CEC), or None."""
     b = _tv_hw_backend()
     if b == "panel":
         return mock_panel(op) if mock else real_panel(op)
+    if b == "webos":
+        return mock_webos(op) if mock else real_webos(op)
+    if b == "samsung":
+        return mock_samsung(op) if mock else real_samsung(op)
+    if b == "roku":
+        return mock_roku(op) if mock else real_roku(op)
     if b == "cec":
         cec_op = _TV_TO_CEC[op]
         return mock_cec(cec_op) if mock else real_cec(cec_op)
@@ -5795,20 +6635,170 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, result, started)
                 return
 
-            # POST /api/tv/key/<k>: factory-remote key (panel only).
+            # POST /api/tv/key/<k>: factory-remote / nav key. The RS-232 panel
+            # drives the Newline OSD; a paired webOS TV drives its pointer nav.
+            # The active hardware backend selects the key vocabulary + sender.
             keyprefix = "/api/tv/key/"
             if path.startswith(keyprefix):
                 k = unquote(path[len(keyprefix):])
-                if not panel_available() or k not in PANEL_KEYS:
+                backend = _tv_hw_backend()
+                if backend == "webos" and k in _WEBOS_KEYS:
+                    result = (mock_webos("key %s" % k) if self.mock
+                              else real_webos_key(k))
+                elif backend == "samsung" and k in _SAMSUNG_KEYS:
+                    result = (mock_samsung("key %s" % k) if self.mock
+                              else real_samsung_key(k))
+                elif backend == "roku" and k in _ROKU_KEYS:
+                    result = (mock_roku("key %s" % k) if self.mock
+                              else real_roku_key(k))
+                elif backend == "panel" and k in PANEL_KEYS:
+                    result = ({"ok": True, "exit_code": 0,
+                               "stdout": "[mock panel] key %s" % k,
+                               "stderr": "", "duration_ms": 100}
+                              if self.mock else real_panel_key(k))
+                else:
                     self._send(404, {"error": "unknown key"}, started)
                     return
-                if self.mock:
-                    result = {"ok": True, "exit_code": 0,
-                              "stdout": "[mock panel] key %s" % k,
-                              "stderr": "", "duration_ms": 100}
-                else:
-                    result = real_panel_key(k)
                 self._send(200, result, started)
+                return
+
+            # POST /api/tv/text: insert text into a focused on-TV field (webOS
+            # IME). Body {"text": "..."}; webOS-only (tv_info.text gates it).
+            if path == "/api/tv/text":
+                backend = _tv_hw_backend()
+                _TEXT_FNS = {
+                    "webos": (mock_webos, real_webos_text),
+                    "samsung": (mock_samsung, real_samsung_text),
+                    "roku": (mock_roku, real_roku_text),
+                }
+                if backend not in _TEXT_FNS:
+                    self._send(404, {"error": "no text backend"}, started)
+                    return
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    text = req["text"]
+                    if not isinstance(text, str):
+                        raise ValueError("text must be a string")
+                except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                    self._send(400, {"error": "text must be a string"}, started)
+                    return
+                mock_fn, real_fn = _TEXT_FNS[backend]
+                result = mock_fn("text") if self.mock else real_fn(text)
+                self._send(200, result, started)
+                return
+
+            # POST /api/tv/webos/pair: pair with an LG webOS TV. Body {"host":
+            # "<ip>", "mac": "<optional, for Wake-on-LAN power-on>"}. Blocks up
+            # to ~60s while the TV shows an Accept prompt; on success the granted
+            # client_key is persisted to config so later starts are silent.
+            if path == "/api/tv/webos/pair":
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    host = req["host"]
+                    if not isinstance(host, str) or not host:
+                        raise ValueError("host required")
+                    mac = req.get("mac")
+                    if mac is not None and not isinstance(mac, str):
+                        raise ValueError("mac must be a string")
+                except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                    self._send(400, {"error": "host (string) required"}, started)
+                    return
+                if self.mock:
+                    self._send(200, {"ok": True, "paired": True,
+                                     "backend": "webos", "host": host}, started)
+                    return
+                try:
+                    client_key = webos_pair(host)
+                except (IOError, OSError) as e:
+                    self._send(502, {"ok": False,
+                                     "error": "pairing failed: %s" % e}, started)
+                    return
+                try:
+                    _webos_save(host, client_key, mac)
+                except OSError as e:
+                    self._send(500, {"ok": False,
+                                     "error": "could not persist config: %s" % e},
+                               started)
+                    return
+                set_webos(False)      # drop stale session; reconnect uses the key
+                set_caps(False)       # the 'tv' capability may have turned on
+                self._send(200, {"ok": True, "paired": True,
+                                 "backend": "webos", "host": host}, started)
+                return
+
+            # POST /api/tv/samsung/pair: pair with a Samsung Tizen TV. Body
+            # {"host": "<ip>", "mac": "<optional, for Wake-on-LAN>"}. Blocks up
+            # to ~60s while the TV shows an Allow prompt; on success the granted
+            # token is persisted so later starts reconnect silently.
+            if path == "/api/tv/samsung/pair":
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    host = req["host"]
+                    if not isinstance(host, str) or not host:
+                        raise ValueError("host required")
+                    mac = req.get("mac")
+                    if mac is not None and not isinstance(mac, str):
+                        raise ValueError("mac must be a string")
+                except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                    self._send(400, {"error": "host (string) required"}, started)
+                    return
+                if self.mock:
+                    self._send(200, {"ok": True, "paired": True,
+                                     "backend": "samsung", "host": host}, started)
+                    return
+                try:
+                    token = samsung_pair(host)
+                except (IOError, OSError) as e:
+                    self._send(502, {"ok": False,
+                                     "error": "pairing failed: %s" % e}, started)
+                    return
+                try:
+                    _samsung_save(host, token, mac)
+                except OSError as e:
+                    self._send(500, {"ok": False,
+                                     "error": "could not persist config: %s" % e},
+                               started)
+                    return
+                set_samsung(False)
+                set_caps(False)
+                self._send(200, {"ok": True, "paired": True,
+                                 "backend": "samsung", "host": host}, started)
+                return
+
+            # POST /api/tv/roku/add: register a Roku by host. Body {"host":
+            # "<ip>"}. Roku needs no pairing — we just verify it answers ECP,
+            # capture its friendly name, and persist. Returns the name.
+            if path == "/api/tv/roku/add":
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    host = req["host"]
+                    if not isinstance(host, str) or not host:
+                        raise ValueError("host required")
+                except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                    self._send(400, {"error": "host (string) required"}, started)
+                    return
+                if self.mock:
+                    self._send(200, {"ok": True, "added": True, "backend": "roku",
+                                     "host": host, "name": "Mock Roku"}, started)
+                    return
+                try:
+                    name = roku_add(host)
+                except (IOError, OSError) as e:
+                    self._send(502, {"ok": False,
+                                     "error": "not a reachable Roku: %s" % e},
+                               started)
+                    return
+                try:
+                    _roku_save(host, name)
+                except OSError as e:
+                    self._send(500, {"ok": False,
+                                     "error": "could not persist config: %s" % e},
+                               started)
+                    return
+                set_roku(False)
+                set_caps(False)
+                self._send(200, {"ok": True, "added": True, "backend": "roku",
+                                 "host": host, "name": name}, started)
                 return
 
             # POST /api/tv/source/<id>: switch the display input (panel only).
