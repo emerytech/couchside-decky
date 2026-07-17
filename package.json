@@ -1,6 +1,6 @@
 {
   "name": "couchside",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "description": "Install and manage the Couchside agent on your Steam Deck / SteamOS box, with the pairing QR right in Game Mode.",
   "type": "module",
   "scripts": {
