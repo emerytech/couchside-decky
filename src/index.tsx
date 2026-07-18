@@ -76,7 +76,7 @@ function Content() {
   };
 
   // Gate a destructive action behind a ConfirmModal so a stray Game-Mode D-pad
-  // click can't un-pair every phone or remove the agent with no undo. ConfirmModal
+  // click can't un-pair every phone or remove the service with no undo. ConfirmModal
   // closes itself on OK/Cancel; we only run the action when the user confirms.
   const confirmThen = (
     title: string,
@@ -110,20 +110,20 @@ function Content() {
     return (
       <PanelSection title="Couchside">
         <PanelSectionRow>
-          <Field label="Agent" bottomSeparator="standard">Not installed</Field>
+          <Field label="Service" bottomSeparator="standard">Not installed</Field>
         </PanelSectionRow>
         <PanelSectionRow>
           <ButtonItem
             layout="below"
             disabled={busy !== null}
-            onClick={() => withBusy("install", bInstall, "Agent installed. Scan the QR to pair.")}
+            onClick={() => withBusy("install", bInstall, "Service installed. Scan the QR to pair.")}
           >
-            {busy === "install" ? "Installing…" : "Install Couchside agent"}
+            {busy === "install" ? "Installing…" : "Install Couchside service"}
           </ButtonItem>
         </PanelSectionRow>
         <PanelSectionRow>
           <Field label="What this does" focusable={false}>
-            Installs the open-source agent to your home folder, enables its service,
+            Installs the open-source Couchside service to your home folder, enables its systemd unit,
             and sets a scoped, audited sudoers rule. Everything runs on your box,
             with no cloud service and no account.
           </Field>
@@ -185,10 +185,10 @@ function Content() {
           <ButtonItem
             layout="below"
             disabled={busy !== null}
-            onClick={() => withBusy("restart", bRestart, "Agent restarted.")}
+            onClick={() => withBusy("restart", bRestart, "Service restarted.")}
           >
             <FaRotate style={{ marginRight: 8 }} />
-            {busy === "restart" ? "Restarting…" : "Restart agent"}
+            {busy === "restart" ? "Restarting…" : "Restart service"}
           </ButtonItem>
         </PanelSectionRow>
         <PanelSectionRow>
@@ -214,7 +214,7 @@ function Content() {
             disabled={busy !== null}
             // Reuses bInstall and the "install" busy label on purpose: install
             // is idempotent, so re-running it upgrades in place.
-            onClick={() => withBusy("install", bInstall, "Agent updated.")}
+            onClick={() => withBusy("install", bInstall, "Service updated.")}
           >
             {busy === "install" ? "Updating…" : "Re-install / update"}
           </ButtonItem>
@@ -227,7 +227,7 @@ function Content() {
               onClick={() =>
                 confirmThen(
                   `Update plugin to v${upd.latest}?`,
-                  "Downloads the latest signed release from GitHub, verifies its signature, replaces this plugin (and the bundled agent), then restarts Decky. The Steam overlay will reload for a few seconds. After updating, tap Re-install / update to roll the new agent onto the box.",
+                  "Downloads the latest signed release from GitHub, verifies its signature, replaces this plugin (and the bundled service), then restarts Decky. The Steam overlay will reload for a few seconds. After updating, tap Re-install / update to roll the new service onto the box.",
                   "Update",
                   () =>
                     withBusy("selfupdate", async () => {
@@ -248,15 +248,15 @@ function Content() {
             disabled={busy !== null}
             onClick={() =>
               confirmThen(
-                "Uninstall agent?",
-                "This stops and removes the Couchside agent from this box. Your phones will lose remote control until you reinstall.",
+                "Uninstall service?",
+                "This stops and removes the Couchside service from this box. Your phones will lose remote control until you reinstall.",
                 "Uninstall",
-                () => withBusy("uninstall", () => bUninstall(false), "Agent removed."),
+                () => withBusy("uninstall", () => bUninstall(false), "Service removed."),
               )
             }
           >
             <FaTrash style={{ marginRight: 8 }} />
-            {busy === "uninstall" ? "Removing…" : "Uninstall agent"}
+            {busy === "uninstall" ? "Removing…" : "Uninstall service"}
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>

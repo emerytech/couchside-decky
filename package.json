@@ -1,7 +1,7 @@
 {
   "name": "couchside",
   "version": "0.2.23",
-  "description": "Install and manage the Couchside agent on your Steam Deck / SteamOS box, with the pairing QR right in Game Mode.",
+  "description": "Turn your phone into your Steam Deck / SteamOS box's dashboard, console, and controller \u2014 and a remote for your TV. Installs and manages the open-source Couchside service and shows the pairing QR right here in Game Mode, no terminal and no desktop trip. Pair by scanning your network and typing the PIN the box shows on screen. Four input modes (gamepad, swipe, trackpad, TV remote), live vitals and journal logs, one-tap fixes for a wedged black screen, Steam launching, volume and power. Also drives networked smart TVs \u2014 LG webOS, Roku, Android/Google TV, Hisense. Keeps itself current with signature-verified releases. LAN-only: no cloud, no accounts, no analytics.",
   "type": "module",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c",

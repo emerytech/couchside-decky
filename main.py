@@ -3,7 +3,7 @@ Couchside Decky Loader plugin backend.
 
 Runs as ROOT (see plugin.json "flags": ["root"]) so it can install the systemd
 unit, the scoped sudoers rule, and the /dev/uinput udev rule without a terminal.
-The Couchside *agent* itself still runs as the desktop user (deck / bazzite);
+The Couchside *service* itself still runs as the desktop user (deck / bazzite);
 this backend just puts the files in place, chowns them, and enables the service.
 
 This is a faithful port of the box installer (install.sh) MINUS the pieces a
@@ -189,7 +189,7 @@ def _seat_owner() -> str:
 
 
 def _target_user() -> str:
-    """The desktop user the agent runs as — the one we grant passwordless sudo and
+    """The desktop user the service runs as — the one we grant passwordless sudo and
     the input group. Resolve it from an authoritative source, never a guess:
       1. DECKY_USER if set and a real account.
       2. The owner of the active graphical seat (loginctl).
@@ -457,7 +457,7 @@ class Plugin:
         except Exception as e:
             who = f"<unresolved: {e}>"
         log.info("Couchside plugin loaded (target user: %s)", who)
-        # Reconcile the running agent with this (possibly just-updated) plugin
+        # Reconcile the running service with this (possibly just-updated) plugin
         # bundle, and take over install.sh's dormant unit. Best-effort: never let
         # a reconcile error fail the plugin load.
         try:
@@ -469,14 +469,14 @@ class Plugin:
         log.info("Couchside plugin unloaded")
 
     def _arm_on_load(self):
-        """Load-time reconciliation so the plugin OWNS the agent with no manual
+        """Load-time reconciliation so the plugin OWNS the service with no manual
         click. Two idempotent, best-effort jobs:
 
           1. Propagate a bundle refresh. Decky replaces this plugin dir on update
              (self_update or the store) and reloads us, but never calls install().
-             If the vendored agent is newer than the copy on disk, install it +
-             restart, so a plugin update becomes an agent update automatically —
-             no Re-install click, no box stuck on an old agent.
+             If the vendored service is newer than the copy on disk, install it +
+             restart, so a plugin update becomes a service update automatically —
+             no Re-install click, no box stuck on an old service.
           2. Take over install.sh's dormant unit. When Decky is present the box
              installer leaves couchside.service installed-but-disabled and hands
              it to us; enable + start it here so the handoff needs no user action.
@@ -485,7 +485,7 @@ class Plugin:
         install still goes through the explicit Install button / _do_install so
         the heavy one-time setup (sudoers, udev, firewall) never runs on a plain
         load. Same no-downgrade rule as _do_install — never replace a strictly
-        newer installed agent with an older vendored one.
+        newer installed service with an older vendored one.
         """
         if not os.path.exists(UNIT_DST):
             return  # nothing installed yet; leave first install to the button
@@ -494,7 +494,7 @@ class Plugin:
         if not os.path.isfile(src_daemon):
             return
         changed = False
-        # (1) refresh the on-disk agent when the vendored copy is strictly newer
+        # (1) refresh the on-disk service when the vendored copy is strictly newer
         try:
             pw = pwd.getpwnam(_target_user())
             install_dir = os.path.join(pw.pw_dir, ".local", "opt", "couchside")
@@ -507,10 +507,10 @@ class Plugin:
                 shutil.copyfile(src_daemon, dst_daemon)
                 os.chmod(dst_daemon, 0o755)
                 _chown(install_dir, pw.pw_uid, pw.pw_gid, recursive=True)
-                log.info("couchside: on-load agent refresh %s -> %s", installed, vendored)
+                log.info("couchside: on-load service refresh %s -> %s", installed, vendored)
                 changed = True
         except Exception:
-            log.exception("couchside: on-load agent refresh skipped")
+            log.exception("couchside: on-load service refresh skipped")
         # (2) arm the unit: enable if install.sh left it dormant, (re)start if we
         # swapped the binary or it isn't running.
         try:
@@ -541,39 +541,39 @@ class Plugin:
         src_unit = os.path.join(pdir, "defaults", "couchside.service")
         for f in (src_daemon, src_unit):
             if not os.path.isfile(f):
-                raise FileNotFoundError(f"bundled agent file missing: {f}")
+                raise FileNotFoundError(f"bundled service file missing: {f}")
 
         # sanity: the bundled daemon compiles
         _run(["python3", "-m", "py_compile", src_daemon], check=True)
 
         # (c) daemon -> ~/.local/opt/couchside
         # Install the VENDORED, release-reviewed defaults/couchsided.py that ships
-        # in this plugin tarball. We deliberately do NOT fetch the agent live from
+        # in this plugin tarball. We deliberately do NOT fetch the service live from
         # GitHub main at install time: this backend runs as ROOT, and a live fetch
         # would have root execute whatever happens to be on main at that moment —
         # unreviewed, unpinned code. The release automation refreshes this vendored
-        # copy on every plugin release, so it is always the current reviewed agent
+        # copy on every plugin release, so it is always the current reviewed service
         # and a live fetch is both unnecessary and unsafe.
         #
         # Preserve the original no-downgrade intent by version, not by network:
-        # compare the vendored VERSION against any already-installed agent and
+        # compare the vendored VERSION against any already-installed service and
         # install the vendored one only when it is newer-or-equal. Never downgrade
-        # a box whose installed agent is somehow newer than the vendored copy.
+        # a box whose installed service is somehow newer than the vendored copy.
         install_dir = os.path.join(home, ".local", "opt", "couchside")
         os.makedirs(install_dir, exist_ok=True)
         dst_daemon = os.path.join(install_dir, "couchsided.py")
         vendored_ver = _daemon_version(src_daemon)
         installed_ver = _daemon_version(dst_daemon) if os.path.exists(dst_daemon) else None
-        # Install the vendored copy unless a strictly-newer agent is already there.
+        # Install the vendored copy unless a strictly-newer service is already there.
         # Unknown installed version (can't parse) => treat as older and (re)install.
         if installed_ver is not None and _ver_gt(installed_ver, vendored_ver):
-            log.info("couchside: keeping installed agent %s (newer than vendored %s)",
+            log.info("couchside: keeping installed service %s (newer than vendored %s)",
                      installed_ver, vendored_ver)
         else:
             shutil.copyfile(src_daemon, dst_daemon)
         os.chmod(dst_daemon, 0o755)
         # Aerial-screensaver player (optional: only bundled in plugin >= 0.2.10).
-        # The agent's /api/screensaver launches it through a Steam shortcut.
+        # The service's /api/screensaver launches it through a Steam shortcut.
         src_saver = os.path.join(pdir, "defaults", "couchside-screensaver.sh")
         if os.path.isfile(src_saver):
             dst_saver = os.path.join(install_dir, "couchside-screensaver.sh")
@@ -621,7 +621,7 @@ class Plugin:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(_gen_config(have_sddm, have_kodi), f, indent=2)
             os.chmod(CONFIG_FILE, 0o644)
-            # root-owned so the user-run agent can read its allowed actions but
+            # root-owned so the user-run service can read its allowed actions but
             # not rewrite which privileged commands it is permitted to run.
             os.chown(CONFIG_FILE, 0, 0)
 
@@ -635,7 +635,7 @@ class Plugin:
 
         # (f) sudoers rule, validated with visudo before install
         sudoers = (
-            f"# couchside: passwordless sudo for EXACTLY the agent's privileged commands.\n"
+            f"# couchside: passwordless sudo for EXACTLY the service's privileged commands.\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl restart sddm\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl reboot\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff\n"
@@ -665,7 +665,7 @@ class Plugin:
         _run(["udevadm", "control", "--reload-rules"])
         _run(["udevadm", "trigger", "--name-match=uinput"])
 
-        # (f3) /dev/rtc0 access for scheduled wake (RTC alarm). The agent is already
+        # (f3) /dev/rtc0 access for scheduled wake (RTC alarm). The service is already
         # in group 'input' (added above), so this grant needs no sudoers change.
         with open(RTC_UDEV, "w") as f:
             f.write('KERNEL=="rtc0", SUBSYSTEM=="rtc", GROUP="input", MODE="0660"\n')
@@ -782,7 +782,7 @@ class Plugin:
                     os.remove(WOL_LINK)
                 except OSError:
                     pass
-            # (c) drop the agent user from the 'input' group we added it to
+            # (c) drop the service user from the 'input' group we added it to
             if shutil.which("gpasswd"):
                 _run(["gpasswd", "-d", user, "input"])
             elif shutil.which("usermod"):
@@ -838,7 +838,7 @@ class Plugin:
                     "error": str(e)}
 
     async def self_update(self):
-        """Replace this plugin (and its vendored agent) with the latest GitHub
+        """Replace this plugin (and its vendored service) with the latest GitHub
         release, IF it is strictly newer and its signature verifies. On success
         a detached `systemctl restart plugin_loader` fires ~2s later so the
         reply reaches the UI before Decky reloads."""
