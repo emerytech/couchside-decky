@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import secrets
 import shutil
 import socket
@@ -299,6 +300,43 @@ def _uinput_ready() -> bool:
         return False
     except Exception:
         return False
+
+
+def _render_unit(user: str, uid: int, exec_path: str) -> str:
+    """Render defaults/couchside.service, which is SYNCED VERBATIM from
+    couchside's agent/couchside.service — the same template install.sh uses.
+
+    Keeping one template is the point: this plugin used to carry its own copy,
+    and when install.sh moved config.json to a user-owned path (so the non-root
+    agent could actually write it) the plugin's copy never learned about it.
+    Decky-only boxes were left unable to save a single setting. Syncing the file
+    means an install-layout change reaches Decky automatically instead of via
+    someone noticing.
+
+    Four placeholders, all of which MUST be substituted:
+      __USER__   desktop user the service runs as
+      __UID__    that user's uid (XDG_RUNTIME_DIR)
+      __EXEC__   resolved daemon path. NOT /home/<user>/... — the home can live
+                 at /var/home (Bazzite/ostree), be systemd-homed, or come from
+                 LDAP, so the real path is injected rather than assumed.
+      __CONFIG__ user-owned config path (see CONFIG_FILE)
+    """
+    pdir = _plugin_dir()
+    with open(os.path.join(pdir, "defaults", "couchside.service")) as f:
+        unit = f.read()
+    unit = (unit.replace("__USER__", user)
+                .replace("__UID__", str(uid))
+                .replace("__EXEC__", exec_path)
+                .replace("__CONFIG__", CONFIG_FILE))
+    # Catch ANY remaining __PLACEHOLDER__ token, not just the four we know. The
+    # template is synced from couchside main; if upstream adds a fifth field this
+    # substitution does not fill, we must fail loudly here rather than write a
+    # unit with a literal __NEW__ in its ExecStart and restart the box into it.
+    leftover = re.findall(r"__[A-Z][A-Z0-9_]*__", unit)
+    if leftover:
+        raise RuntimeError("unit template has unsubstituted placeholders: %s"
+                           % ", ".join(sorted(set(leftover))))
+    return unit
 
 
 def _execstart_has_config(unit_text: str) -> bool:
@@ -606,16 +644,18 @@ class Plugin:
         # --config, so it is left completely alone on a dual-install box.
         try:
             pw = pwd.getpwnam(_target_user())
+            # Recomputed rather than reused from step (1): that block is wrapped
+            # in its own try/except, so an early failure there would leave the
+            # name unbound and silently skip this repair.
+            daemon_path = os.path.join(pw.pw_dir, ".local", "opt", "couchside",
+                                       "couchsided.py")
             if _migrate_legacy_config(pw.pw_uid, pw.pw_gid):
                 changed = True
             with open(UNIT_DST) as f:
                 live_unit = f.read()
             if not _execstart_has_config(live_unit):
-                src_unit = os.path.join(pdir, "defaults", "couchside.service")
-                if os.path.isfile(src_unit):
-                    with open(src_unit) as f:
-                        unit = (f.read().replace("__USER__", pw.pw_name)
-                                .replace("__UID__", str(pw.pw_uid)))
+                if os.path.isfile(os.path.join(pdir, "defaults", "couchside.service")):
+                    unit = _render_unit(pw.pw_name, pw.pw_uid, daemon_path)
                     with open(UNIT_DST, "w") as f:
                         f.write(unit)
                     os.chmod(UNIT_DST, 0o644)
@@ -791,9 +831,8 @@ class Plugin:
         _run(["udevadm", "control", "--reload-rules"])
         _run(["udevadm", "trigger", "--subsystem-match=rtc", "--action=change"])
 
-        # (g) systemd unit (render __USER__/__UID__)
-        with open(src_unit) as f:
-            unit = f.read().replace("__USER__", user).replace("__UID__", str(uid))
+        # (g) systemd unit, rendered from the template install.sh owns
+        unit = _render_unit(user, uid, dst_daemon)
         with open(UNIT_DST, "w") as f:
             f.write(unit)
         os.chmod(UNIT_DST, 0o644)

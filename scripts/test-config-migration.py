@@ -31,6 +31,17 @@ _spec.loader.exec_module(m)
 UID, GID = os.getuid(), os.getgid()
 FAILURES = []
 
+# sandbox() repoints these module globals at a temp tree. Snapshot the real
+# values so each test can restore them — otherwise a later test (e.g. the unit
+# render, which reads m.CONFIG_FILE) sees a leaked sandbox path and fails for the
+# wrong reason.
+_REAL_PATHS = {k: getattr(m, k) for k in ("STATE_DIR", "CONFIG_FILE", "LEGACY_CONFIG")}
+
+
+def _restore_paths():
+    for k, v in _REAL_PATHS.items():
+        setattr(m, k, v)
+
 
 def check(name, got, want):
     if got == want:
@@ -74,6 +85,7 @@ def test_legacy_only():
         check("state dir is 0700", oct(os.stat(m.STATE_DIR).st_mode & 0o777), "0o700")
     finally:
         shutil.rmtree(root)
+        _restore_paths()
 
 
 def test_both_present():
@@ -91,6 +103,7 @@ def test_both_present():
               got.get("panel"), {"dev": "/dev/ttyS0"})
     finally:
         shutil.rmtree(root)
+        _restore_paths()
 
 
 def test_neither():
@@ -102,6 +115,7 @@ def test_neither():
         check("state dir still prepared", os.path.isdir(m.STATE_DIR), True)
     finally:
         shutil.rmtree(root)
+        _restore_paths()
 
 
 def test_ownership_repair():
@@ -116,6 +130,7 @@ def test_ownership_repair():
         check("second run is a no-op", m._migrate_legacy_config(UID, GID), False)
     finally:
         shutil.rmtree(root)
+        _restore_paths()
 
 
 def test_empty_legacy():
@@ -128,20 +143,29 @@ def test_empty_legacy():
               os.path.exists(m.CONFIG_FILE), False)
     finally:
         shutil.rmtree(root)
+        _restore_paths()
 
 
 def test_unit_passes_config():
-    print("bundled unit")
+    print("bundled unit template")
     with open(os.path.join(ROOT, "defaults", "couchside.service")) as f:
         unit = f.read()
-    # Without --config the agent falls back to its built-in
-    # /etc/couchside/config.json, which is exactly the unwritable path this
+    # The template is install.sh's, synced verbatim, so the config path is the
+    # __CONFIG__ placeholder here, not a literal — the literal path is asserted
+    # in test_render_unit after substitution. Without --config the agent falls
+    # back to its built-in /etc/couchside/config.json, the unwritable path this
     # change exists to escape.
     check("ExecStart passes --config", m._execstart_has_config(unit), True)
-    check("...pointing at the user-owned state dir",
-          "/var/lib/couchside/config.json" in unit, True)
+    check("...via the __CONFIG__ placeholder", "__CONFIG__" in unit, True)
+    check("resolved daemon path via __EXEC__ (never a hardcoded /home)",
+          "__EXEC__" in unit and "/home/" not in unit, True)
     check("still grants the input group (evdev + uinput)",
           "SupplementaryGroups=input" in unit, True)
+    # This file must stay byte-identical to couchside's agent/couchside.service.
+    # The CI sync re-fetches it, but if someone hand-edits the vendored copy the
+    # template drift this whole change fights would silently return.
+    check("CONFIG_FILE constant points at the user-owned state dir",
+          _REAL_PATHS["CONFIG_FILE"], "/var/lib/couchside/config.json")
 
 
 def test_unit_repair_guard():
@@ -174,10 +198,55 @@ def test_unit_repair_guard():
           m._execstart_has_config(comment_only), False)
 
 
+def test_render_unit():
+    """_render_unit fills every placeholder in the synced template.
+
+    The template is install.sh's, carried verbatim, so the plugin must
+    substitute all four fields — including __EXEC__ with the RESOLVED daemon
+    path (never a hardcoded /home, which breaks on Bazzite's /var/home) and
+    __CONFIG__ with the user-owned state path.
+    """
+    print("unit rendering")
+    m._plugin_dir = lambda: ROOT
+    exec_path = "/var/home/deck/.local/opt/couchside/couchsided.py"
+    u = m._render_unit("deck", 1000, exec_path)
+    for ph in ("__USER__", "__UID__", "__EXEC__", "__CONFIG__"):
+        check("placeholder %s substituted" % ph, ph in u, False)
+    check("runs as the desktop user", "\nUser=deck\n" in u, True)
+    check("XDG_RUNTIME_DIR uses the uid", "/run/user/1000" in u, True)
+    check("ExecStart uses the resolved path verbatim",
+          ("ExecStart=/usr/bin/python3 " + exec_path) in u, True)
+    check("ExecStart passes --config to the state dir",
+          "--config /var/lib/couchside/config.json" in u, True)
+    check("input group preserved", "SupplementaryGroups=input" in u, True)
+
+    # If upstream adds a placeholder this plugin does not know to substitute, the
+    # render must FAIL rather than write a unit with a literal __NEW__ in its
+    # ExecStart and restart the box into it.
+    tmp = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmp, "defaults"))
+        with open(os.path.join(tmp, "defaults", "couchside.service"), "w") as f:
+            f.write("[Service]\nUser=__USER__\n"
+                    "ExecStart=/usr/bin/python3 __EXEC__ --config __CONFIG__\n"
+                    "Environment=XDG_RUNTIME_DIR=/run/user/__UID__\n"
+                    "Environment=NEW=__FUTURE_FIELD__\n")   # unknown to render
+        m._plugin_dir = lambda: tmp
+        raised = False
+        try:
+            m._render_unit("deck", 1000, "/x/couchsided.py")
+        except RuntimeError:
+            raised = True
+        check("an unknown leftover placeholder raises", raised, True)
+    finally:
+        m._plugin_dir = lambda: ROOT
+        shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
     for fn in (test_legacy_only, test_both_present, test_neither,
                test_ownership_repair, test_empty_legacy, test_unit_passes_config,
-               test_unit_repair_guard):
+               test_unit_repair_guard, test_render_unit):
         fn()
     print()
     if FAILURES:
