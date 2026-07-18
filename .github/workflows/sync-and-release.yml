@@ -98,6 +98,10 @@ jobs:
           node-version: 20
           cache: pnpm
 
+      - name: Check rename-sensitive invariants
+        if: steps.decide.outputs.release == 'true'
+        run: bash scripts/check-invariants.sh
+
       - name: Build & package
         if: steps.decide.outputs.release == 'true'
         id: build
