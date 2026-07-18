@@ -457,9 +457,71 @@ class Plugin:
         except Exception as e:
             who = f"<unresolved: {e}>"
         log.info("Couchside plugin loaded (target user: %s)", who)
+        # Reconcile the running agent with this (possibly just-updated) plugin
+        # bundle, and take over install.sh's dormant unit. Best-effort: never let
+        # a reconcile error fail the plugin load.
+        try:
+            self._arm_on_load()
+        except Exception:
+            log.exception("Couchside on-load reconcile failed")
 
     async def _unload(self):
         log.info("Couchside plugin unloaded")
+
+    def _arm_on_load(self):
+        """Load-time reconciliation so the plugin OWNS the agent with no manual
+        click. Two idempotent, best-effort jobs:
+
+          1. Propagate a bundle refresh. Decky replaces this plugin dir on update
+             (self_update or the store) and reloads us, but never calls install().
+             If the vendored agent is newer than the copy on disk, install it +
+             restart, so a plugin update becomes an agent update automatically —
+             no Re-install click, no box stuck on an old agent.
+          2. Take over install.sh's dormant unit. When Decky is present the box
+             installer leaves couchside.service installed-but-disabled and hands
+             it to us; enable + start it here so the handoff needs no user action.
+
+        Only touches an ALREADY-installed unit (UNIT_DST present): a first-time
+        install still goes through the explicit Install button / _do_install so
+        the heavy one-time setup (sudoers, udev, firewall) never runs on a plain
+        load. Same no-downgrade rule as _do_install — never replace a strictly
+        newer installed agent with an older vendored one.
+        """
+        if not os.path.exists(UNIT_DST):
+            return  # nothing installed yet; leave first install to the button
+        pdir = _plugin_dir()
+        src_daemon = os.path.join(pdir, "defaults", "couchsided.py")
+        if not os.path.isfile(src_daemon):
+            return
+        changed = False
+        # (1) refresh the on-disk agent when the vendored copy is strictly newer
+        try:
+            pw = pwd.getpwnam(_target_user())
+            install_dir = os.path.join(pw.pw_dir, ".local", "opt", "couchside")
+            dst_daemon = os.path.join(install_dir, "couchsided.py")
+            vendored = _daemon_version(src_daemon)
+            installed = _daemon_version(dst_daemon) if os.path.exists(dst_daemon) else None
+            if vendored and (installed is None or _ver_gt(vendored, installed)):
+                _run(["python3", "-m", "py_compile", src_daemon], check=True)
+                os.makedirs(install_dir, exist_ok=True)
+                shutil.copyfile(src_daemon, dst_daemon)
+                os.chmod(dst_daemon, 0o755)
+                _chown(install_dir, pw.pw_uid, pw.pw_gid, recursive=True)
+                log.info("couchside: on-load agent refresh %s -> %s", installed, vendored)
+                changed = True
+        except Exception:
+            log.exception("couchside: on-load agent refresh skipped")
+        # (2) arm the unit: enable if install.sh left it dormant, (re)start if we
+        # swapped the binary or it isn't running.
+        try:
+            enabled = _run(["systemctl", "is-enabled", "--quiet", "couchside.service"]).returncode == 0
+            active = _run(["systemctl", "is-active", "--quiet", "couchside.service"]).returncode == 0
+            if not enabled:
+                _run(["systemctl", "enable", "couchside.service"])
+            if changed or not active:
+                _run(["systemctl", "restart", "couchside.service"])
+        except Exception:
+            log.exception("couchside: on-load service arm skipped")
 
     # ---- install / upgrade ----------------------------------------------
     async def install(self):
