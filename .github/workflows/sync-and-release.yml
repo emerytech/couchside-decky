@@ -102,6 +102,14 @@ jobs:
         if: steps.decide.outputs.release == 'true'
         run: bash scripts/check-invariants.sh
 
+      # config.json lives in a user-owned state dir because the agent runs as the
+      # desktop user and must rewrite it on every TV pairing. A migration bug here
+      # either loses a user's pairings or overwrites a live config with a stale
+      # one, and neither is visible until a real box is upgraded.
+      - name: Test config-path migration
+        if: steps.decide.outputs.release == 'true'
+        run: python3 scripts/test-config-migration.py
+
       - name: Build & package
         if: steps.decide.outputs.release == 'true'
         id: build

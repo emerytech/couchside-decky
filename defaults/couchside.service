@@ -1,6 +1,6 @@
 ; Couchside box agent: systemd unit TEMPLATE.
-; install.sh substitutes __USER__ and __UID__ with the invoking desktop user
-; and installs the result to /etc/systemd/system/couchside.service.
+; The Decky plugin substitutes __USER__ and __UID__ with the desktop user and
+; installs the result to /etc/systemd/system/couchside.service.
 [Unit]
 Description=Couchside box agent
 After=network-online.target
@@ -13,7 +13,11 @@ User=__USER__
 ; with the udev rule the installer writes for /dev/uinput.
 SupplementaryGroups=input
 Environment=XDG_RUNTIME_DIR=/run/user/__UID__
-ExecStart=/usr/bin/python3 /home/__USER__/.local/opt/couchside/couchsided.py
+; --config is EXPLICIT and must stay. The agent's built-in default is
+; /etc/couchside/config.json, which is root-owned and therefore unwritable by
+; this user-run service — every TV pairing and settings save would 500. Point it
+; at the user-owned state dir instead. Matches install.sh.
+ExecStart=/usr/bin/python3 /home/__USER__/.local/opt/couchside/couchsided.py --config /var/lib/couchside/config.json
 Restart=always
 RestartSec=3
 
