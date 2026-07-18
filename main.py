@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import secrets
 import shutil
 import socket
@@ -44,7 +45,23 @@ except Exception:  # pragma: no cover - lets the file import outside Decky
 PORT_DEFAULT = 8787
 ETC_DIR = "/etc/couchside"
 TOKEN_FILE = f"{ETC_DIR}/token"
-CONFIG_FILE = f"{ETC_DIR}/config.json"
+# config.json lives in a USER-OWNED state dir, NOT the root-owned ETC_DIR.
+# The agent runs as the desktop user and rewrites this file whenever the phone
+# saves a setting — TV pairings, the guide-hold trigger. Kept in ETC_DIR it was
+# unwritable, so every such save failed with a 500 "could not persist config:
+# Permission denied" that the user could do nothing about. install.sh hit this
+# exact bug and moved to /var/lib (see its own note at the migration step); this
+# plugin never got the same fix, so Decky-only installs stayed broken.
+#
+# Root ownership was not buying protection here: nothing the agent exposes over
+# HTTP writes `actions`, `units`, or `allow_app_*`. The only config writers are
+# the TV-pairing endpoints and the guide setting. So it blocked legitimate saves
+# while stopping nothing. The privileged surface is the SUDOERS file and the
+# fixed-arg journal wrapper, which stay root-owned in ETC_DIR.
+STATE_DIR = "/var/lib/couchside"
+CONFIG_FILE = f"{STATE_DIR}/config.json"
+# Where pre-fix Decky installs kept it; migrated on install and on plugin load.
+LEGACY_CONFIG = f"{ETC_DIR}/config.json"
 # Fixed-arg, root-owned journal wrapper the sudoers rule grants (no wildcards);
 # it validates its inputs so --file/--directory can't be injected. Mirrors
 # install.sh. Lives in the root-owned ETC_DIR (user can execute, not modify).
@@ -285,6 +302,110 @@ def _uinput_ready() -> bool:
         return False
 
 
+def _render_unit(user: str, uid: int, exec_path: str) -> str:
+    """Render defaults/couchside.service, which is SYNCED VERBATIM from
+    couchside's agent/couchside.service — the same template install.sh uses.
+
+    Keeping one template is the point: this plugin used to carry its own copy,
+    and when install.sh moved config.json to a user-owned path (so the non-root
+    agent could actually write it) the plugin's copy never learned about it.
+    Decky-only boxes were left unable to save a single setting. Syncing the file
+    means an install-layout change reaches Decky automatically instead of via
+    someone noticing.
+
+    Four placeholders, all of which MUST be substituted:
+      __USER__   desktop user the service runs as
+      __UID__    that user's uid (XDG_RUNTIME_DIR)
+      __EXEC__   resolved daemon path. NOT /home/<user>/... — the home can live
+                 at /var/home (Bazzite/ostree), be systemd-homed, or come from
+                 LDAP, so the real path is injected rather than assumed.
+      __CONFIG__ user-owned config path (see CONFIG_FILE)
+    """
+    pdir = _plugin_dir()
+    with open(os.path.join(pdir, "defaults", "couchside.service")) as f:
+        unit = f.read()
+    unit = (unit.replace("__USER__", user)
+                .replace("__UID__", str(uid))
+                .replace("__EXEC__", exec_path)
+                .replace("__CONFIG__", CONFIG_FILE))
+    # Catch ANY remaining __PLACEHOLDER__ token, not just the four we know. The
+    # template is synced from couchside main; if upstream adds a fifth field this
+    # substitution does not fill, we must fail loudly here rather than write a
+    # unit with a literal __NEW__ in its ExecStart and restart the box into it.
+    leftover = re.findall(r"__[A-Z][A-Z0-9_]*__", unit)
+    if leftover:
+        raise RuntimeError("unit template has unsubstituted placeholders: %s"
+                           % ", ".join(sorted(set(leftover))))
+    return unit
+
+
+def _execstart_has_config(unit_text: str) -> bool:
+    """True when the unit's ExecStart actually passes --config.
+
+    Deliberately inspects the ExecStart LINE, not the whole file: the template
+    explains --config in a comment, so a naive `"--config" in text` would report
+    True for a unit whose ExecStart lacks it and skip the repair.
+    """
+    for line in unit_text.splitlines():
+        line = line.strip()
+        if line.startswith("ExecStart") and "--config" in line:
+            return True
+    return False
+
+
+def _migrate_legacy_config(uid: int, gid: int) -> bool:
+    """Ensure a user-owned config.json at CONFIG_FILE, migrating the legacy
+    root-owned one if that is all the box has. Idempotent; safe to call on every
+    install and every plugin load.
+
+    Three cases, in order:
+      1. CONFIG_FILE already exists -> only repair ownership. NEVER clobber it
+         with the legacy copy; on a box that also ran install.sh this is the
+         live config and the legacy file is a stale leftover.
+      2. Only the legacy file exists -> move it across, preserving pairings.
+      3. Neither -> do nothing; the caller writes a fresh default.
+
+    Returns True when something changed.
+    """
+    changed = False
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        # 0700 + user-owned, matching install.sh. The agent writes a temp file
+        # into this DIRECTORY and os.replace()s it, so the directory itself must
+        # be user-writable — a writable file in a root-owned dir is not enough.
+        os.chmod(STATE_DIR, 0o700)
+        os.chown(STATE_DIR, uid, gid)
+    except OSError:
+        log.exception("couchside: could not prepare %s", STATE_DIR)
+        return False
+
+    have_new = os.path.exists(CONFIG_FILE) and os.path.getsize(CONFIG_FILE) > 0
+    have_old = os.path.exists(LEGACY_CONFIG) and os.path.getsize(LEGACY_CONFIG) > 0
+    if not have_new and have_old:
+        try:
+            shutil.move(LEGACY_CONFIG, CONFIG_FILE)
+            log.info("couchside: migrated config %s -> %s (pairings preserved)",
+                     LEGACY_CONFIG, CONFIG_FILE)
+            changed = True
+            have_new = True
+        except OSError:
+            log.exception("couchside: config migration failed")
+    if have_new:
+        # Repair ownership even when we did not move anything: a box installed by
+        # an older plugin has a root-owned file the agent still cannot write.
+        try:
+            st = os.stat(CONFIG_FILE)
+            if st.st_uid != uid or st.st_gid != gid:
+                os.chown(CONFIG_FILE, uid, gid)
+                changed = True
+            if st.st_mode & 0o777 != 0o600:
+                os.chmod(CONFIG_FILE, 0o600)
+                changed = True
+        except OSError:
+            log.exception("couchside: could not fix config ownership")
+    return changed
+
+
 def _read_port() -> int:
     try:
         with open(CONFIG_FILE) as f:
@@ -511,6 +632,40 @@ class Plugin:
                 changed = True
         except Exception:
             log.exception("couchside: on-load service refresh skipped")
+        # (1b) repair the config path on boxes installed by a pre-fix plugin.
+        # Those got config.json root-owned in ETC_DIR and a unit with no
+        # --config, so the agent silently could not save anything (every TV
+        # pairing 500'd). A plugin update alone must fix them: users do not know
+        # to click Re-install, and the symptom looks like a broken app, not a
+        # broken install.
+        #
+        # The unit is rewritten ONLY when it lacks --config. That is what makes
+        # this safe next to install.sh: install.sh's unit already passes
+        # --config, so it is left completely alone on a dual-install box.
+        try:
+            pw = pwd.getpwnam(_target_user())
+            # Recomputed rather than reused from step (1): that block is wrapped
+            # in its own try/except, so an early failure there would leave the
+            # name unbound and silently skip this repair.
+            daemon_path = os.path.join(pw.pw_dir, ".local", "opt", "couchside",
+                                       "couchsided.py")
+            if _migrate_legacy_config(pw.pw_uid, pw.pw_gid):
+                changed = True
+            with open(UNIT_DST) as f:
+                live_unit = f.read()
+            if not _execstart_has_config(live_unit):
+                if os.path.isfile(os.path.join(pdir, "defaults", "couchside.service")):
+                    unit = _render_unit(pw.pw_name, pw.pw_uid, daemon_path)
+                    with open(UNIT_DST, "w") as f:
+                        f.write(unit)
+                    os.chmod(UNIT_DST, 0o644)
+                    os.chown(UNIT_DST, 0, 0)
+                    _run(["systemctl", "daemon-reload"], check=True)
+                    log.info("couchside: repaired unit to pass --config %s",
+                             CONFIG_FILE)
+                    changed = True
+        except Exception:
+            log.exception("couchside: on-load config-path repair skipped")
         # (2) arm the unit: enable if install.sh left it dormant, (re)start if we
         # swapped the binary or it isn't running.
         try:
@@ -611,7 +766,11 @@ class Plugin:
         os.chmod(TOKEN_FILE, 0o600)
         os.chown(TOKEN_FILE, uid, gid)
 
-        # (e) config.json (only if absent)
+        # (e) config.json in the user-owned state dir, migrating any legacy copy.
+        # Migration must run BEFORE the "only if absent" check, or a box that
+        # already has TV pairings in the legacy path would get a fresh default
+        # config and appear to have lost them.
+        _migrate_legacy_config(uid, gid)
         if not (os.path.exists(CONFIG_FILE) and os.path.getsize(CONFIG_FILE) > 0):
             have_sddm = _run(["systemctl", "cat", "sddm.service"]).returncode == 0
             # Per-user flatpaks are invisible to root, so probe as the DESKTOP USER
@@ -620,10 +779,10 @@ class Plugin:
                          and _run(["sudo", "-u", user, "flatpak", "info", "tv.kodi.Kodi"]).returncode == 0)
             with open(CONFIG_FILE, "w") as f:
                 json.dump(_gen_config(have_sddm, have_kodi), f, indent=2)
-            os.chmod(CONFIG_FILE, 0o644)
-            # root-owned so the user-run service can read its allowed actions but
-            # not rewrite which privileged commands it is permitted to run.
-            os.chown(CONFIG_FILE, 0, 0)
+            # User-owned 0600, matching install.sh: the agent runs as this user
+            # and MUST be able to rewrite the file when a pairing is saved.
+            os.chmod(CONFIG_FILE, 0o600)
+            os.chown(CONFIG_FILE, uid, gid)
 
         # (f0) Fixed-arg journal wrapper the sudoers rule grants. Root-owned
         # (0755) in the root-owned ETC_DIR so the desktop user can execute but
@@ -672,9 +831,8 @@ class Plugin:
         _run(["udevadm", "control", "--reload-rules"])
         _run(["udevadm", "trigger", "--subsystem-match=rtc", "--action=change"])
 
-        # (g) systemd unit (render __USER__/__UID__)
-        with open(src_unit) as f:
-            unit = f.read().replace("__USER__", user).replace("__UID__", str(uid))
+        # (g) systemd unit, rendered from the template install.sh owns
+        unit = _render_unit(user, uid, dst_daemon)
         with open(UNIT_DST, "w") as f:
             f.write(unit)
         os.chmod(UNIT_DST, 0o644)
@@ -817,6 +975,10 @@ class Plugin:
 
             if purge:
                 shutil.rmtree(ETC_DIR, ignore_errors=True)
+                # config.json moved here, so a purge that skipped it would leave
+                # the box's pairings behind and a reinstall would silently adopt
+                # them — surprising for someone who asked to purge.
+                shutil.rmtree(STATE_DIR, ignore_errors=True)
                 if os.path.exists(SUDOERS_FILE):
                     os.remove(SUDOERS_FILE)
             return {"ok": True}
