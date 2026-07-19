@@ -66,7 +66,12 @@ LEGACY_CONFIG = f"{ETC_DIR}/config.json"
 # it validates its inputs so --file/--directory can't be injected. Mirrors
 # install.sh. Lives in the root-owned ETC_DIR (user can execute, not modify).
 JOURNAL_WRAPPER = f"{ETC_DIR}/couchside-journal"
-SUDOERS_FILE = "/etc/sudoers.d/couchside"
+# zz- prefix is LOAD-BEARING: sudoers.d applies lexically and sudoers is
+# last-match-wins — a "wheel" file ("(ALL) ALL", password) sorting after a
+# plain "couchside" file silently shadowed every NOPASSWD grant on a real box.
+# zz- makes our fixed-argument rules the winning (last) match.
+SUDOERS_FILE = "/etc/sudoers.d/zz-couchside"
+SUDOERS_FILE_LEGACY = "/etc/sudoers.d/couchside"
 UNIT_DST = "/etc/systemd/system/couchside.service"
 UINPUT_UDEV = "/etc/udev/rules.d/99-couchside-uinput.rules"
 UINPUT_MODLOAD = "/etc/modules-load.d/couchside-uinput.conf"
@@ -666,6 +671,25 @@ class Plugin:
                     changed = True
         except Exception:
             log.exception("couchside: on-load config-path repair skipped")
+        # (1b2) migrate the sudoers file to the zz- name. sudoers.d is lexical
+        # and last-match-wins: a "wheel" file ("(ALL) ALL", password) sorting
+        # after plain "couchside" shadowed EVERY grant on a real box while
+        # `sudo -l` displayed them all. This plugin runs as root, so Decky
+        # boxes heal on plugin update with no password. Never merge into an
+        # existing zz- file here — if both exist, install.sh already wrote the
+        # canonical zz- copy and the legacy file is just retired.
+        try:
+            if os.path.exists(SUDOERS_FILE_LEGACY):
+                if os.path.exists(SUDOERS_FILE):
+                    os.remove(SUDOERS_FILE_LEGACY)
+                    log.info("couchside: removed shadowed legacy sudoers file")
+                else:
+                    os.replace(SUDOERS_FILE_LEGACY, SUDOERS_FILE)
+                    log.info("couchside: sudoers migrated to zz-couchside "
+                             "(ordering fix)")
+                changed = True
+        except Exception:
+            log.exception("couchside: sudoers zz-migration skipped")
         # (1c) ensure the "Restart Decky" sudoers grant exists. Older installs
         # (either installer) predate it, and the recovery action only appears
         # when the grant is present — so a plugin update alone must add it.
@@ -1014,8 +1038,9 @@ class Plugin:
                 # the box's pairings behind and a reinstall would silently adopt
                 # them — surprising for someone who asked to purge.
                 shutil.rmtree(STATE_DIR, ignore_errors=True)
-                if os.path.exists(SUDOERS_FILE):
-                    os.remove(SUDOERS_FILE)
+                for f in (SUDOERS_FILE, SUDOERS_FILE_LEGACY):
+                    if os.path.exists(f):
+                        os.remove(f)
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
