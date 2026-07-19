@@ -666,6 +666,34 @@ class Plugin:
                     changed = True
         except Exception:
             log.exception("couchside: on-load config-path repair skipped")
+        # (1c) ensure the "Restart Decky" sudoers grant exists. Older installs
+        # (either installer) predate it, and the recovery action only appears
+        # when the grant is present — so a plugin update alone must add it.
+        # Append-only with a contains-guard, and the RESULT is visudo-validated
+        # before replacing the file: on a dual-install box this file may be
+        # install.sh's, which must keep working verbatim.
+        try:
+            grant = ("%s ALL=(root) NOPASSWD: "
+                     "/usr/bin/systemctl restart plugin_loader\n" % pw.pw_name)
+            if os.path.exists(SUDOERS_FILE):
+                with open(SUDOERS_FILE) as f:
+                    cur = f.read()
+                if "systemctl restart plugin_loader" not in cur:
+                    tmp = SUDOERS_FILE + ".couchside-tmp"
+                    with open(tmp, "w") as f:
+                        f.write(cur.rstrip("\n") + "\n" + grant)
+                    if _run(["visudo", "-cf", tmp]).returncode == 0:
+                        os.chmod(tmp, 0o440)
+                        os.chown(tmp, 0, 0)
+                        os.replace(tmp, SUDOERS_FILE)
+                        log.info("couchside: added Restart Decky sudoers grant")
+                        changed = True
+                    else:
+                        os.remove(tmp)
+                        log.error("couchside: grant append failed visudo check;"
+                                  " leaving sudoers untouched")
+        except Exception:
+            log.exception("couchside: on-load sudoers grant repair skipped")
         # (2) arm the unit: enable if install.sh left it dormant, (re)start if we
         # swapped the binary or it isn't running.
         try:
@@ -799,6 +827,13 @@ class Plugin:
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl reboot\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff\n"
             f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl suspend\n"
+            # Restart Decky Loader itself: plugin_loader.service dies (cleanly,
+            # so systemd never revives it) whenever Steam's CEF restarts, and
+            # the Decky panel silently vanishes until reboot. This fixed-arg
+            # grant powers the app's "Restart Decky" recovery action — and on a
+            # Decky box the service that runs THIS plugin is exactly the one
+            # being made recoverable.
+            f"{user} ALL=(root) NOPASSWD: /usr/bin/systemctl restart plugin_loader\n"
             # Grant the wrapper, never journalctl itself — the only way to block
             # --file/--directory injection a wildcard journalctl rule would allow.
             f"{user} ALL=(root) NOPASSWD: {JOURNAL_WRAPPER}\n"
