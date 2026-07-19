@@ -781,11 +781,25 @@ class Plugin:
         os.chmod(dst_daemon, 0o755)
         # Aerial-screensaver player (optional: only bundled in plugin >= 0.2.10).
         # The service's /api/screensaver launches it through a Steam shortcut.
+        # Installed under the DISPLAY NAME "Couchside Screensaver": Steam
+        # titles the non-Steam tile from the file basename. The old ugly
+        # "couchside-screensaver.sh" tile (pre-2.9.20 boxes) is left for the
+        # agent's dual-match to keep alive; the agent registers/renames on next
+        # screensaver start.
         src_saver = os.path.join(pdir, "defaults", "couchside-screensaver.sh")
         if os.path.isfile(src_saver):
-            dst_saver = os.path.join(install_dir, "couchside-screensaver.sh")
+            dst_saver = os.path.join(install_dir, "Couchside Screensaver")
             shutil.copyfile(src_saver, dst_saver)
             os.chmod(dst_saver, 0o755)
+        # Branded Steam capsule art the agent drops into Steam's grid folder so
+        # the tile shows a real Couchside capsule, not the placeholder.
+        grid_dst = os.path.join(install_dir, "steam-grid")
+        for art in ("screensaver-portrait.png", "screensaver-landscape.png",
+                    "screensaver-logo.png"):
+            src_art = os.path.join(pdir, "defaults", "steam-grid", art)
+            if os.path.isfile(src_art):
+                os.makedirs(grid_dst, exist_ok=True)
+                shutil.copyfile(src_art, os.path.join(grid_dst, art))
         # Only fix ownership of what we just created. Chowning all of ~/.local
         # would recurse into the user's Steam library (tens of GB) and blow up
         # on the broken symlinks in old steam-runtime trees. makedirs may have

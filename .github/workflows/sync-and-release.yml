@@ -79,6 +79,14 @@ jobs:
           else
             rm -f defaults/couchside-screensaver.sh
           fi
+          # Branded Steam capsule art for the screensaver tile (plain PNGs the
+          # agent drops into Steam's grid folder). Optional; skip any that 404.
+          mkdir -p defaults/steam-grid
+          for art in screensaver-portrait screensaver-landscape screensaver-logo; do
+            curl -fsSL \
+              "https://raw.githubusercontent.com/emerytech/couchside/main/agent/steam-grid/$art.png" \
+              -o "defaults/steam-grid/$art.png" || rm -f "defaults/steam-grid/$art.png"
+          done
 
       - name: Decide whether to release
         id: decide
