@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.32"
+VERSION = "2.9.33"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -221,6 +221,15 @@ CONFIG_SAMSUNG = None  # optional {"host","mac","token"} Samsung Tizen TV config
 CONFIG_ROKU = None  # optional {"host","name"} Roku (ECP) TV config
 CONFIG_ANDROIDTV = None  # optional {"host","cert","key","name","mac"} Android TV config
 CONFIG_VIDAA = None  # optional {"host","name","mac"} Hisense VIDAA (MQTT) config
+# optional {"host","name"} LG COMMERCIAL/signage panel (TCP 9761, no pairing).
+# Distinct from CONFIG_WEBOS: these panels do not speak consumer webOS at all.
+CONFIG_LGCOM = None
+# The brand the user explicitly chose to drive, or None to fall back to the
+# priority chain in _tv_hw_backend(). Without this a second paired TV was
+# UNREACHABLE: the chain returns exactly one backend, so pairing e.g. a Google
+# TV on a box that already had an LG reported success and then did nothing,
+# because webos outranks androidtv and kept winning silently.
+CONFIG_TV_ACTIVE = None
 # Guide-button hold -> Couch Mode. OFF BY DEFAULT: a false positive yanks the
 # user out of their desktop session mid-work. "uniq" optionally pins the trigger
 # to ONE pad, keyed on the evdev U: Uniq field (the pad's OWN MAC) because BT
@@ -496,6 +505,25 @@ def _parse_config(raw):
                     raise ConfigError("androidtv.%s must be a string" % field)
                 androidtv[field] = val
 
+    # Optional LG COMMERCIAL/signage panel (TCP 9761). host + optional name.
+    # No pairing and no credentials: the control port is unauthenticated, which
+    # is why this is a separate backend from consumer webOS rather than a mode
+    # of it.
+    lgcom = None
+    lgcom_raw = raw.get("lg_commercial")
+    if lgcom_raw is not None:
+        if not isinstance(lgcom_raw, dict):
+            raise ConfigError("lg_commercial must be an object")
+        host = lgcom_raw.get("host")
+        if not isinstance(host, str) or not host:
+            raise ConfigError("lg_commercial.host must be a non-empty string")
+        lgcom = {"host": host}
+        nm = lgcom_raw.get("name")
+        if nm is not None:
+            if not isinstance(nm, str):
+                raise ConfigError("lg_commercial.name must be a string")
+            lgcom["name"] = nm
+
     # Optional Hisense VIDAA TV (MQTT on 36669). host + optional name/mac; no
     # pairing (default broker creds).
     vidaa = None
@@ -542,7 +570,7 @@ def _parse_config(raw):
             guide["uniq"] = guide_raw["uniq"].strip()
 
     return (units, actions, order, port, launchers, panel, webos, samsung,
-            roku, androidtv, vidaa, guide)
+            roku, androidtv, vidaa, lgcom, guide)
 
 
 def load_config(path):
@@ -550,6 +578,7 @@ def load_config(path):
     global WATCHLIST, WATCHLIST_NAMES, ACTIONS, ACTION_ORDER, CONFIG_PORT
     global LAUNCHERS, CONFIG_PATH, CONFIG_PANEL, CONFIG_WEBOS, CONFIG_SAMSUNG
     global CONFIG_ROKU, CONFIG_ANDROIDTV, CONFIG_VIDAA, ALLOW_APP_UPDATE
+    global CONFIG_LGCOM, CONFIG_TV_ACTIVE
     global ALLOW_APP_LAUNCHERS, CONFIG_GUIDE
     CONFIG_PATH = path  # remembered so launcher POST/DELETE can rewrite it
     try:
@@ -561,7 +590,7 @@ def load_config(path):
             ALLOW_APP_UPDATE = bool(raw.get("allow_app_update", False))
             ALLOW_APP_LAUNCHERS = bool(raw.get("allow_app_launchers", False))
         (units, actions, order, port, launchers, panel, webos, samsung,
-         roku, androidtv, vidaa, guide) = _parse_config(raw)
+         roku, androidtv, vidaa, lgcom, guide) = _parse_config(raw)
     except FileNotFoundError:
         print("warning: config %s not found, using built-in generic defaults"
               % path, file=sys.stderr, flush=True)
@@ -582,6 +611,9 @@ def load_config(path):
     CONFIG_ROKU = roku
     CONFIG_ANDROIDTV = androidtv
     CONFIG_VIDAA = vidaa
+    CONFIG_LGCOM = lgcom
+    active = raw.get("tv_active")
+    CONFIG_TV_ACTIVE = active if isinstance(active, str) and active else None
     CONFIG_GUIDE = guide
     print("config loaded from %s: %d units, %d actions, %d launchers"
           % (path, len(WATCHLIST), len(ACTIONS), len(LAUNCHERS)), flush=True)
@@ -4826,6 +4858,7 @@ def _webos_save(host, client_key, mac=None):
                 pass
             raise
         CONFIG_WEBOS = cfg
+    set_tv_active("webos")
 
 
 # ---- shared helpers for the network TV backends ---------------------------
@@ -4850,6 +4883,20 @@ def _wol_send(mac):
         return _webos_result(start, True, "wol -> %s" % mac)
     except (ValueError, OSError) as e:
         return _webos_result(start, False, "wol failed: %s" % e)
+
+
+def set_tv_active(brand):
+    """Persist which paired TV the box should drive. None clears the choice and
+    restores the priority chain.
+
+    Called on every successful pair as well as from the picker: pairing a TV is
+    an unambiguous statement that you want to use it, and without this a second
+    paired TV stayed silently unreachable behind a higher-priority brand."""
+    global CONFIG_TV_ACTIVE
+    with CONFIG_LOCK:
+        _config_set_field("tv_active", brand)
+        CONFIG_TV_ACTIVE = brand
+    return brand
 
 
 def _config_set_field(field, value):
@@ -5066,6 +5113,7 @@ def _samsung_save(host, token, mac=None):
     with CONFIG_LOCK:
         _config_set_field("samsung", cfg)
         CONFIG_SAMSUNG = cfg
+    set_tv_active("samsung")
 
 
 # ---- Roku backend (ECP over plain HTTP) -----------------------------------
@@ -5198,6 +5246,7 @@ def _roku_save(host, name):
     with CONFIG_LOCK:
         _config_set_field("roku", cfg)
         CONFIG_ROKU = cfg
+    set_tv_active("roku")
 
 
 # ---- Android TV / Google TV backend (Remote v2, protobuf over TLS) --------
@@ -5474,6 +5523,7 @@ def _androidtv_save(host, cert_pem, key_pem, name=None, mac=None):
     with CONFIG_LOCK:
         _config_set_field("androidtv", cfg)
         CONFIG_ANDROIDTV = cfg
+    set_tv_active("androidtv")
 
 
 # -- persistent remote session (keepalive) --
@@ -5775,6 +5825,7 @@ def _vidaa_save(host, name=None, mac=None):
     with CONFIG_LOCK:
         _config_set_field("vidaa", cfg)
         CONFIG_VIDAA = cfg
+    set_tv_active("vidaa")
 
 
 # ---- LAN TV discovery (mDNS + SSDP sweep) ---------------------------------
@@ -5850,15 +5901,61 @@ def _parse_mdns(buf):
     return ptr, srv, a
 
 
-def _mdns_discover(service, timeout=2.5):
-    """Return [{name, host}] for a mDNS service PTR (e.g. _androidtvremote2._tcp
-    .local). Best-effort; empty on any failure."""
+def _mdns_socket():
+    """A socket that can actually HEAR mDNS answers: bound to 5353 and joined to
+    the group, sharing the port with whatever else is running (avahi).
+
+    WHY THIS MATTERS -- measured, because the obvious fix does not work. A
+    compliant responder sends its answer to the MULTICAST group, not back to the
+    querier's ephemeral port. Querying from an ephemeral port therefore only
+    ever finds devices that happen to answer unicast anyway. On a real network
+    that silently split the results: Chromecast replied and was found, while an
+    Android/Google TV advertising the very service we asked for
+    (_androidtvremote2._tcp, "Conference Room") and an LG webOS TV were both
+    invisible -- so "Scan for TVs" returned neither of the user's real TVs.
+
+    Setting the QU (unicast-response) bit instead was tried FIRST and changed
+    nothing: 0 replies with the bit set, 2 replies once bound to the group. Do
+    not "simplify" this back to a QU bit.
+
+    Returns (socket, joined). joined=False means the bind/join failed and the
+    caller is falling back to the old ephemeral behaviour -- degraded, but the
+    scan still finds unicast-answering devices instead of raising."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # SO_REUSEPORT so this coexists with avahi/systemd-resolved already on 5353.
+    # Multicast datagrams are delivered to EVERY socket joined to the group, so
+    # sharing the port does not steal avahi's traffic.
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+    joined = False
+    try:
+        s.bind(("", _MDNS_ADDR[1]))
+        mreq = struct.pack("4sl", socket.inet_aton(_MDNS_ADDR[0]), socket.INADDR_ANY)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        joined = True
+    except OSError:
+        # Port unavailable (no SO_REUSEPORT, or a strict responder holds it):
+        # fall back to an unbound socket rather than losing discovery entirely.
+        try:
+            s.close()
+        except OSError:
+            pass
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
     except OSError:
         pass
+    return s, joined
+
+
+def _mdns_discover(service, timeout=2.5):
+    """Return [{name, host}] for a mDNS service PTR (e.g. _androidtvremote2._tcp
+    .local). Best-effort; empty on any failure."""
+    s, _joined = _mdns_socket()
     s.settimeout(0.5)
     inst, srv_all, a_all = set(), {}, {}
     try:
@@ -5866,7 +5963,9 @@ def _mdns_discover(service, timeout=2.5):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                data, _ = s.recvfrom(4096)
+                # Bound to 5353 we now see every responder's traffic, not just
+                # replies to our own question, so allow for full-size records.
+                data, _ = s.recvfrom(9000)
             except socket.timeout:
                 continue
             except OSError:
@@ -5874,11 +5973,13 @@ def _mdns_discover(service, timeout=2.5):
             ptr, srv, a = _parse_mdns(data)
             srv_all.update(srv)
             a_all.update(a)
-            for n in ptr:
-                if n.endswith(service):
-                    inst.add(n)
-            for n in srv:
-                if n.endswith(service):
+            # `endswith` alone also matches the SERVICE name itself, which is
+            # a record we now receive (bound to 5353 we see service-level PTRs,
+            # not just answers to our own question). That leaked
+            # "_androidtvremote2._tcp.local" into the results as if it were a
+            # TV. Require a real instance label underneath it.
+            for n in list(ptr) + list(srv):
+                if n != service and n.endswith("." + service):
                     inst.add(n)
     finally:
         s.close()
@@ -5891,7 +5992,10 @@ def _mdns_discover(service, timeout=2.5):
         if not ip:
             continue
         label = name[: -len(service) - 1].rstrip(".") or name
-        out.append({"name": label, "host": ip})
+        # `target` is the SRV target hostname (e.g. LGwebOSTV.local). Callers
+        # need it to identify the DEVICE: an instance label is a user-chosen
+        # room name ("Conference Room Display") and cannot be matched on.
+        out.append({"name": label, "host": ip, "target": host or ""})
     return out
 
 
@@ -5992,7 +6096,255 @@ def _discover_webos():
             if m:
                 name = m.group(1).strip()
         out.append({"brand": "webos", "name": name or "LG webOS", "host": ip})
+
+    # SSDP alone misses real TVs. Measured on a live network: an 85" consumer
+    # webOS set answered no SSDP search at all, so "Scan for TVs" returned only
+    # a commercial signage panel -- the app then pre-filled that wrong target
+    # and pairing failed with an opaque TLS timeout, because a signage panel
+    # accepts TCP on 3001 without ever completing a handshake.
+    #
+    # Modern LG sets advertise AirPlay over mDNS, where that same TV showed up
+    # immediately as "Conference Room Display" (LGwebOSTV.local). Its mDNS
+    # hostname is the reliable tell -- the AirPlay instance name is a
+    # user-chosen room label, and plenty of non-LG devices serve _airplay._tcp.
+    for t in _mdns_discover("_airplay._tcp.local", timeout=2.0):
+        ip, host = t.get("host"), (t.get("target") or "")
+        if not ip or ip in seen:
+            continue
+        if not re.search(r"lgwebostv|webos", host.lower()):
+            continue
+        seen.add(ip)
+        out.append({"brand": "webos", "name": t.get("name") or "LG webOS", "host": ip})
     return out
+
+
+# LG COMMERCIAL / signage control port. Commercial panels expose LG's
+# documented RS-232 command set over TCP here; consumer sets do not open it.
+LG_COMMERCIAL_PORT = 9761
+
+
+def _port_open(host, port, timeout=1.5):
+    """True if a TCP connect succeeds. An OPEN port is weak evidence on its own
+    -- see identify_tv, where a commercial LG panel opens 3001 and then never
+    completes a TLS handshake."""
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _tls_completes(host, port, timeout=4.0):
+    """True if a TLS handshake actually COMPLETES (self-signed is fine).
+
+    This is the check that separates a consumer webOS TV from an LG commercial
+    panel, and it cannot be replaced by a port check. Measured on real hardware:
+    the panel accepts TCP on 3001 in 6ms and then never handshakes, so the
+    pairing attempt died with "_ssl.c:1063: The handshake operation timed out"
+    -- an error that told the user nothing about the actual problem, which was
+    that they had aimed Couchside at the wrong device entirely."""
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        raw = socket.create_connection((host, port), timeout=timeout)
+        raw.settimeout(timeout)
+        with ctx.wrap_socket(raw, server_hostname=host):
+            return True
+    except Exception:
+        return False
+
+
+def identify_tv(host):
+    """What KIND of device is at this address?
+
+    {"brand": <id or None>, "label": str, "supported": bool, "reason": str}
+
+    Exists so a wrong target produces an explanation instead of a raw socket
+    error. Ordered most-specific first: the HTTP APIs answer with a real device
+    name, and the LG commercial check must precede the consumer webOS check
+    because both open 3001.
+
+    A handful of connects to ONE address the user typed -- not a sweep."""
+    host = (host or "").strip()
+    if not host:
+        return {"brand": None, "label": "", "supported": False,
+                "reason": "no address given"}
+
+    # Roku: unauthenticated ECP, names itself.
+    if _port_open(host, ROKU_PORT):
+        xml = _discover_http("http://%s:%d/query/device-info" % (host, ROKU_PORT))
+        m = re.search(r"<friendly-device-name>(.*?)</friendly-device-name>", xml)
+        if m or "<device-info>" in xml:
+            return {"brand": "roku", "label": (m.group(1).strip() if m else "Roku"),
+                    "supported": True, "reason": "Roku ECP"}
+
+    # Samsung Tizen: the v2 API returns a device block.
+    if _port_open(host, SAMSUNG_PORT):
+        return {"brand": "samsung", "label": "Samsung", "supported": True,
+                "reason": "Samsung Tizen remote port"}
+
+    # LG COMMERCIAL before consumer: a signage panel also opens 3001, but its
+    # 3001 never completes TLS. 9761 is the tell and it is unambiguous.
+    if _port_open(host, LG_COMMERCIAL_PORT):
+        return {"brand": "lg_commercial", "label": "LG commercial display",
+                "supported": False,
+                "reason": "This is an LG commercial/signage display, not a "
+                          "consumer webOS TV. It does not support webOS "
+                          "pairing."}
+
+    # Consumer webOS: TCP alone is not enough, the handshake must complete.
+    if _port_open(host, WEBOS_PORT):
+        if _tls_completes(host, WEBOS_PORT):
+            return {"brand": "webos", "label": "LG webOS", "supported": True,
+                    "reason": "webOS SSAP"}
+        return {"brand": None, "label": "unknown device", "supported": False,
+                "reason": "Port %d is open but it is not answering as a webOS "
+                          "TV (the secure handshake times out). This is usually "
+                          "a commercial display or another device entirely."
+                          % WEBOS_PORT}
+
+    if _port_open(host, ANDROIDTV_REMOTE_PORT):
+        return {"brand": "androidtv", "label": "Google TV", "supported": True,
+                "reason": "Android TV remote port"}
+
+    if _port_open(host, VIDAA_PORT):
+        return {"brand": "vidaa", "label": "Hisense", "supported": True,
+                "reason": "VIDAA MQTT port"}
+
+    return {"brand": None, "label": "", "supported": False,
+            "reason": "Nothing answered at that address. Check the IP, and "
+                      "make sure the TV is powered on -- a TV in standby "
+                      "cannot be identified."}
+
+
+# ---- LG commercial / signage backend (TCP 9761) ---------------------------
+# LG's COMMERCIAL panels (the signage line -- an "S" model like UR640S) speak
+# LG's documented RS-232 command set over plain TCP on 9761. No pairing, no TLS,
+# no accept prompt: considerably simpler than consumer webOS, which these panels
+# do NOT support at all (see identify_tv -- they open 3001 and never handshake).
+#
+# Wire format is ASCII:   <c1><c2> <setid> <data>\r
+#            reply:       <c2> <setid> OK<data>x     (NG<data>x on refusal)
+# A data byte of ff is a STATUS READ, not a write.
+#
+# MEASURED on a real panel, set + read-back + restore for each:
+#   ka power    01 = on
+#   xb input    91 (round-tripped 91 -> 90 -> 91, verified each step)
+#   ke mute     00 = muted, 01 = unmuted (INVERTED vs what you would guess)
+#   kf volume   ACKs the write and then always reads back 00 -- audio is inert
+#               on that panel, so volume is deliberately NOT exposed. A control
+#               that silently does nothing costs more trust than a missing one.
+#   mg backlight -> NG (unsupported); dn/fy/fz -> no reply at all.
+LGCOM_PORT = 9761
+LGCOM_SETID = "01"
+_LGCOM_TIMEOUT = 4.0
+LGCOM_MOCK = False
+
+# op -> (command, data). Only ops proven to round-trip on hardware.
+_LGCOM_OPS = {
+    "power_off": ("ka", "00"),
+    "power_on": ("ka", "01"),   # works over the network: the panel keeps its
+                                # NIC alive in standby, unlike a consumer TV
+                                # which needs Wake-on-LAN.
+}
+
+
+def lgcom_available():
+    """True in --mock, or when config named an LG commercial host (no pairing)."""
+    if LGCOM_MOCK:
+        return True
+    return bool(CONFIG_LGCOM and CONFIG_LGCOM.get("host"))
+
+
+def _lgcom_cmd(host, cmd, data, timeout=_LGCOM_TIMEOUT):
+    """One command; the reply string, or None. Never raises."""
+    try:
+        s = socket.create_connection((host, LGCOM_PORT), timeout=timeout)
+    except OSError:
+        return None
+    try:
+        s.settimeout(timeout)
+        s.sendall(("%s %s %s\r" % (cmd, LGCOM_SETID, data)).encode("ascii"))
+        return s.recv(256).decode("ascii", "replace").strip()
+    except OSError:
+        return None
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _lgcom_ok(reply):
+    """The panel answers OK<data>x on success and NG<data>x on refusal."""
+    return bool(reply) and "OK" in reply
+
+
+def _lgcom_value(reply):
+    """The two data chars out of '<c> 01 OK91x', or None."""
+    if not _lgcom_ok(reply):
+        return None
+    i = reply.index("OK") + 2
+    v = reply[i:i + 2]
+    return v if len(v) == 2 else None
+
+
+def lgcom_input(host, code):
+    """Switch input. `code` is LG's input byte (90 = HDMI1, 91 = HDMI2, ...)."""
+    return _lgcom_ok(_lgcom_cmd(host, "xb", code))
+
+
+def lgcom_mute(host, on):
+    """Mute. NOTE the inversion: ke 00 mutes, ke 01 unmutes."""
+    return _lgcom_ok(_lgcom_cmd(host, "ke", "00" if on else "01"))
+
+
+def lgcom_muted(host):
+    """True/False/None. Inverted, as above."""
+    v = _lgcom_value(_lgcom_cmd(host, "ke", "ff"))
+    return None if v is None else (v == "00")
+
+
+def lgcom_status(host):
+    """{power, input, muted} -- whichever the panel answers. Never raises."""
+    out = {}
+    v = _lgcom_value(_lgcom_cmd(host, "ka", "ff"))
+    if v is not None:
+        out["power"] = (v == "01")
+    v = _lgcom_value(_lgcom_cmd(host, "xb", "ff"))
+    if v is not None:
+        out["input"] = v
+    m = lgcom_muted(host)
+    if m is not None:
+        out["muted"] = m
+    return out
+
+
+def real_lgcom(op):
+    """Run a TV op against the panel. Mirrors the other backends' return shape."""
+    start = time.monotonic()
+
+    def done(ok, stdout="", stderr=""):
+        return {"ok": ok, "exit_code": 0 if ok else -1, "stdout": stdout,
+                "stderr": stderr,
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+
+    if LGCOM_MOCK:
+        return done(True, "[mock lgcom] %s" % op)
+    host = (CONFIG_LGCOM or {}).get("host")
+    if not host:
+        return done(False, stderr="no LG commercial display configured")
+    if op == "mute":
+        cur = lgcom_muted(host)
+        return done(lgcom_mute(host, not cur) if cur is not None
+                    else lgcom_mute(host, True))
+    pair = _LGCOM_OPS.get(op)
+    if pair is None:
+        # Volume is intentionally absent: it ACKs and never takes effect.
+        return done(False, stderr="op not supported on an LG commercial display")
+    return done(_lgcom_ok(_lgcom_cmd(host, pair[0], pair[1])))
 
 
 def tv_discover(mock, timeout=2.6):
@@ -6060,11 +6412,46 @@ def set_tv(mock):
     set_soft(mock)
 
 
+def _probe_ok(fn):
+    """True if an availability probe says yes. Probes touch config, sockets and
+    serial ports, so any of them can raise; a backend that errors is simply not
+    available. (set_caps has its own local `safe` for the same reason -- this is
+    the module-level equivalent, needed because _tv_hw_backend runs per request.)"""
+    try:
+        return bool(fn())
+    except Exception:
+        return False
+
+
+# brand -> availability probe, in the order the chain falls back through.
+def _tv_backend_probes():
+    return [("panel", panel_available), ("webos", webos_available),
+            ("samsung", samsung_available), ("androidtv", androidtv_available),
+            ("roku", roku_available), ("vidaa", vidaa_available),
+            ("lgcom", lgcom_available), ("cec", cec_available)]
+
+
+def tv_backends_available():
+    """Every controllable backend on this box, newest-choice first. The app
+    lists these so the user can pick WHICH paired TV to drive."""
+    return [name for name, probe in _tv_backend_probes() if _probe_ok(probe)]
+
+
 def _tv_hw_backend():
-    """The external TV backend for power (and TV volume, when chosen): the serial
+    """The external TV backend for power (and TV volume, when chosen).
+
+    An explicit user choice (config `tv_active`) wins, so a box with several
+    paired TVs drives the one the user picked. It is validated against live
+    availability every call rather than trusted: a chosen TV whose config was
+    removed must fall back instead of leaving the box with no working remote.
+
+    With no choice recorded, the historical priority chain applies: the serial
     panel first (it can power on from standby), then a paired webOS TV (explicit
-    config + a strict superset of CEC), then CEC. None when none exist. Kept
-    separate from box volume, which the soft backend handles."""
+    config + a strict superset of CEC), then CEC."""
+    if CONFIG_TV_ACTIVE:
+        for name, probe in _tv_backend_probes():
+            if name == CONFIG_TV_ACTIVE and _probe_ok(probe):
+                return name
     if panel_available():
         return "panel"
     if webos_available():
@@ -6077,6 +6464,8 @@ def _tv_hw_backend():
         return "roku"
     if vidaa_available():
         return "vidaa"
+    if lgcom_available():
+        return "lgcom"
     if cec_available():
         return "cec"
     return None
@@ -6091,9 +6480,16 @@ def tv_info():
     box_vol = soft_available()
     if hw is None and not box_vol:
         return None
+    # The roster the app's TV picker lists, plus what is actually driving now.
+    # `active` is the RESOLVED backend, not the stored preference: a chosen TV
+    # whose config vanished falls back, and the UI must show what is true.
+    backends = tv_backends_available()
     if hw == "panel":
         backend, adapter = "panel", "Newline RS-232 (%s @ %d)" % (
             PANEL["device"], PANEL["baud"])
+    elif hw == "lgcom":
+        backend, adapter = "lgcom", ("LG commercial (%s)" % CONFIG_LGCOM["host"]
+                                     if CONFIG_LGCOM else "LG commercial")
     elif hw == "webos":
         backend, adapter = "webos", ("LG webOS (%s)" % CONFIG_WEBOS["host"]
                                      if CONFIG_WEBOS else "LG webOS")
@@ -6123,6 +6519,11 @@ def tv_info():
         "available": True,
         "backend": backend,
         "adapter": adapter,
+        # Every controllable backend on this box, and the user's stored choice.
+        # The app lists `backends` as a TV picker; older apps ignore both fields
+        # and keep seeing exactly the single `backend` they always did.
+        "backends": backends,
+        "tv_active": CONFIG_TV_ACTIVE,
         "ops": list(TV_OPS),
         "box_volume": box_vol,
         "tv_volume": hw is not None,
@@ -6176,6 +6577,8 @@ def _send_tv_hw(op, mock):
     b = _tv_hw_backend()
     if b == "panel":
         return mock_panel(op) if mock else real_panel(op)
+    if b == "lgcom":
+        return real_lgcom(op)
     if b == "webos":
         return mock_webos(op) if mock else real_webos(op)
     if b == "samsung":
@@ -8862,6 +9265,30 @@ def mock_stream_host():
             "client": "macOS", "since": int(time.time()) - 725}
 
 
+def mock_tv():
+    """A box with TWO paired TVs, so the app's TV picker is reachable in the
+    web harness.
+
+    /api/tv had no mock branch, so under --mock it ran the real tv_info()
+    against the dev machine, found no backend and 404'd. That made the
+    multi-TV picker -- which only renders at 2+ backends -- impossible to
+    exercise anywhere except a box with two TVs physically paired, which is
+    exactly the state that is hardest to arrange and easiest to ship broken."""
+    return {
+        "available": True,
+        "backend": "webos",
+        "adapter": "LG webOS (10.7.0.205)",
+        "backends": ["webos", "androidtv"],
+        "tv_active": "webos",
+        "ops": ["power_on", "power_off", "volume_up", "volume_down", "mute"],
+        "box_volume": True, "tv_volume": True, "tv_power": True,
+        "source_box": False, "sources": [], "screen_toggle": False,
+        "keys": True, "source_key": False, "text": True,
+        "text_focus_push": True, "muted": False,
+        "box_volume_level": 70, "tv_volume_level": None,
+    }
+
+
 def mock_steamlink():
     """Stream hosts in EVERY liveness state at once.
 
@@ -9856,7 +10283,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/tv":
                 # Probe-and-appear: 404 when no TV backend so the app shows no
                 # TV strip; a body only when a backend is live.
-                info = tv_info()
+                info = mock_tv() if self.mock else tv_info()
                 if info is None:
                     self._send(404, {"error": "not found"}, started)
                 else:
@@ -10331,6 +10758,124 @@ class Handler(BaseHTTPRequestHandler):
             # "<ip>", "mac": "<optional, for Wake-on-LAN power-on>"}. Blocks up
             # to ~60s while the TV shows an Accept prompt; on success the granted
             # client_key is persisted to config so later starts are silent.
+            if path == "/api/tv/lgcommercial/add":
+                # An LG commercial panel needs no pairing: the 9761 control port
+                # is unauthenticated. So this just records the host after
+                # confirming something actually answers there -- storing a host
+                # that never responds is how a dead remote gets shipped.
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    host = req["host"]
+                    if not isinstance(host, str) or not host:
+                        raise ValueError("host required")
+                    name = req.get("name")
+                    if name is not None and not isinstance(name, str):
+                        raise ValueError("name must be a string")
+                except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                    self._send(400, {"error": "host (string) required"}, started)
+                    return
+                if self.mock:
+                    self._send(200, {"ok": True, "backend": "lgcom",
+                                     "host": host}, started)
+                    return
+                st = lgcom_status(host)
+                if not st:
+                    self._send(502, {"ok": False, "error":
+                                     "No LG commercial display answered on "
+                                     "port %d at that address." % LGCOM_PORT},
+                               started)
+                    return
+                try:
+                    cfg = {"host": host}
+                    if name:
+                        cfg["name"] = name
+                    global CONFIG_LGCOM
+                    with CONFIG_LOCK:
+                        _config_set_field("lg_commercial", cfg)
+                        CONFIG_LGCOM = cfg
+                except Exception as e:
+                    self._send(500, {"error": "could not persist config: %s" % e},
+                               started)
+                    return
+                self._send(200, {"ok": True, "backend": "lgcom", "host": host,
+                                 "status": st}, started)
+                return
+            if path == "/api/tv/active":
+                # Pick WHICH paired TV drives the remote. The priority chain
+                # alone made a second paired TV unreachable, so this is the
+                # switch that makes multiple TVs actually usable.
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    brand = req.get("backend")
+                    if brand is not None and not isinstance(brand, str):
+                        raise ValueError("backend must be a string or null")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "backend (string or null) required"},
+                               started)
+                    return
+                if self.mock:
+                    self._send(200, {"ok": True, "tv_active": brand,
+                                     "backend": brand or "webos",
+                                     "backends": ["webos", "androidtv"]}, started)
+                    return
+                # Reject a brand this box cannot actually drive: silently
+                # storing an unusable choice is how the original bug felt.
+                avail = tv_backends_available()
+                if brand is not None and brand not in avail:
+                    self._send(400, {"error": "backend not available on this box",
+                                     "backends": avail}, started)
+                    return
+                try:
+                    set_tv_active(brand)
+                except Exception as e:
+                    self._send(500, {"error": "could not persist config: %s" % e},
+                               started)
+                    return
+                self._send(200, {"ok": True, "tv_active": CONFIG_TV_ACTIVE,
+                                 "backend": _tv_hw_backend(),
+                                 "backends": avail}, started)
+                return
+            if path == "/api/tv/identify":
+                # What kind of device is at this address? Lets the app pick the
+                # pairing flow itself, and turn a wrong target into a sentence
+                # instead of a raw TLS error.
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    host = req["host"]
+                    if not isinstance(host, str) or not host:
+                        raise ValueError("host required")
+                except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                    self._send(400, {"error": "host (string) required"}, started)
+                    return
+                if self.mock:
+                    # Vary by address so the harness can drive BOTH outcomes.
+                    # A mock that only ever returns "supported" leaves the
+                    # unsupported path -- the whole reason identify exists --
+                    # untestable outside real hardware.
+                    if host.endswith(".178"):
+                        self._send(200, {
+                            "brand": "lg_commercial",
+                            "label": "LG commercial display", "supported": False,
+                            "reason": "This is an LG commercial/signage display, "
+                                      "not a consumer webOS TV. It does not "
+                                      "support webOS pairing."}, started)
+                    elif host.endswith(".199"):
+                        self._send(200, {
+                            "brand": None, "label": "", "supported": False,
+                            "reason": "Nothing answered at that address. Check "
+                                      "the IP, and make sure the TV is powered "
+                                      "on -- a TV in standby cannot be "
+                                      "identified."}, started)
+                    else:
+                        self._send(200, {"brand": "webos", "label": "LG webOS",
+                                         "supported": True,
+                                         "reason": "webOS SSAP"}, started)
+                    return
+                self._send(200, identify_tv(host), started)
+                self._send(200, {"ok": True, "tv_active": CONFIG_TV_ACTIVE,
+                                 "backend": _tv_hw_backend(),
+                                 "backends": avail}, started)
+                return
             if path == "/api/tv/webos/pair":
                 try:
                     req = json.loads(body.decode("utf-8")) if body else {}
