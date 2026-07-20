@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.21"
+VERSION = "2.9.31"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -178,6 +178,29 @@ DECKY_RESTART_ACTION = {
     "cmd": ["sudo", "systemctl", "restart", "plugin_loader"],
     "user_env": False,
     "detached": False,
+}
+
+# Pairing a controller is the one job you cannot do WITH a controller, and
+# Steam buries the Bluetooth page several clicks into Settings — which is a real
+# problem on a couch with no keyboard. steam:// deep-links straight to it.
+#
+# VERIFIED ON HARDWARE via a screen capture of the box: firing
+# steam://open/settings/bluetooth in Game Mode lands directly on the Bluetooth
+# panel, sidebar highlighted, scan already running. Worth recording HOW that was
+# established, because the obvious check lies: this URL is NOT a string literal
+# anywhere in Steam's JS bundle (the handler builds the route from the panel
+# name), so grepping the bundle finds nothing and proves nothing. An earlier
+# pass grepped, found no match, and wrongly concluded no Bluetooth deep link
+# existed. Test the URL, don't grep for it.
+BLUETOOTH_PAIRING_ACTION = {
+    "label": "Pair a controller",
+    "description": "Open Steam's Bluetooth pairing screen on the TV",
+    # Navigates the TV away from whatever is on it — the app renders medium as
+    # "CHANGES WHAT'S ON SCREEN", which is exactly what this does.
+    "danger": "medium",
+    "cmd": ["steam", "steam://open/settings/bluetooth"],
+    "user_env": True,        # needs DISPLAY / XDG_RUNTIME_DIR to reach the session
+    "detached": True,        # the url handler hands off to the running client
 }
 
 # Custom launcher limits (see the SECURITY NOTE in the launcher routes).
@@ -691,6 +714,26 @@ def _inject_decky_action(mock):
     if "restart-decky" not in ACTION_ORDER:
         ACTION_ORDER.append("restart-decky")
 
+
+def _inject_bluetooth_action(mock):
+    """Add the Bluetooth pairing action on boxes that actually have Steam.
+
+    Gated on Steam being installed, since the whole action is a steam:// URL —
+    on a non-Steam box it would be a button that silently does nothing, and a
+    dead button costs more trust than a missing one (same reasoning as the Decky
+    gate above). No sudo and no unit to check: the URL runs as the desktop user
+    through the already-running client. In --mock it is always added so the
+    Actions tab can be developed off-box. Called after load_config; idempotent;
+    a config-defined action of the same id wins."""
+    global ACTIONS, ACTION_ORDER
+    if "pair-controller" in ACTIONS:
+        return
+    if not mock and _steam_root() is None:
+        return
+    ACTIONS["pair-controller"] = dict(BLUETOOTH_PAIRING_ACTION)
+    if "pair-controller" not in ACTION_ORDER:
+        ACTION_ORDER.append("pair-controller")
+
 # ---------------------------------------------------------------------------
 # Real-mode data collection (Linux; each helper degrades gracefully)
 # ---------------------------------------------------------------------------
@@ -931,7 +974,8 @@ def set_caps(mock):
     if mock:
         CAPS = {k: True for k in
                 ("gamepad", "steam", "media", "tv", "screen", "power_schedule",
-                 "screensaver", "couchmode", "desktop")}
+                 "screensaver", "couchmode", "desktop", "steamlink", "gaming",
+                 "streamhost", "steammenus")}
         return
     CAPS = {
         "gamepad": _uinput_writable(),
@@ -943,6 +987,10 @@ def set_caps(mock):
         "screensaver": safe(screensaver_available),
         "couchmode": safe(couchmode_available),
         "desktop": safe(desktop_available),
+        "steamlink": safe(steamlink_available),
+        "gaming": safe(gaming_available),
+        "streamhost": safe(streamhost_available),
+        "steammenus": safe(steammenus_available),
     }
 
 
@@ -2752,6 +2800,279 @@ def discover_steam_games():
         return []
 
 
+# ---------------------------------------------------------------------------
+# Steam Remote Play — in-home streaming (/api/steamlink).
+#
+# The box's Steam client can stream games FROM another Steam machine on the LAN
+# (your gaming PC or another Deck) — the Steam client IS the streaming client,
+# so there is nothing to install. Steam caches every host it has streamed from,
+# and the appids that host offers, in config/remoteclients.vdf. We surface those
+# as one-tap "stream this game" tiles: launching steam://rungameid/<appid> for a
+# game that is NOT installed locally but that an online host offers makes Steam
+# stream it (verified on real hardware: a single rungameid brought up the
+# streaming_client, no install manifest). If the host is offline the launch is a
+# no-op on the box, so this is safe to fire optimistically.
+#
+# Names come from Steam's own appinfo.vdf cache (LAN-only, never a CDN — matches
+# the cover-art policy), so host-only games that were never installed still show
+# their real title. Cover art rides the existing /api/steam/<appid>/cover, which
+# 404s for uncached art; the app falls back to the title.
+# ---------------------------------------------------------------------------
+
+# appinfo.vdf name cache: parsing the (multi-MB) blob on every /api/steamlink
+# poll is wasteful, and it changes rarely. Cache the full {appid:int -> name}
+# map keyed by the file's mtime+size so a Steam metadata refresh invalidates it.
+_APPINFO_CACHE = {"key": None, "names": {}}
+_APPINFO_LOCK = threading.Lock()
+_APPINFO_MAGIC_V29 = 0x07564429
+_APPINFO_MAGIC_V28 = 0x07564428
+
+
+def _appinfo_path():
+    root = _steam_root()
+    if root is None:
+        return None
+    p = os.path.join(root, "appcache", "appinfo.vdf")
+    return p if os.path.isfile(p) else None
+
+
+def _parse_appinfo_names(data):
+    """{appid:int -> name:str} from an appinfo.vdf blob (v28 inline-key or v29
+    string-table). Defensive: a malformed app entry is skipped, never raised;
+    a wholly unparseable blob yields {}. Only common->name is extracted."""
+    names = {}
+    try:
+        magic = struct.unpack_from("<I", data, 0)[0]
+    except struct.error:
+        return names
+    if magic not in (_APPINFO_MAGIC_V29, _APPINFO_MAGIC_V28):
+        return names
+    v29 = magic == _APPINFO_MAGIC_V29
+    # string table (v29 only): keys in the KV blob are int32 indices into it.
+    name_idx = None
+    if v29:
+        try:
+            st_off = struct.unpack_from("<q", data, 8)[0]
+            count = struct.unpack_from("<I", data, st_off)[0]
+            strings, p = [], st_off + 4
+            for _ in range(count):
+                e = data.index(b"\x00", p)
+                strings.append(data[p:e])
+                p = e + 1
+            name_idx = strings.index(b"name")
+        except (struct.error, ValueError, IndexError):
+            return names
+        section = 16
+    else:
+        section = 12
+    # Within an app entry the KV blob begins after the fixed header fields:
+    # infoState(4) lastUpdated(4) picsToken(8) sha1(20) changeNumber(4)
+    # + v29's second (binary-vdf) sha1(20).
+    kv_off = 4 + 4 + 8 + 20 + 4 + (20 if v29 else 0)
+    n = len(data)
+    p = section
+    while p + 8 <= n:
+        try:
+            appid = struct.unpack_from("<I", data, p)[0]
+            if appid == 0:
+                break
+            size = struct.unpack_from("<I", data, p + 4)[0]
+            blob_start = p + 8
+            blob_end = blob_start + size
+            p = blob_end
+            names_val = _appinfo_find_name(data, blob_start + kv_off,
+                                           min(blob_end, n), name_idx, v29)
+            if names_val:
+                names[appid] = names_val
+        except (struct.error, ValueError, IndexError):
+            break
+    return names
+
+
+def _appinfo_find_name(data, start, end, name_idx, v29):
+    """The first string field named "name" in one app's KV blob, or None. Keys
+    are int32 string-table indices (v29) or inline NUL-terminated (v28)."""
+    p = start
+    depth = 0
+    try:
+        while p < end:
+            t = data[p]
+            p += 1
+            if t == 0x08:            # end of map
+                depth -= 1
+                if depth < 0:
+                    return None
+                continue
+            if v29:
+                key = struct.unpack_from("<I", data, p)[0]
+                p += 4
+            else:
+                e = data.index(b"\x00", p)
+                key = data[p:e]
+                p = e + 1
+            if t == 0x00:            # nested map
+                depth += 1
+                continue
+            if t == 0x01:            # string value
+                e = data.index(b"\x00", p)
+                val = data[p:e]
+                p = e + 1
+                if (name_idx is not None and key == name_idx) or \
+                        (name_idx is None and key == b"name"):
+                    return val.decode("utf-8", "replace")
+                continue
+            if t == 0x02:            # int32
+                p += 4
+                continue
+            if t == 0x07:            # int64
+                p += 8
+                continue
+            return None              # unknown type: stop this app safely
+    except (IndexError, struct.error):
+        return None
+    return None
+
+
+def _steam_appinfo_names():
+    """{appid:int -> name}, cached by appinfo.vdf mtime+size. {} on any error."""
+    path = _appinfo_path()
+    if path is None:
+        return {}
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        return {}
+    with _APPINFO_LOCK:
+        if _APPINFO_CACHE["key"] == key:
+            return _APPINFO_CACHE["names"]
+    try:
+        with open(path, "rb") as f:
+            names = _parse_appinfo_names(f.read())
+    except OSError:
+        return {}
+    with _APPINFO_LOCK:
+        _APPINFO_CACHE["key"] = key
+        _APPINFO_CACHE["names"] = names
+    return names
+
+
+def _remoteclients_path():
+    root = _steam_root()
+    if root is None:
+        return None
+    p = os.path.join(root, "config", "remoteclients.vdf")
+    return p if os.path.isfile(p) else None
+
+
+def _vdf_line_val(line):
+    """The VALUE of a `"key"  "value"` text-VDF line (the last quoted token), or
+    None. Used for remoteclients.vdf, which has no nesting we care about."""
+    parts = line.split('"')
+    if len(parts) >= 4:
+        return parts[-2]
+    if len(parts) == 3:              # a lone `"token"` (e.g. the "apps" key)
+        return parts[1]
+    return None
+
+
+def _parse_remoteclients(text):
+    """[{host, last, apps:[appid_str,...]}] from a remoteclients.vdf blob. Text
+    line-scan (pure-stdlib agent, no VDF parser). Best-effort; [] on trouble."""
+    hosts = []
+    cur = None
+    in_apps = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith('"hostname"'):
+            cur = {"host": _vdf_line_val(s) or "", "last": 0, "apps": []}
+            hosts.append(cur)
+            in_apps = False
+        elif cur is not None and s.startswith('"lastupdated"'):
+            try:
+                cur["last"] = int(_vdf_line_val(s) or "0")
+            except (TypeError, ValueError):
+                pass
+        elif s == '"apps"':
+            in_apps = True
+        elif in_apps:
+            if s.startswith("}"):
+                in_apps = False
+            elif cur is not None:
+                v = _vdf_line_val(s)
+                if v and v.isdigit():
+                    cur["apps"].append(v)
+    return hosts
+
+
+def discover_stream_games():
+    """Streamable host games as launcher dicts, most-recent host per appid.
+    Each -> {"id":"stream:<appid>","label":<name>,"kind":"stream",
+    "appid":<int>,"host":<hostname>}. Tools/runtimes skipped. Read-only,
+    best-effort: any failure yields []."""
+    try:
+        path = _remoteclients_path()
+        if path is None:
+            return []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            hosts = _parse_remoteclients(f.read())
+        names = _steam_appinfo_names()
+        best = {}  # appid(str) -> (last_seen, host)
+        for h in hosts:
+            for a in h["apps"]:
+                prev = best.get(a)
+                if prev is None or h["last"] > prev[0]:
+                    best[a] = (h["last"], h["host"])
+        out = []
+        for a, (last, host) in best.items():
+            name = names.get(int(a), "")
+            if _is_steam_tool(a, name):
+                continue
+            out.append({
+                "id": "stream:%s" % a,
+                "label": name or ("App %s" % a),
+                "kind": "stream",
+                "appid": int(a),
+                "host": host,
+                "last": last,
+            })
+        out.sort(key=lambda l: (l["label"].lower(), l["appid"]))
+        return out
+    except Exception:
+        return []
+
+
+def _streamable_appids():
+    """Set of appid strings currently offered by any known host — the allowlist
+    the launch route validates against so only a real streamable game fires."""
+    return {str(g["appid"]) for g in discover_stream_games()}
+
+
+def steamlink_available():
+    """Steam present AND at least one host offers at least one streamable game.
+    Boot-time hint (rides caps); GET /api/steamlink is the live authority."""
+    return (_steam_root() is not None
+            and shutil.which("steam") is not None
+            and bool(discover_stream_games()))
+
+
+def steamlink_info():
+    """{available, hosts:[{host, last, games:[{appid,label}]}]} grouped by host,
+    newest host first. games are de-duped to their most-recent host, so a title
+    appears once even if several machines offer it."""
+    games = discover_stream_games()
+    by_host = {}
+    for g in games:
+        by_host.setdefault(g["host"], {"host": g["host"], "last": g["last"],
+                                       "games": []})
+        by_host[g["host"]]["games"].append(
+            {"appid": g["appid"], "label": g["label"]})
+    hosts = sorted(by_host.values(), key=lambda h: h["last"], reverse=True)
+    for h in hosts:
+        h["games"].sort(key=lambda g: g["label"].lower())
+    return {"available": bool(games), "hosts": hosts}
+
+
 def _acf_int(s):
     """Parse an ACF numeric string to int; 0 on missing/garbage (never raises)."""
     try:
@@ -2927,8 +3248,12 @@ def _launcher_argv(launcher_id):
     well-formed but not present (e.g. steam:<appid> for a game that isn't
     installed) resolves to None so the route returns 404 "unknown launcher".
 
-    steam:<appid>  -> ["steam", "steam://rungameid/<appid>"]
-    custom:<slug>  -> that launcher's stored cmd argv from config
+    steam:<appid>   -> ["steam", "steam://rungameid/<appid>"] (installed game)
+    stream:<appid>  -> ["steam", "steam://rungameid/<appid>"] (Remote Play from
+                       a host — same URL, but the appid is validated against the
+                       streamable set instead of the on-disk manifest, since a
+                       host game is by definition NOT installed locally)
+    custom:<slug>   -> that launcher's stored cmd argv from config
     """
     if launcher_id.startswith("steam:"):
         appid = launcher_id[len("steam:"):]
@@ -2939,6 +3264,16 @@ def _launcher_argv(launcher_id):
         # Validate the SPECIFIC appmanifest_<appid>.acf rather than globbing +
         # parsing every manifest on each launch.
         if _steam_game_installed(appid):
+            return ["steam", "steam://rungameid/%s" % appid]
+        return None
+    if launcher_id.startswith("stream:"):
+        appid = launcher_id[len("stream:"):]
+        if not appid.isdigit():
+            return None
+        # A host-streamable game is NOT installed locally, so gate on the
+        # remoteclients allowlist instead. Steam streams it iff a host that
+        # offers it is online; if not, the rungameid is a harmless no-op.
+        if appid in _streamable_appids():
             return ["steam", "steam://rungameid/%s" % appid]
         return None
     if _valid_launcher_id(launcher_id):
@@ -7278,8 +7613,8 @@ _GUIDE_MOCK = False
 
 def _parse_input_devices(text):
     """Parse /proc/bus/input/devices into
-    [{"name","phys","uniq","handlers":[...],"keybits":[...]}]. Tolerant of
-    unknown lines. partition(':') is used so a Phys like
+    [{"name","phys","uniq","vendor","product","handlers":[...],"keybits":[...]}].
+    Tolerant of unknown lines. partition(':') is used so a Phys like
     usb-0000:c3:00.4-1/input0 survives."""
     recs, cur = [], None
     for line in text.splitlines():
@@ -7290,8 +7625,19 @@ def _parse_input_devices(text):
         val = val.strip()
         if tag == "I":
             cur = {"name": "", "phys": "", "uniq": "", "handlers": [],
-                   "keybits": []}
+                   "keybits": [], "vendor": "", "product": ""}
             recs.append(cur)
+            # "Bus=0003 Vendor=28de Product=11ff Version=0001". VID:PID is the
+            # only thing that separates a Steam Input phantom from the pad it
+            # republishes — both are phys-less and both are named after a real
+            # Xbox pad. Lowercased: /proc prints hex lowercase, but don't rely
+            # on it. Missing/garbled fields stay "" and simply never match.
+            for tok in val.split():
+                k, _, v = tok.partition("=")
+                if k == "Vendor":
+                    cur["vendor"] = v.strip().lower()
+                elif k == "Product":
+                    cur["product"] = v.strip().lower()
         elif cur is None:
             continue
         elif tag == "N" and val.startswith("Name="):
@@ -7644,6 +7990,683 @@ def _guide_watch(gen):
 
 
 # ---------------------------------------------------------------------------
+# Gaming card (GET /api/gaming). A live "what's running right now" panel:
+# discrete-GPU temp/VRAM, the running Steam game (+ cover via the existing cover
+# route), the active display output, connected controllers with battery, and the
+# session (Game Mode vs desktop). EVERY field is independently optional — the
+# only boxes reachable to test on are Intel i915 with NO hwmon under the DRM
+# device, so the GPU block simply does not appear rather than blanking the card.
+# The amdgpu sysfs paths follow the documented layout but are UNVERIFIED on
+# hardware (no AMD box on the LAN), and degrade to "no GPU block" on anything
+# that is not amdgpu (Intel exposes no device hwmon; NVIDIA would need NVML).
+# ---------------------------------------------------------------------------
+
+_GAMING_TTL = 2.0
+_GAMING_CACHE = {"val": None, "at": 0.0}
+_GAMING_LOCK = threading.Lock()
+# Sysfs roots, as module constants so tests can point them at fixtures (the same
+# pattern as _PROC_INPUT_DEVICES for the pad list).
+_DRM_DIR = "/sys/class/drm"
+_POWER_SUPPLY_DIR = "/sys/class/power_supply"
+
+
+def _read_int(path):
+    """int from a one-line sysfs file, or None (never raises)."""
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def gaming_available():
+    """Boot-time caps hint: a box with Steam can have a gaming session worth
+    showing. GET /api/gaming is the live authority (per-field probe-and-appear).
+    Never raises."""
+    try:
+        return _steam_root() is not None
+    except Exception:
+        return False
+
+
+def _gpu_sensors():
+    """Discrete-GPU temp + VRAM from amdgpu sysfs, or {} when absent. Intel i915
+    exposes no DRM-device hwmon; NVIDIA needs NVML — both degrade here to "no GPU
+    block", never to a CPU number mislabelled as GPU. Every field independently
+    optional. Read-only, best-effort; never raises."""
+    try:
+        drm = _DRM_DIR
+        # Real cards only: cardN. The connector dirs (cardN-DP-1) ALSO match a
+        # bare card* glob AND carry a `device` symlink (to the DRM card, not the
+        # PCI GPU), so mem_info_*/hwmon are not under them — re.fullmatch(card\d+)
+        # is the documented fix for that trap.
+        cards = [b for b in os.listdir(drm) if re.fullmatch(r"card\d+", b)]
+    except OSError:
+        return {}
+    for card in sorted(cards):
+        dev = os.path.join(drm, card, "device")
+        hw_name, temp_path = None, None
+        # hwmon index is not stable across boxes: match on the name file, never a
+        # hardcoded hwmonN (as read_cpu_temp_c does).
+        for nf in sorted(glob.glob(os.path.join(dev, "hwmon", "hwmon*", "name"))):
+            try:
+                with open(nf) as f:
+                    nm = f.read().strip()
+            except OSError:
+                continue
+            if nm == "amdgpu":
+                hw_name = nm
+                cand = os.path.join(os.path.dirname(nf), "temp1_input")
+                temp_path = cand if os.path.exists(cand) else None
+                break
+        if hw_name is None:
+            continue  # Intel/NVIDIA/virtual card: no amdgpu hwmon here
+        gpu = {"name": hw_name}
+        if temp_path:
+            milli = _read_int(temp_path)
+            if milli is not None:
+                gpu["temp_c"] = round(milli / 1000.0, 1)
+        # VRAM is documented as BYTES but was not observable this session. Sanity-
+        # gate the magnitude before trusting the unit — a total under ~64 MB is
+        # almost certainly not bytes, so drop it rather than report a lie.
+        total = _read_int(os.path.join(dev, "mem_info_vram_total"))
+        used = _read_int(os.path.join(dev, "mem_info_vram_used"))
+        if total is not None and total > (64 << 20):
+            gpu["vram_total_mb"] = total >> 20
+            if used is not None:
+                gpu["vram_used_mb"] = used >> 20
+        return gpu
+    return {}
+
+
+_REAPER_APPID_RE = re.compile(r"\bAppId=(\d+)")
+
+
+def _appid_from_cmdline(cmdline):
+    """Steam AppId from a /proc/<pid>/cmdline blob (NUL-separated tokens), or
+    None. Requires the real Steam launch wrapper — a `reaper` executable token
+    AND a steamapps/ path (the game binary) — so a stray "AppId=" elsewhere does
+    not register. Rejects a bracketed argv[0] ([oom_reaper] and other kernel
+    threads; those also have an empty cmdline, but guard explicitly). Never
+    raises."""
+    try:
+        args = [a for a in cmdline.split("\x00") if a]
+        if not args or args[0].startswith("["):
+            return None
+        if not any(os.path.basename(a) == "reaper" for a in args):
+            return None
+        joined = " ".join(args)
+        if "steamapps" not in joined:
+            return None
+        m = _REAPER_APPID_RE.search(joined)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _running_game():
+    """{"appid": int[, "label": str]} for the Steam game running now, or None.
+    Scans /proc/*/cmdline for the reaper wrapper; label from the appinfo cache
+    (LAN-only, same source the Steam Link list uses). Best-effort; never raises."""
+    try:
+        for entry in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                with open(entry, "r", errors="replace") as f:
+                    cmd = f.read()
+            except OSError:
+                continue
+            appid = _appid_from_cmdline(cmd)
+            if appid:
+                game = {"appid": int(appid)}
+                name = _steam_appinfo_names().get(int(appid))
+                if name:
+                    game["label"] = name
+                return game
+    except Exception:
+        pass
+    return None
+
+
+def _norm_mac(s):
+    """A MAC-ish string lowercased with all separators stripped, for fuzzy joins
+    across the many power_supply naming schemes."""
+    return re.sub(r"[^0-9a-f]", "", (s or "").lower())
+
+
+def _pad_battery(uniq):
+    """{"battery_pct": int[, "battery_status": str]} joined to a pad's uniq via
+    /sys/class/power_supply, or {} when there is no match. An EMPTY power_supply
+    directory is the normal mains-desktop case, NOT an error. Pad-battery naming
+    varies (hid-<MAC>-battery, sony_controller_battery_<MAC>, …) so join fuzzily:
+    the pad MAC (separators stripped) appearing in the supply's own name or its
+    uevent. Read-only, best-effort; never raises."""
+    key = _norm_mac(uniq)
+    if not key:
+        return {}
+    try:
+        supplies = os.listdir(_POWER_SUPPLY_DIR)
+    except OSError:
+        return {}
+    for name in supplies:
+        base = os.path.join(_POWER_SUPPLY_DIR, name)
+        if key not in _norm_mac(name):
+            try:
+                with open(os.path.join(base, "uevent")) as f:
+                    uev = f.read()
+            except OSError:
+                uev = ""
+            if key not in _norm_mac(uev):
+                continue
+        out = {}
+        pct = _read_int(os.path.join(base, "capacity"))
+        if pct is not None:
+            out["battery_pct"] = max(0, min(100, pct))
+        try:
+            with open(os.path.join(base, "status")) as f:
+                st = f.read().strip()
+            if st:
+                out["battery_status"] = st
+        except OSError:
+            pass
+        if out:
+            return out
+    return {}
+
+
+# Steam Input republishes every controller it manages as its own virtual pad
+# under this VID:PID. The Puck is the wireless dongle the 2025 Steam Controller
+# pairs through; its presence is what lets us name an otherwise anonymous
+# phantom. Both measured on a live box, 2026-07-19.
+_STEAM_INPUT_ID = ("28de", "11ff")
+_STEAM_PUCK_ID = ("28de", "1304")
+
+
+def _read_input_devices():
+    """Parsed /proc/bus/input/devices, [] on any read error."""
+    try:
+        with open(_PROC_INPUT_DEVICES, "r", errors="replace") as f:
+            return _parse_input_devices(f.read())
+    except OSError:
+        return []
+
+
+def _is_pad(rec):
+    """A joystick node with a guide button — same shape test list_real_pads
+    applies, minus its phys/uniq requirement."""
+    return (any(t.startswith("js") for t in rec.get("handlers", []))
+            and _declares_key(rec, BTN_MODE))
+
+
+def _steam_input_pads(recs):
+    """Pads Steam Input is currently republishing (VID:PID 28de:11ff).
+
+    MEASURED ON HARDWARE, all three cases producing exactly one phantom each:
+    a real pad carrying a Phys, a phys-less pad, and the agent's OWN uinput
+    pad. So this count is (real pads) + (agent pads) + (pads only Steam can
+    see) — never a subset. That is what makes the subtraction below sound."""
+    return [r for r in recs
+            if (r.get("vendor"), r.get("product")) == _STEAM_INPUT_ID
+            and _is_pad(r)]
+
+
+def _own_pad_count():
+    """Virtual gamepads the agent itself has open right now.
+
+    Counts entries whose device slot is filled, NOT len(GAMEPAD_SESSIONS) —
+    waiters sit in that list with device None, and an entry is appended before
+    any device is created. Normally 0 or 1 (only the holder owns a pad); it can
+    briefly read 2 during a handoff, between promoting the new holder and
+    releasing the old one, since both run outside GAMEPAD_LOCK. A transient
+    over-count only hides a controller for one 2s poll, which is why this is
+    allowed to race rather than take a heavier lock."""
+    try:
+        with GAMEPAD_LOCK:
+            return sum(1 for s in GAMEPAD_SESSIONS
+                       if s.get("device") is not None)
+    except Exception:
+        return 0
+
+
+def _gaming_controllers():
+    """Controllers the user could actually play with, deduped, with a best-
+    effort battery join.
+
+    TWO sources, because neither sees every pad on its own:
+
+      * REAL pads (list_real_pads) — carry a Phys or Uniq, so they have honest
+        names and can be battery-joined.
+      * Steam Input phantoms — a Steam Controller NEVER exposes a gamepad node
+        of its own. The Puck presents only lizard-mode mouse/keyboard nodes;
+        Steam consumes the HID and republishes it phys-less. Those phantoms are
+        invisible to list_real_pads BY DESIGN: our own uinput pad is phys-less
+        too, and a filter that matched it would tear down the user's desktop
+        session every time a phone connected.
+
+    Steam wraps everything it manages, so whatever is left after subtracting
+    the pads we can already see and the pads we created ourselves is exactly
+    what list_real_pads cannot reach:
+
+        total = max(len(real), phantoms - our_pads)
+
+    max() rather than plain subtraction so real pads still show when Steam is
+    not running at all and there are no phantoms. Verified against a live box
+    in every state that was reachable:
+
+        idle, Steam Controller on   real 0  phantom 1  ours 0  -> 1
+        phone gamepad connected     real 0  phantom 2  ours 1  -> 1  (not 2)
+        + a pad carrying a Phys     real 1  phantom 2  ours 0  -> 2
+        Steam not running           real 1  phantom 0  ours 0  -> 1
+    """
+    seen, out = set(), []
+    for p in list_real_pads():
+        u = p.get("uniq") or ""
+        dedupe = u.lower() or (p.get("phys") or "").lower() or p.get("event", "")
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        ctrl = {"uniq": u, "name": p.get("name", "")}
+        ctrl.update(_pad_battery(u))
+        out.append(ctrl)
+
+    recs = _read_input_devices()
+    hidden = max(0, len(_steam_input_pads(recs)) - _own_pad_count() - len(out))
+    if hidden:
+        # The phantom is anonymous ("Microsoft X-Box 360 pad 0") and carries no
+        # Uniq, so there is nothing real to name or battery-join it by. Name it
+        # from the dongle when that is present. No battery either way: the 2025
+        # controller publishes NO power_supply node (its charge is readable only
+        # over HID, in userspace), so there is nothing for _pad_battery to find.
+        label = ("Steam Controller"
+                 if any((r.get("vendor"), r.get("product")) == _STEAM_PUCK_ID
+                        for r in recs)
+                 else "Controller")
+        for i in range(hidden):
+            # Synthetic uniq: the app keys its controller list on uniq, so two
+            # hidden pads must not collide on "".
+            out.append({"uniq": "steam-input-%d" % i, "name": label})
+    return out
+
+
+def _active_output():
+    """The display the game is on: the first external connected output, else the
+    first internal, else None. From _connected_outputs (works in any session)."""
+    outs = _connected_outputs()
+    if not outs:
+        return None
+    ext = [o for o in outs if not o["internal"]]
+    return (ext or outs)[0]
+
+
+def _gaming_payload():
+    """The /api/gaming body — every field independently optional; omit anything
+    that could not be read rather than emit a null the app must special-case.
+    TTL-memoized so the app's ~5s poll does not re-scan sysfs/proc each time."""
+    now = time.monotonic()
+    with _GAMING_LOCK:
+        c = _GAMING_CACHE
+        if c["val"] is not None and now - c["at"] <= _GAMING_TTL:
+            return c["val"]
+    payload = {"session": _couchmode_session()}
+    gpu = _gpu_sensors()
+    if gpu:
+        payload["gpu"] = gpu
+    game = _running_game()
+    if game:
+        payload["game"] = game
+    output = _active_output()
+    if output:
+        payload["output"] = output
+    ctrls = _gaming_controllers()
+    if ctrls:
+        payload["controllers"] = ctrls
+    with _GAMING_LOCK:
+        _GAMING_CACHE["val"] = payload
+        _GAMING_CACHE["at"] = now
+    return payload
+
+
+def mock_gaming():
+    """A full payload for --mock so the app's render path is exercised without
+    hardware: GPU block populated (as an AMD box would), a running game, an
+    external output, a pad with battery, Game Mode."""
+    return {
+        "gpu": {"name": "amdgpu", "temp_c": 61.0,
+                "vram_used_mb": 3300, "vram_total_mb": 8192},
+        "game": {"appid": 1091500, "label": "Cyberpunk 2077"},
+        "output": {"name": "DP-1", "internal": False},
+        "controllers": [{"uniq": "dc:2c:26:aa:bb:cc",
+                         "name": "Xbox Wireless Controller",
+                         "battery_pct": 62, "battery_status": "Discharging"}],
+        "session": "gamescope",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stream host detection (GET /api/stream-host) — CouchOS roadmap phase 4a.
+#
+# DETECT ONLY: is a Steam Remote Play session being served BY this box right now?
+# No session/display manipulation whatsoever (that is 4b/4c, and 4c is gated on a
+# hardware test). This is the opposite direction from the shipped `steamlink`
+# CLIENT feature ("Stream FROM PC"), so it gets its own caps key and endpoint.
+#
+# Signal choice, grounded on hardware rather than the original plan's log tailer:
+#   * TCP 27036 LISTEN (owned by steam) = the host is up. VERIFIED live. This
+#     doubles as the wedged-Steam test.
+#   * A CONNECTED UDP peer on the streaming ports = a session is actually
+#     running, and it names the peer. Verified to be CLEAN while idle (the only
+#     connected UDP socket on an idle box is DHCP 68<->67).
+# The plan specified tailing streaming_log.txt instead. Three findings on real
+# hardware argued against it: (a) the log has NO stream-stop line at all, forcing
+# a deadline hack; (b) its would-be liveness lines are swamped by 9,915
+# "Adding/Removing process for gameID" entries that fire with no stream running,
+# which would pin a session permanently active; (c) an ESTABLISHED TCP peer on
+# 27036 is NOT a session — the router holds one on an idle box. The UDP-peer
+# probe has both edges, names the peer, and needs no deadline. If a live host
+# session shows it does not fire, the log tailer is the documented fallback.
+# ---------------------------------------------------------------------------
+
+# Steam's Remote Play control port. LISTEN here (owned by steam) means the host
+# is up; it doubles as the wedged-Steam test. Verified live.
+_STREAM_LISTEN_PORT = 27036
+_PROC_NET_TCP = ("/proc/net/tcp", "/proc/net/tcp6")
+_PROC_NET_UDP = ("/proc/net/udp", "/proc/net/udp6")
+_TCP_LISTEN = "0A"
+
+# Session edges, read off streaming_log.txt. BOTH edges exist — captured from a
+# real macOS Remote Play session served by a live box:
+#   [2026-07-19 17:50:17][75.044] >>> Starting desktop stream
+#   [2026-07-19 17:50:18][75.533] >>> Client video decoder set to macOS Metal ...
+#   [2026-07-19 17:51:04][122.09] >>> Stopped desktop stream
+# (An earlier draft of this feature keyed on a connected UDP peer in 27031-27036
+# instead; that signal DID NOT FIRE during that real session, so it silently
+# missed it. Log markers are the ground truth.)
+_STREAM_START_MARK = ">>> Starting desktop stream"
+_STREAM_STOP_MARK = ">>> Stopped desktop stream"
+_STREAM_CLIENT_MARK = ">>> Client video decoder set to "
+# Absolute backstop for a session left "started" with no stop line. It is NOT
+# the real recovery path — 12h is far too coarse for that; _stream_data_bound()
+# catches a dirty end within one poll. This only bounds the pathological case
+# where the data port somehow stays bound forever.
+_STREAM_MAX_S = 12 * 3600
+# The Remote Play DATA port. Bound for the life of a session and released when
+# it ends, cleanly or not — see _stream_data_bound().
+_STREAM_DATA_PORT = 27031
+_STREAM_LOCK = threading.Lock()
+_STREAM_STATE = {"active": False, "since": 0, "client": None, "pos": 0}
+
+
+def _stream_log_path():
+    """<steam_root>/logs/streaming_log.txt, or None. Built through _steam_root()
+    (never a hardcoded ~/.steam/steam), mirroring _remoteclients_path()."""
+    root = _steam_root()
+    if root is None:
+        return None
+    p = os.path.join(root, "logs", "streaming_log.txt")
+    return p if os.path.isfile(p) else None
+
+
+def _stream_line_epoch(line):
+    """Unix seconds from a '[YYYY-MM-DD HH:MM:SS]...' log prefix, else None."""
+    try:
+        if not line.startswith("[") or len(line) < 21:
+            return None
+        return int(time.mktime(time.strptime(line[1:20], "%Y-%m-%d %H:%M:%S")))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _stream_scan_log():
+    """Advance a byte cursor over streaming_log.txt and fold the session markers
+    into _STREAM_STATE. Handles ROTATION (file shrank -> restart at 0). The first
+    scan reads the whole file so the current state is established from the last
+    marker; afterwards only the new tail is read. Never raises."""
+    path = _stream_log_path()
+    if path is None:
+        return
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    with _STREAM_LOCK:
+        pos = _STREAM_STATE["pos"]
+        if size < pos:          # rotated / truncated
+            pos = 0
+        if size == pos:
+            return              # nothing new
+        try:
+            with open(path, "r", errors="replace") as f:
+                f.seek(pos)
+                chunk = f.read()
+                newpos = f.tell()
+        except OSError:
+            return
+        for line in chunk.splitlines():
+            if _STREAM_START_MARK in line:
+                _STREAM_STATE["active"] = True
+                _STREAM_STATE["since"] = _stream_line_epoch(line) or int(time.time())
+                _STREAM_STATE["client"] = None
+            elif _STREAM_STOP_MARK in line:
+                _STREAM_STATE["active"] = False
+                _STREAM_STATE["since"] = 0
+                _STREAM_STATE["client"] = None
+            elif _STREAM_CLIENT_MARK in line:
+                # "... set to macOS Metal hardware decoding" -> "macOS"
+                rest = line.split(_STREAM_CLIENT_MARK, 1)[1].strip()
+                _STREAM_STATE["client"] = rest.split()[0] if rest else None
+        _STREAM_STATE["pos"] = newpos
+
+
+def _proc_net_rows(paths):
+    """Yield (local_port, rem_hex_ip, rem_port, state) from /proc/net/tcp{,6}.
+    Pure parsing — no `ss`/`netstat` subprocess. Never raises."""
+    for path in paths:
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()[1:]     # drop the header
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            try:
+                lp = parts[1].rsplit(":", 1)[1]
+                rh, rp = parts[2].rsplit(":", 1)
+                yield (int(lp, 16), rh, int(rp, 16), parts[3])
+            except (ValueError, IndexError):
+                continue
+
+
+def _stream_listening():
+    """True when Steam is listening on the Remote Play control port — i.e. this
+    box can host, and Steam is not wedged. Never raises."""
+    for lport, _rh, _rp, st in _proc_net_rows(_PROC_NET_TCP):
+        if lport == _STREAM_LISTEN_PORT and st == _TCP_LISTEN:
+            return True
+    return False
+
+
+def _stream_data_bound():
+    """True while Steam holds the Remote Play DATA socket open (udp/27031).
+
+    THE RECOVERY SIGNAL for a session that ended dirty. Steam writes
+    ">>> Stopped desktop stream" only on a GRACEFUL stop — a stream host that
+    crashes or gets replaced never writes one, so the session stayed "active"
+    until _STREAM_MAX_S (12 HOURS) expired. Observed in the wild: a card still
+    claiming a live macOS stream 27 minutes after the client disconnected.
+
+    Measured on hardware in BOTH states, which is the bar this detector failed
+    to clear the first time around:
+        streaming live   udp6 :27031 present  (even with the log idle 41s)
+        session dead     27031 absent entirely, while Steam kept running and
+                         kept its 27037 discovery listener plus three LAN peers
+
+    It binds BEFORE the start marker is written ("Streaming initialized and
+    listening on port 27031" precedes ">>> Starting desktop stream" by ~4s), so
+    cross-checking it cannot suppress a session that is merely starting up.
+
+    Rejected alternative: log mtime staleness. Measured 41s of silence DURING a
+    healthy stream, so any threshold tight enough to be useful would hide live
+    sessions. Note the port binds on udp6 in practice — check both families.
+    Never raises."""
+    for lport, _rh, _rp, _st in _proc_net_rows(_PROC_NET_UDP):
+        if lport == _STREAM_DATA_PORT:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Steam settings deep links (/api/steam/menus)
+# ---------------------------------------------------------------------------
+#
+# steam://open/settings/<panel> jumps straight to one page of Steam's settings.
+# That is useful from a couch, where the alternative is walking a controller
+# through a menu — and impossible when the thing being configured IS the
+# controller.
+#
+# EVERY slug below was confirmed ON HARDWARE by firing it at a real box and
+# screen-capturing the result. That is not belt-and-braces. This list CANNOT be
+# derived by reading Steam's JS bundle: the handler builds the route from the
+# panel name, so the slugs appear nowhere in it. Grepping finds a few unrelated
+# legacy URLs and misses every entry here — including "bluetooth", which is
+# proven to work. An earlier pass grepped, found nothing, and wrongly concluded
+# no Bluetooth deep link existed.
+#
+# An unknown slug is NOT an error: Steam silently opens Settings on its DEFAULT
+# page. So a wrong entry would present as a working button that goes somewhere
+# else — worse than a missing one. Hence measured, never guessed.
+#
+# Verified ABSENT (Steam fell back to the default page) — do NOT re-add one of
+# these without capturing the screen first: internet, ingame, notifications,
+# notification, alerts, in-game, overlay, gameoverlay, ingameoverlay, interface,
+# broadcast, remoteplay, remote-play, remoteplaysettings, account, voice, music,
+# compatibility, developer, wifi, connectivity, steamnetwork, general,
+# steamcloud, streaming, recording. Several of those panels DO exist in Steam's UI (Notifications,
+# In Game, Remote Play are all visible in the sidebar) — their slugs are simply
+# something else and have not been found yet.
+#
+# "system" is deliberately absent for a different reason: it IS the default
+# page, so it is indistinguishable from an invalid slug by screen capture. It
+# almost certainly works; it is omitted rather than shipped on an assumption.
+STEAM_MENUS = (
+    ("home", "Home"),
+    ("library", "Library"),
+    ("store", "Store"),
+    ("downloads", "Downloads"),
+    ("storage", "Storage"),
+    ("gamerecording", "Game Recording"),
+    ("network", "Internet"),
+    ("display", "Display"),
+    ("audio", "Audio"),
+    ("power", "Power"),
+    ("controller", "Controller"),
+    ("bluetooth", "Bluetooth"),
+    ("keyboard", "Keyboard"),
+    ("customization", "Customization"),
+    ("accessibility", "Accessibility"),
+    ("friends", "Friends & Chat"),
+    ("family", "Family"),
+    ("cloud", "Cloud"),
+    ("security", "Security"),
+)
+_STEAM_MENU_IDS = frozenset(m[0] for m in STEAM_MENUS)
+
+
+def steammenus_available():
+    """Boot-time caps hint: these are steam:// URLs and are meaningless without
+    Steam. GET /api/steam/menus is the live authority. Never raises."""
+    try:
+        return _steam_root() is not None
+    except Exception:
+        return False
+
+
+def steam_menus_payload():
+    """The menu list, in the order the app should render it — most-reached-for
+    first rather than Steam's own sidebar order."""
+    return {"menus": [{"id": i, "label": label} for i, label in STEAM_MENUS]}
+
+
+def open_steam_menu(menu_id):
+    """Open one settings panel on the box's screen. True when dispatched.
+
+    SECURITY: menu_id is checked against a FROZEN allowlist and never reaches a
+    shell — the argv is handed to the steam binary directly. Anything not on the
+    list is refused rather than forwarded, so a caller cannot steer the box to
+    an arbitrary steam:// URL (steam:// can install games and run programs).
+    Detached like the equivalent Action: the url handler hands off to the
+    already-running client and exits."""
+    if menu_id not in _STEAM_MENU_IDS:
+        return False
+    subprocess.Popen(
+        ["steam", "steam://open/settings/%s" % menu_id],
+        env=_user_env(),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    return True
+
+
+def streamhost_available():
+    """Boot-time caps hint: Steam is present, so this box could host. The
+    endpoint is the live authority. Never raises."""
+    try:
+        return _steam_root() is not None
+    except Exception:
+        return False
+
+
+def stream_host_info():
+    """Body for GET /api/stream-host. `active` = a Remote Play session is being
+    served BY this box right now; the app shows its card only then.
+
+    The log markers open a session; the log marker OR a released data port
+    closes it. An ESTABLISHED TCP peer on 27036/27037 is NOT a session (an idle
+    box has one from the router, plus one per Steam client on the LAN — a
+    client's connection outlives its stream by design), and `listening` is
+    context only: Steam drops that listener around a session, so gating on it
+    would hide a live stream."""
+    _stream_scan_log()
+    listening = _stream_listening()
+    with _STREAM_LOCK:
+        active = bool(_STREAM_STATE["active"])
+        since = _STREAM_STATE["since"]
+        client = _STREAM_STATE["client"]
+    if active and since and int(time.time()) - since > _STREAM_MAX_S:
+        active = False                      # stale "started" with no stop line
+    if active and not _stream_data_bound():
+        # Dirty end: the host process died or was replaced without ever writing
+        # a stop marker, so the log alone would keep this session "live" for
+        # hours. Clear the shared state too, not just the local flag, so `client`
+        # and `since` stop being reported. The byte cursor is deliberately left
+        # alone — resetting it would re-read the whole log on the next poll.
+        active = False
+        with _STREAM_LOCK:
+            if _STREAM_STATE["active"]:
+                _STREAM_STATE["active"] = False
+                _STREAM_STATE["since"] = 0
+                _STREAM_STATE["client"] = None
+    # NOTE: `active` is deliberately NOT gated on `listening`. Verified on real
+    # hardware: Steam drops its 0.0.0.0:27036 TCP listener around a streaming
+    # session (present before, gone after) while the client stays connected — so
+    # gating on it would SUPPRESS a genuinely live session. The log's explicit
+    # stop marker plus _STREAM_MAX_S are what clear a session; `listening` is
+    # reported for context only.
+    info = {"available": True, "listening": listening, "active": active}
+    if active:
+        if client:
+            info["client"] = client
+        if since:
+            info["since"] = since
+    return info
+
+
+def mock_stream_host():
+    return {"available": True, "listening": True, "active": True,
+            "client": "macOS", "since": int(time.time()) - 725}
+
+
+# ---------------------------------------------------------------------------
 # Minimal RFC6455 WebSocket support (server side, no fragmentation)
 # ---------------------------------------------------------------------------
 
@@ -7753,6 +8776,14 @@ def ws_send_json(conn, obj):
 GAMEPAD_LOCK = threading.Lock()
 GAMEPAD_HOLDER = None      # the entry that currently owns input devices, or None
 GAMEPAD_SESSIONS = []      # every live entry (holder + waiters)
+# Idle-reap: drop a gamepad session that has sent us NOTHING for this long. The
+# app pings every ~5s, so real silence this long means app->box is dead (a
+# Game-Mode Wi-Fi blip during a Couch Mode switch leaves the socket half-dead —
+# the phone keeps sending but nothing arrives, so the trackpad freezes). Reaping
+# fast + closing cleanly is the ONLY reliable app->box-death signal (a box->app
+# heartbeat can't detect it — it flows regardless and would just mask a dead
+# outbound). Was 60s; 12s is >2x the ping so a healthy client never false-reaps.
+GAMEPAD_IDLE_TIMEOUT_S = 12.0
 
 
 def _wsend_json(entry, obj):
@@ -7829,15 +8860,17 @@ def _make_holder(entry, mock):
     first swipe / keypress of EVERY session (measured 508/525ms). A create
     failure here is non-fatal — the slot stays None and the lazy path in
     _handle_frame retries on first use, reporting the error to the client."""
-    # REUSE the session's existing pad on re-promotion. A session that passes
-    # control away keeps its device (nothing destroys it at demotion — only
-    # disconnect does), so a Pass/take-back ping-pong used to hit this line
-    # again and OVERWRITE the ref: the old pad object was orphaned with its fd
-    # open, leaving a phantom "Microsoft X-Box 360 pad N" alive until the agent
-    # exited (three were found on a box after one afternoon). Each orphan is
-    # also a controller Steam re-enumerates — enough churn corrupted a real
-    # box's desktop controller config. Reuse fixes the leak AND means a handoff
-    # ping-pong presents ONE stable controller to Steam instead of a parade.
+    # REUSE the session's existing pad on re-promotion, when one survived.
+    # (_release_devices DOES destroy the pad at demotion, so usually none has —
+    # an earlier version of this comment claimed otherwise.) The guard is what
+    # stops a re-promotion from OVERWRITING a live ref: that orphaned the old
+    # pad object with its fd still open, leaving a phantom "Microsoft X-Box 360
+    # pad N" alive until the agent exited (three were found on a box after one
+    # afternoon). Each orphan is also a controller Steam re-enumerates — enough
+    # churn corrupted a real box's desktop controller config, and each one now
+    # also inflates _own_pad_count and so hides a real controller from the
+    # gaming card. Reuse keeps a handoff ping-pong presenting ONE stable
+    # controller to Steam instead of a parade.
     if entry.get("device") is None:
         try:
             entry["device"] = MockGamepad() if mock else UInputGamepad()
@@ -8541,6 +9574,17 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/api/status":
                 data = mock_status() if self.mock else real_status()
+                # The LAN IP the phone actually reached us on. The app caches it
+                # as the box's fallback address and REFRESHES it every poll, so a
+                # box added by hostname gets a working fallback and a box whose
+                # DHCP lease drifts stays reachable when mDNS (.local) breaks —
+                # e.g. right after an agent restart, when Game Mode WiFi
+                # power-save has dropped the multicast mDNS needs. Same value as
+                # /api/ping's "ip"; here it rides the poll the app already makes.
+                try:
+                    data["ip"] = self.connection.getsockname()[0]
+                except OSError:
+                    pass
                 self._send(200, data, started)
             elif path == "/api/units":
                 units = mock_units() if self.mock else real_units()
@@ -8676,6 +9720,44 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, info, started)
                 else:
                     self._send(404, {"error": "screensaver not installed"}, started)
+            elif path == "/api/steam/menus":
+                # Steam settings deep links. Probe-and-appear: 404 without
+                # Steam, so an older agent or a non-Steam box simply never
+                # shows the surface. Static list, no scan, no cache needed.
+                if steammenus_available() or self.mock:
+                    self._send(200, steam_menus_payload(), started)
+                else:
+                    self._send(404, {"error": "unavailable"}, started)
+            elif path == "/api/steamlink":
+                # Steam Remote Play (in-home streaming) host list. Probe-and-
+                # appear: 404 when no host has ever been streamed from (nothing
+                # to offer) so the app hides the "Stream from PC" surface. Launch
+                # is the existing POST /api/launchers/stream:<appid>.
+                info = steamlink_info()
+                if info["available"]:
+                    self._send(200, info, started)
+                else:
+                    self._send(404, {"error": "no streamable hosts"}, started)
+            elif path == "/api/gaming":
+                # Live "what's running now" card. Probe-and-appear: 404 when this
+                # box has no Steam (nothing to report) so old/non-gaming boxes
+                # hide the card. The payload is per-field optional — a box with no
+                # discrete GPU (Intel i915) simply omits the "gpu" key.
+                if not self.mock and _steam_root() is None:
+                    self._send(404, {"error": "no gaming context"}, started)
+                else:
+                    data = mock_gaming() if self.mock else _gaming_payload()
+                    self._send(200, data, started)
+            elif path == "/api/stream-host":
+                # Steam Remote Play with this box as the HOST (phase 4a, detect
+                # only — no session/display manipulation). Probe-and-appear: 404
+                # without Steam. The app shows its card only while `active`.
+                # Distinct from /api/steamlink, which is the CLIENT direction.
+                if not self.mock and _steam_root() is None:
+                    self._send(404, {"error": "no steam"}, started)
+                else:
+                    info = mock_stream_host() if self.mock else stream_host_info()
+                    self._send(200, info, started)
             elif path == "/api/guide-hold":
                 # Probe-and-appear like /api/screensaver: 404 when the box can't
                 # do the handoff or can't read evdev, so the app hides the row.
@@ -8817,6 +9899,34 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(413, {"error": "request body too large"}, started)
                 return
             body = self._read_body()
+
+            # POST /api/steam/menus {"id": "<panel>"}: open one Steam settings
+            # page on the box's screen. 404 on an id that is not on the frozen
+            # allowlist — Steam would silently open its DEFAULT page for an
+            # unknown slug, so forwarding one would look like success while
+            # landing somewhere else entirely.
+            if path == "/api/steam/menus":
+                # _read_body() hands back BYTES, not a parsed object — decode
+                # like every other POST route here.
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(req, dict):
+                        raise ValueError("body must be a JSON object")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "body must be a JSON object"},
+                               started)
+                    return
+                menu_id = req.get("id")
+                if not isinstance(menu_id, str) or menu_id not in _STEAM_MENU_IDS:
+                    self._send(404, {"error": "unknown menu"}, started)
+                    return
+                if self.mock:
+                    self._send(200, {"ok": True, "id": menu_id}, started)
+                    return
+                ok = open_steam_menu(menu_id)
+                self._send(200 if ok else 500,
+                           {"ok": ok, "id": menu_id}, started)
+                return
 
             prefix = "/api/actions/"
             if path.startswith(prefix):
@@ -9652,7 +10762,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- recv loop --------------------------------------------------------
         try:
-            conn.settimeout(60.0)
+            conn.settimeout(GAMEPAD_IDLE_TIMEOUT_S)
             buf = bytearray()
             while True:
                 try:
@@ -9661,7 +10771,11 @@ class Handler(BaseHTTPRequestHandler):
                     print("[gamepad] protocol violation: %s" % e, flush=True)
                     _wsend_op(entry, WS_OP_CLOSE)
                     return
-                if frame is None:  # EOF / timeout / socket error -> dead
+                if frame is None:  # EOF / idle timeout / socket error -> dead
+                    # Tell the app cleanly (best-effort — a no-op on an already-
+                    # dead socket) so an idle-reaped, half-dead session reconnects
+                    # promptly instead of waiting out the app's own watchdog.
+                    _wsend_op(entry, WS_OP_CLOSE)
                     return
                 opcode, payload = frame
                 try:
@@ -9962,6 +11076,7 @@ def main():
     _inject_session_actions()
     _inject_suspend_action(args.mock)
     _inject_decky_action(args.mock)
+    _inject_bluetooth_action(args.mock)
     set_tv(args.mock)
     set_mpris(args.mock)
     set_screen(args.mock)
