@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.34"
+VERSION = "2.9.40"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -133,9 +133,15 @@ SESSION_ACTIONS = {
         "label": "Switch to Desktop",
         "description": "Leave Game Mode for the SteamOS desktop",
         "danger": "medium",
-        # "plasma" = one-time switch to the desktop (doesn't change the default
-        # login mode, so the box still boots into Game Mode). NB: session-select
-        # has no "desktop" arg: valid targets are plasma*/gamescope.
+        # One-time switch to the desktop: the default login mode is untouched,
+        # so the box still boots into Game Mode. NB: session-select has no
+        # "desktop" arg -- valid targets are plasma*/gamescope.
+        #
+        # The arg is REWRITTEN at injection time to match the box's configured
+        # default session (see _inject_session_actions). Bare "plasma" is
+        # SteamOS's legacy alias for the X11 session, so leaving it here would
+        # force X11 onto a Wayland-configured box. This value is the fallback
+        # for boxes whose default cannot be read.
         "cmd": ["steamos-session-select", "plasma"],
         "user_env": True,
         "detached": True,
@@ -703,9 +709,17 @@ def _inject_session_actions():
     global ACTIONS, ACTION_ORDER
     if not shutil.which("steamos-session-select"):
         return
+    # Point "Switch to Desktop" at the session this box is CONFIGURED for. The
+    # static spec says "plasma", which SteamOS maps to the X11 session -- on a
+    # Wayland-configured box that silently changes the user's desktop. Resolved
+    # once here, from a frozen allowlist, so the stored argv stays a fixed list.
+    _, select_arg = _default_desktop_session()
     for aid, spec in SESSION_ACTIONS.items():
         if aid not in ACTIONS:
-            ACTIONS[aid] = dict(spec)
+            spec = dict(spec)
+            if aid == "switch-desktop":
+                spec["cmd"] = ["steamos-session-select", select_arg]
+            ACTIONS[aid] = spec
             if aid not in ACTION_ORDER:
                 ACTION_ORDER.append(aid)
 
@@ -988,16 +1002,236 @@ def read_mem():
         return {"total_mb": 0, "used_mb": 0, "available_mb": 0}
 
 
+# Filesystems worth showing, in the order they should appear. "/home" is here
+# because on SteamOS the user's storage IS /home and "/" is a small read-only
+# rootfs -- reporting only "/" showed a Steam Deck owner "3.5 / 5.0 GB, 69%" on a
+# machine with far more space, which reads as a nearly-full disk and is not even
+# a filesystem they can write to.
+_DISK_MOUNTS = ("/", "/home", "/var")
+
+
+# Sysfs root for USB wake, as a module constant so tests can point it at
+# fixtures (same pattern as _DRM_DIR / _PROC_INPUT_DEVICES).
+_USB_DEVICES_DIR = "/sys/bus/usb/devices"
+# A USB *interface* node is "<device>:<config>.<iface>" (e.g. 1-2:1.0). Only
+# DEVICES own power/wakeup; interfaces never do. Measured on a live Bazzite box:
+# every ":" node had no wakeup file at all, so listing them is pure noise.
+_USB_IFACE_RE = re.compile(r":")
+_USB_ROOT_HUB_RE = re.compile(r"^usb\d+$")
+
+
+def _usb_read(path):
+    """First line of a sysfs file, or None. Never raises."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.readline().strip()
+    except OSError:
+        return None
+
+
+def usb_wake_devices():
+    """Every USB device that can be a wake source, and whether it is armed.
+
+    READ-ONLY. Arming needs root and is deliberately not done here — this exists
+    so the app can show what a box could wake from BEFORE anyone changes system
+    state, and so a user can see why their controller does not wake it.
+
+    Why per-device rather than the root hubs everyone starts with: a field report
+    on a DIY SteamOS box had keyboard and mouse waking the machine while
+    controllers did not, because only the root hubs were armed and a controller's
+    signal arrives through a dongle further down the tree.
+
+    `transient` is the load-bearing field. The same reporter then armed every
+    device with a writable wakeup file and hit the opposite problem: a controller
+    powering itself off after 15 minutes is a DISCONNECT, the kernel counts that
+    as a bus state change, and the machine woke straight back up. Arming a device
+    that goes away is how you get spurious wakes; arming the dongle it hangs off
+    does not have that failure mode, because the dongle never leaves. Hubs and
+    root hubs stay put, so they are marked persistent.
+
+    Never raises: returns [] when the sysfs root is unreadable, and omits any
+    device whose attributes cannot be read rather than guessing at them."""
+    out = []
+    try:
+        names = sorted(os.listdir(_USB_DEVICES_DIR))
+    except OSError:
+        return []
+    for name in names:
+        if _USB_IFACE_RE.search(name):
+            continue  # interface node: never owns power/wakeup
+        base = os.path.join(_USB_DEVICES_DIR, name)
+        wake_path = os.path.join(base, "power", "wakeup")
+        state = _usb_read(wake_path)
+        if state not in ("enabled", "disabled"):
+            # No wakeup file (or an unreadable one) means this device cannot be a
+            # wake source. Omitting it beats reporting a control that does
+            # nothing — a dead button costs more trust than a missing one.
+            continue
+        cls = _usb_read(os.path.join(base, "bDeviceClass")) or ""
+        is_root = bool(_USB_ROOT_HUB_RE.match(name))
+        is_hub = cls == "09" or is_root
+        out.append({
+            "id": name,
+            "vendor": _usb_read(os.path.join(base, "idVendor")) or "",
+            "product_id": _usb_read(os.path.join(base, "idProduct")) or "",
+            "name": (_usb_read(os.path.join(base, "product"))
+                     or _usb_read(os.path.join(base, "manufacturer")) or ""),
+            "wake": state,
+            "armed": state == "enabled",
+            "root_hub": is_root,
+            "hub": is_hub,
+            # HEURISTIC, and a deliberately weak one: "not a hub". A hub is
+            # certainly persistent; a leaf device only MIGHT power itself off.
+            # Measured counterexample on a live box: the Xbox wireless dongle
+            # (045e:02e6) is a leaf and reports transient, yet it never leaves —
+            # it is exactly the device you would want armed. Sysfs exposes
+            # nothing that distinguishes "dongle that stays" from "controller
+            # that sleeps", so this is a hint for the UI to phrase a warning
+            # around, NOT a fact to gate on. Do not make arming decisions from
+            # it without asking the user.
+            "transient": not is_hub,
+            "writable": os.access(wake_path, os.W_OK),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# On-screen-keyboard detection
+#
+# When Steam raises its own keyboard on the TV, the phone should raise ITS
+# keyboard too, so you can type (or paste) instead of thumb-picking letters on
+# a grid with a d-pad.
+#
+# There is no general way to learn that a text field took focus on the box:
+# Wayland exposes no such thing, and gamescope has no client API for it. But
+# "Steam's on-screen keyboard opened" is a different and much narrower question,
+# and Steam writes it in plain text to its own UI log. Reading a Steam log for a
+# signal is established practice here — stream_host_online() already parses
+# Steam's remote-connection log the same way.
+#
+# MEASURED on a live Bazzite box in Game Mode, 2026-07-21:
+#   - Opening the keyboard emits exactly TWO identical lines, every time, across
+#     ten observed events. Hence the dedupe window below.
+#   - NEGATIVE CONTROL: navigating the library, opening a game page and moving
+#     between tabs produced "Trying to change focus to already selected tab",
+#     "updating PluginView", store page loads -- and ZERO keyboard markers. The
+#     signal is specific to the keyboard, not to focus in general.
+#   - Twenty minutes of an idle box produced zero markers.
+#   - Write latency is sub-second: detection timestamps matched Steam's own
+#     stamp within the 1s resolution of the test, twice landing in the same
+#     second. Steam does not buffer this log.
+#
+# This is an UNDOCUMENTED log line and Valve can rename it in any update, so it
+# degrades closed at every step: no log file, no marker, or a renamed marker all
+# mean the feature silently never fires. Nothing else depends on it.
+_OSK_LOG = os.path.expanduser("~/.steam/steam/logs/webhelper_js.txt")
+_OSK_MARKER = "giving focus to keyboard"
+_OSK_POLL_S = 0.25
+# Two lines per open, same second. Anything inside this window is one event.
+_OSK_DEDUPE_S = 1.5
+_OSK_GEN = 0
+_OSK_LOCK = threading.Lock()
+
+
+def osk_available():
+    """True when this box has the Steam UI log to watch. Never raises."""
+    try:
+        return os.path.isfile(_OSK_LOG)
+    except OSError:
+        return False
+
+
+def _osk_notify():
+    """Tell the CURRENT holder its box just raised a keyboard.
+
+    Only the holder: a waiter cannot type, so popping its keyboard would be a
+    lie. Best-effort — _wsend_json never raises."""
+    with GAMEPAD_LOCK:
+        holder = GAMEPAD_HOLDER
+    if holder is not None:
+        _wsend_json(holder, {"t": "osk"})
+
+
+def _osk_watch(gen):
+    """Tail the Steam UI log and fire _osk_notify on each keyboard-open.
+
+    Starts at END of file, so an agent restart never replays a keyboard that
+    opened an hour ago. Handles truncation/rotation by resetting the offset."""
+    try:
+        pos = os.path.getsize(_OSK_LOG)
+    except OSError:
+        return
+    last = 0.0
+    while True:
+        with _OSK_LOCK:
+            if gen != _OSK_GEN:
+                return  # superseded by a newer watcher
+        time.sleep(_OSK_POLL_S)
+        try:
+            size = os.path.getsize(_OSK_LOG)
+            if size < pos:      # rotated or truncated
+                pos = 0
+            if size == pos:
+                continue
+            with open(_OSK_LOG, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(pos)
+                chunk = f.read()
+                pos = f.tell()
+        except OSError:
+            continue            # log vanished mid-read: try again next tick
+        if _OSK_MARKER not in chunk:
+            continue
+        now = time.monotonic()
+        if now - last < _OSK_DEDUPE_S:
+            continue            # the second line of the same open
+        last = now
+        _osk_notify()
+
+
+def osk_arm(mock=False):
+    """(Re)start the OSK watcher. Generation-guarded like the guide watcher, so
+    a restart cannot leave two live watchers both firing."""
+    global _OSK_GEN
+    with _OSK_LOCK:
+        _OSK_GEN += 1
+        gen = _OSK_GEN
+    if mock or not osk_available():
+        return
+    threading.Thread(target=_osk_watch, args=(gen,), daemon=True,
+                     name="osk-watch").start()
+    print("[osk] watching %s" % _OSK_LOG, flush=True)
+
+
 def read_disks():
     disks = []
-    for mount in ("/", "/var"):
+    seen_devices = set()
+    for mount in _DISK_MOUNTS:
         try:
+            # Same filesystem reached by two paths (the common case where /home
+            # is not split out) must not be listed twice.
+            try:
+                dev = os.stat(mount).st_dev
+            except OSError:
+                continue
+            if dev in seen_devices:
+                continue
+
+            # Read-only roots are not the user's storage and nothing they do can
+            # change the number, so showing one is pure alarm. This is what hides
+            # the immutable rootfs on SteamOS and Fedora Atomic derivatives.
+            try:
+                if os.statvfs(mount).f_flag & os.ST_RDONLY:
+                    continue
+            except (OSError, AttributeError):
+                pass  # unreadable -> fall through to the size check
+
             du = shutil.disk_usage(mount)
             # Skip synthetic mounts with no real capacity (e.g. the composefs
             # read-only / on Bazzite/Fedora Atomic reports a tiny total that is
             # always "100% used": meaningless and alarming on the dashboard).
             if du.total < 1024 ** 3:
                 continue
+            seen_devices.add(dev)
             total_gb = du.total / (1024 ** 3)
             used_gb = du.used / (1024 ** 3)
             free_gb = du.free / (1024 ** 3)
@@ -1062,7 +1296,7 @@ def set_caps(mock):
         CAPS = {k: True for k in
                 ("gamepad", "steam", "media", "tv", "screen", "power_schedule",
                  "screensaver", "couchmode", "desktop", "steamlink", "gaming",
-                 "streamhost", "steammenus")}
+                 "streamhost", "steammenus", "boxbattery")}
         return
     CAPS = {
         "gamepad": _uinput_writable(),
@@ -1078,6 +1312,7 @@ def set_caps(mock):
         "gaming": safe(gaming_available),
         "streamhost": safe(streamhost_available),
         "steammenus": safe(steammenus_available),
+        "boxbattery": safe(box_battery_available),
     }
 
 
@@ -1491,6 +1726,7 @@ def real_status():
     load = read_load()
     temp = read_cpu_temp_c()
     mem = read_mem()
+    battery = read_box_battery()
     now = int(time.time())
     _record_history(now, temp, load[0] if load else None, mem)
     return {
@@ -1501,6 +1737,11 @@ def real_status():
         "cpu_temp_c": temp,
         "mem": mem,
         "disks": read_disks(),
+        # The machine's OWN battery, on handhelds and laptops. ADDITIVE and
+        # OMITTED entirely on a mains desktop, so old apps are unaffected and
+        # new ones can treat "absent" as "this box has no battery" rather than
+        # having to distinguish that from 0%.
+        **({"battery": battery} if battery else {}),
         "net": net_info_cached(),
         "agent_version": VERSION,
         # CAPS is a boot-time snapshot, but "desktop" is SESSION-volatile (it
@@ -1858,14 +2099,70 @@ def _tv_audio_sink():
     return None
 
 
-def _internal_audio_sink():
-    """Node name of the built-in speaker/analog sink (for restoring on return)."""
-    for s in _pactl_sinks():
-        low = s["name"].lower()
-        if not s["hdmi"] and ("speaker" in low or "analog" in low
-                              or "pci" in low):
-            return s["name"]
-    return None
+def _current_default_sink():
+    """The node name pactl currently reports as the default sink, or None when
+    pactl is missing/errors. Read BEFORE any set-default-sink so the user's own
+    choice can be put back verbatim."""
+    if not shutil.which("pactl"):
+        return None
+    r = _couch_run(["pactl", "get-default-sink"], timeout=8)
+    if not r["ok"]:
+        return None
+    name = (r["stdout"] or "").strip()
+    return name or None
+
+
+# The default sink as it was BEFORE Couchside moved audio to the TV, so leaving
+# Couch Mode restores exactly what the user had.
+#
+# This used to be guessed on the way back out: _internal_audio_sink() matched a
+# sink whose name contained "speaker"/"analog"/"pci" and made that the default.
+# That is not a restore, it is a substitution, and it cost a user their audio --
+# reported from the field as the box's default device being changed out from
+# under them, with sound gone from the TV until they fixed it by hand. Anyone
+# whose default was a USB DAC, a Bluetooth speaker or any virtual sink got the
+# same treatment.
+#
+# In memory rather than on disk deliberately: this is ephemeral state belonging
+# to one Couch Mode session, and config.json is the user's file, not a scratch
+# pad. The cost is that an agent restart mid-session forgets it -- in which case
+# the restore SKIPS instead of guessing. Doing nothing is always recoverable;
+# moving a user's audio somewhere they did not choose is what caused this bug.
+_PRIOR_DEFAULT_SINK = None
+_PRIOR_SINK_LOCK = threading.Lock()
+
+
+def _remember_default_sink():
+    """Record the current default sink before Couchside changes it. First writer
+    wins: entering Couch Mode twice must not overwrite the ORIGINAL value with
+    the TV sink we ourselves set."""
+    global _PRIOR_DEFAULT_SINK
+    with _PRIOR_SINK_LOCK:
+        if _PRIOR_DEFAULT_SINK is not None:
+            return
+        _PRIOR_DEFAULT_SINK = _current_default_sink()
+
+
+def _restore_default_sink():
+    """Put the default sink back to what it was before Couch Mode.
+
+    Degrades closed, three ways. Nothing remembered (agent restarted, or the box
+    never entered Couch Mode through us) -> skipped. The remembered sink no
+    longer exists -> skipped, because a stale name would either fail or, worse,
+    match something else. Already the default -> skipped as a no-op."""
+    global _PRIOR_DEFAULT_SINK
+    with _PRIOR_SINK_LOCK:
+        want = _PRIOR_DEFAULT_SINK
+        _PRIOR_DEFAULT_SINK = None
+    if not want:
+        return {"skipped": True,
+                "reason": "no prior audio device recorded; leaving audio alone"}
+    if want not in [s["name"] for s in _pactl_sinks()]:
+        return {"skipped": True,
+                "reason": "the previous audio device is gone; leaving audio alone"}
+    if _current_default_sink() == want:
+        return {"skipped": True, "reason": "already the default"}
+    return _couch_run(["pactl", "set-default-sink", want])
 
 
 def _couch_run_first(cmds):
@@ -1897,17 +2194,58 @@ def _session_to_game():
     ])
 
 
-def _session_to_desktop():
-    """Transient switch back to the desktop session.
 
-    SteamOS: steamosctl with the X11 session (validated live). Bazzite: its
-    steamos-session-select 'plasma' runs a ONESHOT desktop session — the boot
-    default stays Game Mode, which is exactly couch-mode semantics (also
-    validated live)."""
+# SteamOS ships BOTH desktop sessions and steamos-session-select maps the bare
+# "plasma" arg to the X11 one:
+#     plasma)         steamosctl switch-to-desktop-mode plasmax11.desktop
+#     plasma-wayland) steamosctl switch-to-desktop-mode plasma.desktop
+# So passing "plasma" silently OVERRIDES a box configured for Wayland. Measured
+# on a real Deck (SteamOS 20260701.2): the configured default was
+# plasma.desktop (Wayland) and our switch landed it in an x11 session. The user
+# noticed their desktop had changed and had no idea we did it.
+#
+# FROZEN ALLOWLIST. The session name is read from the system, not a client, but
+# it still only ever SELECTS one of these known values -- never interpolated.
+# Anything unrecognised falls back to the previously-validated X11 path, so a
+# box we can't read stays exactly as it behaved before.
+_DESKTOP_SESSIONS = {
+    "plasma.desktop": "plasma-wayland",
+    "plasmax11.desktop": "plasma",
+}
+_DEFAULT_DESKTOP_FALLBACK = "plasmax11.desktop"
+
+
+def _default_desktop_session():
+    """The desktop session this box is CONFIGURED to use, as a
+    (session_file, session_select_arg) pair from the frozen table above.
+
+    Degrades closed: any read failure, or a name not on the allowlist, returns
+    the X11 pair that shipped before -- never a guess, never a raw value."""
+    try:
+        r = subprocess.run(["steamosctl", "get-default-desktop-session"],
+                           capture_output=True, text=True, timeout=5)
+        name = (r.stdout or "").strip()
+    except Exception:
+        name = ""
+    if name not in _DESKTOP_SESSIONS:
+        name = _DEFAULT_DESKTOP_FALLBACK
+    return name, _DESKTOP_SESSIONS[name]
+
+
+def _session_to_desktop():
+    """Transient switch back to the desktop session, honouring the box's OWN
+    configured default rather than forcing one.
+
+    This used to hardcode plasmax11.desktop. That silently downgraded a
+    Wayland-configured box to X11 every time Couch Mode came back to the
+    desktop (see _default_desktop_session). It stays a ONESHOT switch either
+    way: the boot default is untouched, so the box still returns to Game Mode,
+    which is exactly couch-mode semantics."""
+    session, select_arg = _default_desktop_session()
     return _couch_run_first([
-        ["steamosctl", "switch-to-desktop-mode", "plasmax11.desktop"],
+        ["steamosctl", "switch-to-desktop-mode", session],
         ["steamosctl", "switch-to-desktop-mode"],
-        ["steamos-session-select", "plasma"],
+        ["steamos-session-select", select_arg],
     ])
 
 
@@ -1964,28 +2302,53 @@ def couchmode_start(output, hdr=False):
     steps["tv_power_on"] = pwr if pwr is not None else {"skipped": True}
     src = tv_send("source_box", False)
     steps["tv_input"] = src if src is not None else {"skipped": True}
-    # (1) Route audio to the TV.
+    # (1) Route audio to the TV, remembering where it was so exit can undo it.
     sink = _tv_audio_sink()
-    steps["audio"] = (_couch_run(["pactl", "set-default-sink", sink])
-                      if sink else {"skipped": True})
+    if sink:
+        _remember_default_sink()
+        steps["audio"] = _couch_run(["pactl", "set-default-sink", sink])
+    else:
+        steps["audio"] = {"skipped": True}
     # (2) Honor the display picker where the platform allows it.
     steps["output"] = _set_preferred_output(output)
     # (3) Enter Game Mode (the one step that must succeed).
     sw = _session_to_game()
     steps["session"] = sw
-    return {"ok": sw["ok"], "output": output, "hdr": bool(hdr),
-            "session": "gamescope" if sw["ok"] else _couchmode_session(),
+    # (4) READBACK. steamos-session-select returns as soon as the switch is
+    # TRIGGERED, so sw["ok"] only means "the subprocess exited 0" -- it does not
+    # mean Game Mode came up. A compositor that fails to initialise on this GPU
+    # (proprietary NVIDIA, a bad output) previously reported success onto a black
+    # TV. Both live callers were affected: couchmode_enter (HTTP) and
+    # couchmode_try_enter (the guide-hold controller trigger).
+    #
+    # Reuses _couch_verify_gamescope() -- the staged ceremony already solved this
+    # exact problem for its own path, and a second private poller would be two
+    # implementations of one rule. NOTE this makes the call block up to
+    # SESSION_VERIFY_TIMEOUT_S; both callers already hold COUCH_LOCK for the
+    # whole switch, and blocking there is what stops a re-trigger mid-switch.
+    presented = False
+    if sw["ok"]:
+        presented = _couch_verify_gamescope()
+        steps["gamescope_up"] = {
+            "ok": presented, "exit_code": 0 if presented else 1, "stdout": "",
+            "stderr": "" if presented else
+            "switch reported success but Game Mode did not appear within %gs"
+            % SESSION_VERIFY_TIMEOUT_S}
+    return {"ok": bool(sw["ok"] and presented), "output": output,
+            "hdr": bool(hdr),
+            # Report the session we actually observed, never the one we hoped for.
+            "session": "gamescope" if presented else _couchmode_session(),
             "steps": steps}
 
 
 def desktop_mode():
-    """Return from Game Mode to the Plasma desktop and route audio back to the
-    built-in speaker."""
+    """Return from Game Mode to the Plasma desktop and put the audio device back
+    to whatever it was before Couch Mode moved it.
+
+    Restores, never substitutes: if we did not record a prior device, audio is
+    left exactly where it is. See _restore_default_sink."""
     sw = _session_to_desktop()
-    steps = {"session": sw}
-    sink = _internal_audio_sink()
-    steps["audio"] = (_couch_run(["pactl", "set-default-sink", sink])
-                      if sink else {"skipped": True})
+    steps = {"session": sw, "audio": _restore_default_sink()}
     return {"ok": sw["ok"],
             "session": "desktop" if sw["ok"] else _couchmode_session(),
             "steps": steps}
@@ -2113,6 +2476,7 @@ def _couch_do_audio(has_external):
         return {"state": "failed",
                 "reason": "the TV's HDMI audio sink never appeared — "
                           "sound may still be on the box"}
+    _remember_default_sink()  # capture BEFORE the change, so exit can undo it
     r = _couch_run(["pactl", "set-default-sink", sink])
     if r["ok"]:
         return {"state": "ok"}
@@ -2532,6 +2896,10 @@ def mock_status():
             {"mount": "/var", "total_gb": 465.1, "used_gb": 198.2,
              "free_gb": 266.9, "pct": 43},
         ],
+        # Mock is a HANDHELD so the battery row is exercisable in the web
+        # harness -- a mains desktop would render nothing and prove nothing.
+        "battery": {"pct": 58, "status": "Discharging",
+                    "on_ac": False, "minutes": 251},
         "net": {"iface": "eth0", "mac": "de:ad:be:ef:00:01",
                 "wired": True, "wol_armed": True},
         "agent_version": VERSION,
@@ -7000,6 +7368,13 @@ SCREEN_WIDTH = 960                # downscale target width
 SCREEN_LOCK = threading.Lock()    # single-flight: never stack captures
 _SCREEN = None                    # capability dict or None; set by set_screen
 _SCREEN_CACHE = {"ts": 0.0, "data": None, "mime": None}  # 500 ms frame cache
+# Grayscale 0-255. Below this a frame is ~uniform (an all-black compositor
+# readback) and is rejected as a failed capture rather than served. _png_complete
+# only proves the PNG has an IEND chunk -- a perfectly well-formed all-black
+# frame passes it, and the app then shows a black preview that looks identical
+# to a working one.
+SCREEN_MIN_STDDEV = 2.0
+_screen_black_logged_at = 0.0     # rate-limit the ~uniform-frame log line
 
 
 def _screen_downscaler():
@@ -7136,6 +7511,67 @@ def _grab_spectacle(env, outdir):
     return png if _png_complete(png) else None
 
 
+def _grayscale_stddev(raw):
+    """Population std-dev of an 8-bit grayscale byte buffer (0-255), or None when
+    empty. Pure stdlib -- this agent ships with no third-party dependency and
+    must stay installable on an immutable SteamOS/Bazzite rootfs."""
+    n = len(raw)
+    if n == 0:
+        return None
+    mean = sum(raw) / n
+    return (sum((b - mean) ** 2 for b in raw) / n) ** 0.5
+
+
+def _frame_variance(src, env):
+    """Std-dev (0-255 grayscale) of a 32x32 sample of `src` (a PNG), using
+    whatever image tool this box has -- the same family _screen_downscaler picks
+    from, so it adds no new dependency.
+
+    Returns None when it CANNOT be measured (no tool, tool error). Callers MUST
+    treat None as "inconclusive" and never as black: a measurement gap must not
+    be able to suppress a real frame. 32x32 is plenty to separate a black
+    readback from a real desktop, and it is one short-lived subprocess on a path
+    that already runs a downscale per capture (and is capped at ~2/sec by the
+    500ms cache)."""
+    if shutil.which("magick"):
+        argv = ["magick", src, "-resize", "32x32!", "-colorspace", "Gray",
+                "-depth", "8", "GRAY:-"]
+    elif shutil.which("convert"):
+        argv = ["convert", src, "-resize", "32x32!", "-colorspace", "Gray",
+                "-depth", "8", "GRAY:-"]
+    elif shutil.which("ffmpeg"):
+        argv = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vf",
+                "scale=32:32,format=gray", "-f", "rawvideo", "-"]
+    else:
+        return None
+    try:
+        r = subprocess.run(argv, env=env, timeout=SCREEN_CAPTURE_TIMEOUT_S,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    if r.returncode != 0 or not r.stdout:
+        return None
+    return _grayscale_stddev(r.stdout)
+
+
+def _reject_uniform_frame(grabbed, env):
+    """True when this capture is ~uniform (black) and must not be served.
+
+    Rejecting makes the route 503, so the app keeps the SCREEN card and retries,
+    instead of rendering a black image that is indistinguishable from a working
+    preview of a dark scene."""
+    sd = _frame_variance(grabbed, env)
+    if sd is None or sd >= SCREEN_MIN_STDDEV:
+        return False
+    global _screen_black_logged_at
+    now = time.monotonic()
+    if now - _screen_black_logged_at > 15:
+        _screen_black_logged_at = now
+        print("[screen] rejecting ~uniform frame (stddev %.2f < %.1f)"
+              % (sd, SCREEN_MIN_STDDEV), flush=True)
+    return True
+
+
 def real_screen_frame():
     """Capture one frame -> (jpeg_bytes, "image/jpeg") or None. Single-flight +
     500 ms cache so any number of pollers cause at most ~2 captures/sec."""
@@ -7173,6 +7609,11 @@ def real_screen_frame():
                 if grabbed:
                     break
             if not grabbed:
+                return None
+            # Checked BEFORE the downscale so a rejected frame costs nothing
+            # further. _png_complete() above only proves the file has an IEND
+            # chunk; an all-black readback is a perfectly well-formed PNG.
+            if _reject_uniform_frame(grabbed, env):
                 return None
             data = None
             try:
@@ -8739,6 +9180,101 @@ def _running_game():
     return None
 
 
+# ---------------------------------------------------------------------------
+# Box battery (handhelds: Steam Deck, Legion Go / Go S, ROG Ally, laptops).
+#
+# Distinct from _pad_battery(), which reports a CONTROLLER's charge by joining
+# its MAC to a supply node. This is the machine's OWN battery, and until now the
+# agent never read it at all -- so a handheld running Couchside showed no battery
+# anywhere, despite the kernel exposing it.
+#
+# MEASURED VERBATIM on a Lenovo Legion Go S (Bazzite), 2026-07-22. Two things in
+# that real uevent drive the parser and are not obvious from documentation:
+#   * POWER_SUPPLY_TYPE appears TWICE in the same file. Last-wins is fine here
+#     (both say Battery) but a parser that assumed one occurrence per key would
+#     be relying on luck.
+#   * It is an ENERGY-based gauge (ENERGY_NOW/ENERGY_FULL, microwatt-hours), not
+#     a CHARGE-based one. Both exist in the wild, so both are read.
+# A mains-only desktop has no Battery node at all; that is the normal case and
+# returns {} rather than zeroes, so the cap degrades closed.
+
+def _uevent(path):
+    """Parse a power_supply uevent into a dict. Never raises; {} on any error."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k:
+                    out[k] = v
+    except OSError:
+        return {}
+    return out
+
+
+def read_box_battery():
+    """{"pct", "status", "on_ac"[, "minutes"]} for the machine's own battery, or
+    {} when this machine has none.
+
+    Read-only, best-effort, never raises. An unreadable or malformed node yields
+    {} -- "unavailable" -- never a fabricated percentage.
+    """
+    try:
+        names = os.listdir(_POWER_SUPPLY_DIR)
+    except OSError:
+        return {}
+
+    batt, on_ac = None, None
+    for name in sorted(names):
+        u = _uevent(os.path.join(_POWER_SUPPLY_DIR, name, "uevent"))
+        kind = u.get("POWER_SUPPLY_TYPE")
+        if kind == "Battery" and batt is None:
+            # PRESENT=0 means a bay with no pack in it -- not this machine's
+            # battery, and reporting 0% for it would be a lie.
+            if u.get("POWER_SUPPLY_PRESENT") == "0":
+                continue
+            batt = u
+        elif kind == "Mains" and u.get("POWER_SUPPLY_ONLINE") in ("0", "1"):
+            # Any online mains supply counts as plugged in.
+            on_ac = on_ac or u["POWER_SUPPLY_ONLINE"] == "1"
+
+    if batt is None:
+        return {}
+
+    try:
+        pct = int(batt["POWER_SUPPLY_CAPACITY"])
+    except (KeyError, ValueError):
+        return {}
+    if not 0 <= pct <= 100:
+        return {}
+
+    out = {"pct": pct, "status": batt.get("POWER_SUPPLY_STATUS", "Unknown")}
+    if on_ac is not None:
+        out["on_ac"] = on_ac
+
+    # Runtime left, when the gauge reports a draw. ENERGY_* is microwatt-hours
+    # against POWER_NOW microwatts; CHARGE_* is microamp-hours against
+    # CURRENT_NOW microamps. Both divide to hours. Only meaningful while
+    # discharging -- on AC, POWER_NOW is the CHARGE rate, and dividing by it
+    # would report a confident, entirely wrong "time left".
+    if out["status"] == "Discharging":
+        for now_k, rate_k in (("POWER_SUPPLY_ENERGY_NOW", "POWER_SUPPLY_POWER_NOW"),
+                              ("POWER_SUPPLY_CHARGE_NOW", "POWER_SUPPLY_CURRENT_NOW")):
+            try:
+                now, rate = int(batt[now_k]), int(batt[rate_k])
+            except (KeyError, ValueError):
+                continue
+            if now > 0 and rate > 0:
+                out["minutes"] = int(now * 60 // rate)
+                break
+    return out
+
+
+def box_battery_available():
+    """True when this machine has a readable battery."""
+    return bool(read_box_battery())
+
+
 def _norm_mac(s):
     """A MAC-ish string lowercased with all separators stripped, for fuzzy joins
     across the many power_supply naming schemes."""
@@ -9549,7 +10085,17 @@ def _make_holder(entry, mock):
     # also inflates _own_pad_count and so hides a real controller from the
     # gaming card. Reuse keeps a handoff ping-pong presenting ONE stable
     # controller to Steam instead of a parade.
-    if entry.get("device") is None:
+    #
+    # KEYBOARD-ONLY sessions (?nopad=1) never get a pad at all. The point is not
+    # to save a few ioctls: creating one makes Steam announce "controller
+    # connected", and disconnecting announces it again — so a phone that
+    # foregrounds and backgrounds spams the TV with notifications, and a game
+    # already running sees a SECOND controller that can steal player 1. A client
+    # that only sends arrows/enter/esc has no use for the pad, so it asks not to
+    # have one. Mouse and keyboard are still created below; only the pad is
+    # skipped, and gamepad frames from such a session are dropped in
+    # _handle_frame rather than lazily creating one behind our back.
+    if not entry.get("nopad") and entry.get("device") is None:
         try:
             entry["device"] = MockGamepad() if mock else UInputGamepad()
         except Exception as e:
@@ -9559,7 +10105,8 @@ def _make_holder(entry, mock):
             return False
     entry["held"] = True
     entry["requested"] = False
-    _wsend_json(entry, {"t": "hello", "dev": entry["device"].name,
+    dev = entry["device"].name if entry.get("device") is not None else "keyboard only"
+    _wsend_json(entry, {"t": "hello", "dev": dev,
                         "text": _text_caps(mock)})
     for slot, factory in (("mouse", MockMouse if mock else UInputMouse),
                           ("keyboard", MockKeyboard if mock else UInputKeyboard)):
@@ -10316,6 +10863,27 @@ class Handler(BaseHTTPRequestHandler):
                 # TVs" picker instead of a manual IP. Always 200 (possibly an
                 # empty list) — it is an action, not a probe-and-appear cap.
                 self._send(200, {"tvs": tv_discover(self.mock)}, started)
+            elif path == "/api/usb-wake":
+                # READ-ONLY inventory of possible wake sources. Probe-and-appear:
+                # 404 when the box exposes none (no sysfs, or nothing armable),
+                # so a box that cannot do this shows no control at all.
+                #
+                # Arming is NOT done here and never will be from this route: it
+                # writes /sys/.../power/wakeup, which needs root. That stays a
+                # deliberate, documented, opt-in step.
+                devs = ([{"id": "1-2", "vendor": "28de", "product_id": "1304",
+                          "name": "Steam Controller Puck", "wake": "disabled",
+                          "armed": False, "root_hub": False, "hub": False,
+                          "transient": True, "writable": True},
+                         {"id": "usb1", "vendor": "1d6b", "product_id": "0002",
+                          "name": "xHCI Host Controller", "wake": "disabled",
+                          "armed": False, "root_hub": True, "hub": True,
+                          "transient": False, "writable": True}]
+                        if self.mock else usb_wake_devices())
+                if not devs:
+                    self._send(404, {"error": "not found"}, started)
+                else:
+                    self._send(200, {"devices": devs}, started)
             elif path == "/api/displays":
                 # Probe-and-appear: 404 unless this box can do the desktop->TV
                 # Game Mode handoff (SteamOS/Bazzite, 2+ outputs), so the app
@@ -11504,9 +12072,13 @@ class Handler(BaseHTTPRequestHandler):
         # 'ask' = request control from the holder; anything else (incl. old
         # clients that send no param) = grab it, the pre-2.9.2 behavior.
         ask = q.get("handoff", ["takeover"])[0] == "ask"
+        # Keyboard-only client: do not create a virtual pad for this session.
+        # Opt-IN so every existing client keeps its pad; an old app sends no
+        # param and is unaffected. See _make_holder for why it matters.
+        nopad = q.get("nopad", ["0"])[0] == "1"
         entry = {"conn": conn, "device": None, "mouse": None, "keyboard": None,
                  "name": name, "held": False, "requested": False,
-                 "slock": threading.Lock()}
+                 "nopad": nopad, "slock": threading.Lock()}
 
         # ---- decide this session's initial role -------------------------------
         demoted = None      # a holder we bumped (takeover): notify after unlock
@@ -11777,7 +12349,14 @@ class Handler(BaseHTTPRequestHandler):
         target = entry.get(slot)
         if target is None:
             if factory is None:
-                return True  # gamepad device gone (mid-teardown): drop frame
+                # Gamepad frame with no pad. Two ways to get here and BOTH must
+                # drop rather than create: mid-teardown (the pad is gone), and a
+                # keyboard-only session (?nopad=1) that never had one. There is
+                # deliberately no lazy factory for the pad, so a nopad session
+                # cannot be tricked into materialising a controller by sending a
+                # button frame — which would put back the exact Steam
+                # "controller connected" spam it asked to avoid.
+                return True
             try:
                 target = factory()
             except Exception as e:
@@ -11879,6 +12458,7 @@ def main():
     set_power_schedule(args.mock)
     set_screensaver(args.mock)
     set_guide(args.mock)  # arms the guide-hold watcher when opted in
+    osk_arm(args.mock)  # tails Steam's UI log; silent no-op without it
     set_couchmode(args.mock)  # ceremony engine honors --mock
     set_caps(args.mock)  # after the detectors above; snapshots CAPS
     port = args.port if args.port is not None else (CONFIG_PORT or DEFAULT_PORT)
