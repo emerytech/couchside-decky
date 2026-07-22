@@ -12,7 +12,7 @@ name: Sync agent & release plugin
 #     workflow the moment agent/couchsided.py lands on main  -> instant release.
 #   - schedule: daily safety net in case a dispatch was missed.
 #   - workflow_dispatch: manual, with an optional force.
-#   - push to this repo's main touching the plugin source itself.
+#   - push to this repo's master touching the plugin source itself.
 #
 # Uses only the built-in GITHUB_TOKEN (same-repo release + commit-back). No PAT
 # or cross-repo secret is needed here, because the agent is pulled over the
@@ -30,7 +30,12 @@ on:
   schedule:
     - cron: "17 9 * * *"
   push:
-    branches: [main]
+    # THIS REPO'S DEFAULT BRANCH IS master, NOT main. With `branches: [main]`
+    # this trigger silently never fired, so a change to the plugin's own source
+    # never cut a release -- releases only happened via the daily schedule or a
+    # manual dispatch. The agent-sync path was unaffected (schedule +
+    # repository_dispatch), which is why it went unnoticed.
+    branches: [master]
     paths:
       - "src/**"
       - "main.py"
