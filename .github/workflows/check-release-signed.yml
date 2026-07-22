@@ -1,0 +1,49 @@
+name: Check the latest release is signed
+
+# The signing key is OFFLINE and deliberately never touches CI, so this workflow
+# cannot sign anything -- it can only NOTICE that nobody has.
+#
+# Why this exists: releases are cut automatically (daily schedule /
+# repository_dispatch), but `scripts/sign-release.sh` in the couchside repo is a
+# manual local step. So a release cut while nobody was watching ships WITHOUT
+# SHA256SUMS.sig -- and main.py hard-requires that asset:
+#
+#     need = ("Couchside.tar.gz", "SHA256SUMS", "SHA256SUMS.sig")
+#     # No sig => no update. Root code refuses unsigned releases.
+#
+# In-panel self-update therefore breaks silently for every box. That happened
+# for v0.2.37 and v0.2.38 -- both schedule-triggered, both unsigned, and nobody
+# found out until someone went looking during an unrelated release. Failing here
+# is loud (Actions + the usual failure email) and costs nothing.
+
+on:
+  schedule:
+    - cron: "47 10 * * *"      # 90 min after the sync job, so a fresh release is visible
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Latest release must carry SHA256SUMS.sig
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name] | join(" ")')"
+          echo "latest release: $tag"
+          echo "assets: $assets"
+          for want in Couchside.tar.gz SHA256SUMS SHA256SUMS.sig; do
+            case " $assets " in
+              *" $want "*) ;;
+              *)
+                echo "::error::$tag is missing $want -- in-panel self-update will REFUSE this release."
+                echo "Sign it from a rescue-remote checkout with the offline key:"
+                echo "    scripts/sign-release.sh $tag"
+                exit 1 ;;
+            esac
+          done
+          echo "OK: $tag is signed and installable."
