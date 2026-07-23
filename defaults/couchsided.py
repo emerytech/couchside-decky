@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.43"
+VERSION = "2.9.47"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -1593,6 +1593,283 @@ def update_apply():
         stderr=subprocess.DEVNULL, start_new_session=True)
     print("[update] app-triggered update started (log: %s)" % log, flush=True)
     return {"started": True, "log": log}
+
+
+# ---------------------------------------------------------------------------
+# Flatpak updates (/api/update/flatpak) — the first "update hub" target.
+#
+# STRICT ALLOWLIST (CLAUDE.md §3): there is NO client-supplied identifier here.
+# The route path is a fixed literal and the argv is a frozen list built in this
+# module; the client only chooses to fire the ONE thing this endpoint runs. It
+# is looked up by the route, never interpolated — the same principle as the
+# action allowlist, tightened to "no selector at all".
+#
+# flatpak update is PER-USER and needs no root, so unlike the OS updater to come
+# it carries no sudo grant and no wrapper. It is token-authed like the reboot /
+# poweroff / suspend actions (not behind ALLOW_APP_UPDATE): it can only move
+# already-installed apps to newer versions from their already-trusted remotes —
+# strictly less destructive than the reboot button, which is token-only too.
+# ---------------------------------------------------------------------------
+
+FLATPAK_UPDATE_LOG = "/tmp/couchside-flatpak-update.log"
+# The root-owned wrapper that `couchside allow-system-updates on` grants NOPASSWD.
+# MEASURED 2026-07-22 on a real box: the agent is a SYSTEM service with no active
+# login session, so a plain `flatpak update` of SYSTEM installs is denied by
+# polkit ("Flatpak system operation Deploy not allowed for user"). Running the
+# update as root via this fixed wrapper bypasses that — root needs no polkit. The
+# grant is on THIS PATH, never on `flatpak` itself, so a token holder can only
+# run this one fixed update, never arbitrary flatpak subcommands (install / run /
+# override / remote-add). Same airtight shape as the journal wrapper.
+FLATPAK_UPDATE_WRAPPER = "/etc/couchside/couchside-flatpak-update"
+# The no-root fallback when the wrapper grant is absent: update only the USER's
+# own --user installs, which never need root. On a box whose flatpaks are all
+# system-installed this updates nothing (honest — the app then prompts to enable
+# system updates). Frozen argv; NEVER interpolate a client value into it.
+_FLATPAK_USER_UPDATE_CMD = ["flatpak", "update", "--user", "-y",
+                            "--noninteractive"]
+_FLATPAK_LIST_UPDATES_CMD = ["flatpak", "remote-ls", "--updates",
+                             "--columns=application,version"]
+
+
+def flatpak_available():
+    """True when flatpak is installed. The update endpoints 404 otherwise, so
+    the capability simply does not exist on a box without flatpak
+    (probe-and-appear)."""
+    return shutil.which("flatpak") is not None
+
+
+def flatpak_can_elevate():
+    """True when the box owner has opted in (`couchside allow-system-updates on`)
+    and sudoers therefore permits the fixed flatpak-update wrapper with no
+    password. Degrade-closed via _sudo_nopasswd_allows: a missing grant means the
+    app updates only --user flatpaks and prompts to enable system updates —
+    never a dead 'system update' that silently fails."""
+    return _sudo_nopasswd_allows("couchside-flatpak-update")
+
+
+def read_flatpak_log(limit=60):
+    """Last `limit` non-blank lines of the flatpak-update transcript, or [].
+    The PATH IS A CONSTANT — no client input selects a file. Never raises."""
+    try:
+        with open(FLATPAK_UPDATE_LOG, "r", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    return [ln.rstrip() for ln in lines if ln.strip()][-limit:]
+
+
+def flatpak_pending_updates():
+    """Names+versions of flatpaks with an update available, or [] on any error.
+    Read-only (remote-ls), and degrade-closed: a probe failure reports 'nothing
+    to do', never a false 'updates waiting'."""
+    try:
+        r = subprocess.run(_FLATPAK_LIST_UPDATES_CMD, capture_output=True,
+                           text=True, timeout=30, env=_user_env())
+        if r.returncode != 0:
+            return []
+        out = []
+        for ln in r.stdout.splitlines():
+            ln = ln.strip()
+            if ln and not ln.lower().startswith("application"):
+                out.append(ln)
+        return out
+    except Exception:
+        return []
+
+
+def flatpak_update():
+    """Fire a DETACHED flatpak update writing to FLATPAK_UPDATE_LOG, returning
+    immediately.
+
+    Uses the root wrapper (`sudo -n` the fixed script) when the owner has opted
+    in, else falls back to a no-root `--user` update. The argv is one of two
+    FROZEN lists chosen HERE; nothing from a client reaches it.
+
+    Detached, not a blocking action, because a real update downloads for minutes
+    — far past real_action's 15s ceiling. Output goes to a LOG FILE, never an
+    unread PIPE: a piped detached child deadlocks once the buffer fills, which
+    reboot/poweroff never hit because they exit instantly but a long update
+    would. A short poll catches an instant failure so we never report a false
+    'started'."""
+    elevated = flatpak_can_elevate()
+    if elevated:
+        # Root wrapper (system installs). Fixed path, no args — the grant is on
+        # this exact path, so this cannot be steered into another flatpak op.
+        cmd = ["sudo", "-n", FLATPAK_UPDATE_WRAPPER]
+        env = None
+    else:
+        cmd = list(_FLATPAK_USER_UPDATE_CMD)
+        env = _user_env()
+    try:
+        logf = open(FLATPAK_UPDATE_LOG, "w")
+    except OSError as e:
+        return {"started": False, "error": "cannot open log: %s" % e}
+    try:
+        proc = subprocess.Popen(
+            cmd, env=env,
+            stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError as e:
+        logf.close()
+        return {"started": False, "error": str(e)}
+    finally:
+        # The child holds its own fd to the log; this process no longer needs it.
+        try:
+            logf.close()
+        except OSError:
+            pass
+    # ~400ms: an elevation/permission failure with --noninteractive dies at once,
+    # and surfacing that beats a false 'started'.
+    time.sleep(0.4)
+    rc = proc.poll()
+    if rc is not None and rc != 0:
+        return {"started": False, "elevated": elevated, "exit_code": rc,
+                "log": FLATPAK_UPDATE_LOG, "lines": read_flatpak_log()}
+    print("[update] flatpak update started (elevated=%s, log: %s)"
+          % (elevated, FLATPAK_UPDATE_LOG), flush=True)
+    return {"started": True, "elevated": elevated, "log": FLATPAK_UPDATE_LOG}
+
+
+# ---------------------------------------------------------------------------
+# OS updates (/api/update/os) — the second update-hub target.
+#
+# Atomic distros only (SteamOS, Bazzite): the box IMAGE is updated as a unit,
+# staged for the next boot. Same STRICT ALLOWLIST shape as the flatpak slice —
+# no client-supplied identifier, the argv is a frozen list chosen HERE — and the
+# same opt-in elevation (a root-owned wrapper granted by
+# `couchside allow-system-updates on`), because the underlying `rpm-ostree
+# upgrade --check` is denied to the sessionless agent by polkit exactly like a
+# system flatpak (MEASURED 2026-07-22: "AutomaticUpdateTrigger not allowed for
+# user"). Root, via the wrapper, bypasses it.
+#
+# THE HONESTY THAT MATTERS: an atomic OS update STAGES a new deployment for the
+# next boot; it does not apply live. os_status() reads that staged state back
+# (rpm-ostree status --json, read-only, no root) so the app can say "staged —
+# reboot to apply" and never "done" for something that has not happened. This is
+# exactly the failure mode CLAUDE.md §11.4 is about.
+# ---------------------------------------------------------------------------
+
+OS_UPDATE_WRAPPER = "/etc/couchside/couchside-os-update"
+OS_UPDATE_LOG = "/tmp/couchside-os-update.log"
+
+
+def os_updater_kind():
+    """Which atomic OS updater this box has, or None. Chooses the SAME way the
+    wrapper does (which rpm-ostree / steamos-update), so the app never offers an
+    OS-update button on a box the wrapper couldn't serve."""
+    if shutil.which("rpm-ostree"):
+        return "rpm-ostree"
+    if shutil.which("steamos-update"):
+        return "steamos"
+    return None
+
+
+def os_can_elevate():
+    """True when the owner opted in and sudoers permits the OS update wrapper
+    with no password. Degrade-closed (see flatpak_can_elevate)."""
+    return _sudo_nopasswd_allows("couchside-os-update")
+
+
+def _rpm_ostree_status():
+    """Parsed `rpm-ostree status --json`, or {} on any failure. Read-only, no
+    root — so the app can always show current version + staged state even
+    without the update grant."""
+    try:
+        r = subprocess.run(["rpm-ostree", "status", "--json"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return {}
+        return json.loads(r.stdout)
+    except Exception:
+        return {}
+
+
+def os_status():
+    """Read-only OS deployment state for GET /api/update/os. Never needs the
+    grant. `staged` True means an update is already downloaded and will apply on
+    the next reboot — the app must then say 'reboot to apply', not offer another
+    update."""
+    kind = os_updater_kind()
+    out = {"kind": kind, "elevated": os_can_elevate(),
+           "current": None, "staged": False}
+    if kind == "rpm-ostree":
+        d = _rpm_ostree_status()
+        booted = None
+        staged = False
+        for dep in d.get("deployments", []):
+            if dep.get("booted"):
+                booted = dep.get("version") or dep.get("checksum")
+            if dep.get("staged"):
+                staged = True
+        out["current"] = booted
+        out["staged"] = staged
+    elif kind == "steamos":
+        # steamos-update has no cheap read-only "what's staged" like rpm-ostree's
+        # json; report only what is free. A steamos update applies on reboot the
+        # same way, so `staged` is surfaced by the app's post-run message rather
+        # than probed here.
+        try:
+            with open("/etc/os-release") as f:
+                for ln in f:
+                    if ln.startswith("BUILD_ID="):
+                        out["current"] = ln.split("=", 1)[1].strip().strip('"')
+                        break
+        except OSError:
+            pass
+    return out
+
+
+def read_os_update_log(limit=80):
+    """Last `limit` non-blank lines of the OS-update transcript, or []. CONSTANT
+    path; no client input selects a file. Never raises."""
+    try:
+        with open(OS_UPDATE_LOG, "r", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    return [ln.rstrip() for ln in lines if ln.strip()][-limit:]
+
+
+def os_update_apply():
+    """Fire a DETACHED OS update (stage) via the root wrapper, writing to
+    OS_UPDATE_LOG. Requires the opt-in grant — with no elevation an atomic OS
+    update cannot run at all, so unlike flatpak there is no --user fallback: we
+    report needs_optin instead of pretending.
+
+    Detached + log-file for the same reasons as flatpak_update (minutes-long,
+    pipe-deadlock). The argv is [sudo, -n, <wrapper>, apply] — the wrapper self-
+    validates the mode, and the client supplies neither the mode nor anything
+    else."""
+    if os_updater_kind() is None:
+        return {"started": False, "error": "no atomic OS updater on this box"}
+    if not os_can_elevate():
+        return {"started": False, "needs_optin": True,
+                "error": "system updates are not enabled on this box "
+                         "(couchside allow-system-updates on)"}
+    try:
+        logf = open(OS_UPDATE_LOG, "w")
+    except OSError as e:
+        return {"started": False, "error": "cannot open log: %s" % e}
+    try:
+        proc = subprocess.Popen(
+            ["sudo", "-n", OS_UPDATE_WRAPPER, "apply"], env=None,
+            stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError as e:
+        logf.close()
+        return {"started": False, "error": str(e)}
+    finally:
+        try:
+            logf.close()
+        except OSError:
+            pass
+    time.sleep(0.4)
+    rc = proc.poll()
+    if rc is not None and rc != 0:
+        return {"started": False, "exit_code": rc,
+                "log": OS_UPDATE_LOG, "lines": read_os_update_log()}
+    print("[update] OS update started (log: %s)" % OS_UPDATE_LOG, flush=True)
+    return {"started": True, "log": OS_UPDATE_LOG}
 
 
 # ---------------------------------------------------------------------------
@@ -9551,6 +9828,12 @@ def _appid_from_cmdline(cmdline):
         return None
 
 
+# How long to wait for a game to actually exit after SIGTERM before reporting
+# that it did not. Long enough for a save-on-quit, short enough that the phone
+# is not left spinning: a game that has not gone in this window is not going.
+_GAME_STOP_GRACE_S = 6.0
+
+
 def stop_running_game():
     """Ask the game running right now to close. {"stopped": bool, ...}.
 
@@ -9572,8 +9855,26 @@ def stop_running_game():
     if not game or not game.get("pid"):
         return {"stopped": False, "reason": "nothing running"}
     pid = game["pid"]
+
+    # Signal the process GROUP, not just the pid.
+    #
+    # MEASURED FAILURE, 2026-07-22: signalling the reaper pid alone returned
+    # success and the game kept running. `reaper` is Steam's supervisor wrapper;
+    # the game is its CHILD, so SIGTERM to the wrapper does not reach the thing
+    # the user is looking at. The group is the launch job -- game plus its
+    # helpers -- which is exactly the unit "close this game" means.
+    #
+    # Guarded: a pgid of 0 or 1, or OUR OWN group, would mean signalling
+    # everything including this agent. Refuse rather than risk it.
     try:
-        os.kill(pid, signal.SIGTERM)
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = None
+    try:
+        if pgid and pgid > 1 and pgid != os.getpgid(0):
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         # It exited between resolving and signalling. That is the outcome the
         # caller wanted, so report it as such rather than as an error.
@@ -9582,7 +9883,18 @@ def stop_running_game():
         return {"stopped": False, "reason": "not permitted"}
     except OSError as e:
         return {"stopped": False, "reason": e.__class__.__name__}
-    return {"stopped": True, "game": game}
+
+    # VERIFY, do not assume. The previous version reported success because
+    # os.kill did not raise -- which only means the signal was delivered, not
+    # that anything closed. That is how a button that does nothing reported 200.
+    # Games take a moment to save and exit, so give it a grace period.
+    deadline = time.monotonic() + _GAME_STOP_GRACE_S
+    while time.monotonic() < deadline:
+        time.sleep(0.4)
+        if _running_game() is None:
+            return {"stopped": True, "game": game}
+    return {"stopped": False, "game": game,
+            "reason": "still running after SIGTERM"}
 
 
 def _proc_uptime_s(pid):
@@ -10950,19 +11262,26 @@ PAIR_PIN = None
 
 def pair_pin_start():
     """Mint a fresh PIN + session (replacing any prior one) and return
-    (pin, ttl). Debounced: within PAIR_PIN_START_DEBOUNCE of the last start the
-    LIVE pin is returned unchanged, so a double-tap / retry doesn't reroll the
-    number already on screen. Caller displays it on the box."""
+    (pin, ttl, fresh). Debounced: within PAIR_PIN_START_DEBOUNCE of the last
+    start the LIVE pin is returned unchanged, so a double-tap / retry doesn't
+    reroll the number already on screen. Caller displays it on the box.
+
+    `fresh` is True only when a NEW PIN was minted, False when the debounce
+    branch returned the existing one. The caller pops the box screen ONLY on a
+    fresh mint (KI-019): without that, a repeat /start inside the debounce
+    window returns the same PIN but still throws another full-screen page onto
+    the TV — which is exactly the nuisance the debounce comment claims to
+    prevent."""
     global PAIR_PIN
     with PAIR_PIN_LOCK:
         now = time.monotonic()
         s = PAIR_PIN
         if s and now <= s["expires"] and now - s["started"] < PAIR_PIN_START_DEBOUNCE:
-            return s["pin"], int(s["expires"] - now)
+            return s["pin"], int(s["expires"] - now), False
         pin = "%06d" % (int.from_bytes(os.urandom(3), "big") % 1000000)
         PAIR_PIN = {"pin": pin, "expires": now + PAIR_PIN_TTL,
                     "attempts": 0, "started": now}
-        return pin, PAIR_PIN_TTL
+        return pin, PAIR_PIN_TTL, True
 
 
 def pair_pin_active():
@@ -10994,9 +11313,25 @@ def pair_pin_check(pin):
         return True
 
 
+_BOX_POP_LOCK = threading.Lock()
+_BOX_POP_AT = [0.0]                 # monotonic time of the last box-screen pop
+_BOX_POP_COOLDOWN = 5.0            # seconds; hard floor between pops
+
+
 def pair_show_on_box(port):
     """Open the loopback /pair page on the BOX'S own screen so the PIN is
-    visible there."""
+    visible there.
+
+    Rate-limited (KI-019, defence in depth): the caller already gates this on a
+    FRESH pin mint, so legitimate double-taps don't re-pop. This cooldown is the
+    backstop — even a stream of genuinely-fresh sessions (a LAN client looping
+    /start past the debounce) cannot throw the page onto the TV more than once
+    per _BOX_POP_COOLDOWN. The normal flow (user pairs once) never touches it."""
+    now = time.monotonic()
+    with _BOX_POP_LOCK:
+        if now - _BOX_POP_AT[0] < _BOX_POP_COOLDOWN:
+            return
+        _BOX_POP_AT[0] = now
     pair_show_on_box_url("http://localhost:%d/pair" % port)
 
 
@@ -11118,21 +11453,94 @@ def render_pair_page(token, port):
         "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;}"
         "body{display:flex;flex-direction:column;align-items:center;"
         "justify-content:center;text-align:center;padding:4vmin;box-sizing:border-box;}"
-        "h1{font-size:min(6vmin,42px);font-weight:650;margin:0 0 3vmin;letter-spacing:.2px;}"
-        ".sub{color:#9aa4b2;font-size:min(3vmin,20px);margin:0 0 4vmin;max-width:36ch;}"
-        ".card{background:#fff;border-radius:24px;padding:min(5vmin,40px);"
+        "h1{font-size:min(5vmin,38px);font-weight:650;margin:0 0 .8vmin;letter-spacing:.2px;}"
+        ".sub{color:#9aa4b2;font-size:min(2.7vmin,18px);margin:0 0 2.4vmin;max-width:46ch;}"
+        # The stage is one row: [phone + steps] on the left, QR on the right. It
+        # must fit ONE screen with no scroll -- a TV read from the couch can't.
+        # Sized to sit in a row at ~960px wide (Steam's CEF render width, MEASURED
+        # on the box 2026-07-22 -- an earlier looser layout looked fine in Chrome
+        # at 1280 but WRAPPED the QR below the fold on the actual box). Still wraps
+        # to a column on a genuinely narrow display as a last resort.
+        ".stage{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;"
+        "gap:min(5vmin,44px);max-width:1000px;}"
+        ".left{display:flex;align-items:center;gap:min(3vmin,22px);}"
+        ".steps{display:flex;flex-direction:column;gap:min(2.6vmin,20px);"
+        "text-align:left;max-width:30ch;}"
+        ".step{display:flex;align-items:center;gap:min(2.2vmin,15px);}"
+        ".num{flex:0 0 auto;width:min(5vmin,38px);height:min(5vmin,38px);"
+        "border-radius:50%;background:#1c2430;color:#7dd3fc;font-weight:700;"
+        "font-size:min(2.8vmin,20px);display:flex;align-items:center;"
+        "justify-content:center;}"
+        ".step b{font-size:min(3vmin,20px);font-weight:600;color:#e8ecf3;}"
+        ".step span{display:block;color:#9aa4b2;font-size:min(2.4vmin,15px);margin-top:.3vmin;}"
+        # The QR keeps its white card exactly as before -- do not restyle it, the
+        # camera has to read it.
+        ".card{background:#fff;border-radius:20px;padding:min(3.4vmin,28px);"
         "box-shadow:0 12px 40px rgba(0,0,0,.5);}"
-        "#qr{display:block;image-rendering:pixelated;width:min(70vmin,560px);"
-        "height:min(70vmin,560px);}"
-        ".url{margin-top:4vmin;color:#5a6472;font-size:min(2.2vmin,14px);"
-        "word-break:break-all;max-width:80ch;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}"
+        "#qr{display:block;image-rendering:pixelated;width:min(42vmin,300px);"
+        "height:min(42vmin,300px);}"
+        ".cap{color:#9aa4b2;font-size:min(2.2vmin,14px);margin-top:1.4vmin;}"
+        ".url{margin-top:2vmin;color:#5a6472;font-size:min(1.9vmin,12px);"
+        "word-break:break-all;max-width:70ch;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}"
         ".err{color:#ff6b6b;margin-top:3vmin;font-size:min(3vmin,18px);}"
+        # The animated phone mock. Three scenes cross-fade on a 9s loop, 3s each,
+        # driven ONLY by @keyframes -- no JS. Proven to render + cycle on Steam's
+        # CEF browser (SteamOS + Bazzite, 2026-07-22). Each scene group holds full
+        # opacity for its third of the cycle and is invisible otherwise; the 4%
+        # ramps overlap slightly so it reads as a cross-fade, not a hard cut.
+        ".phone{flex:0 0 auto;width:min(18vmin,96px);}"
+        ".scene{opacity:0;animation:cs 9s infinite;}"
+        ".scene.b{animation-delay:3s;}.scene.c{animation-delay:6s;}"
+        "@keyframes cs{0%{opacity:0}4%{opacity:1}29%{opacity:1}33%{opacity:0}100%{opacity:0}}"
+        "@media (max-width:820px){.steps{max-width:80vw}.stage{gap:4vmin}}"
         "</style></head><body>"
-        "<h1>Scan to pair Couchside</h1>"
-        "<div class=\"sub\">Point your phone&rsquo;s <b>camera</b> at this code "
-        "&mdash; it opens the Couchside app and pairs your box automatically. "
-        "The app itself has no scanner; use the camera.</div>"
-        "<div class=\"card\"><canvas id=\"qr\" width=\"560\" height=\"560\"></canvas></div>"
+        "<h1>Pair your phone</h1>"
+        "<div class=\"sub\">Get the Couchside app, then follow these three steps "
+        "&mdash; or point your phone&rsquo;s camera at the code to skip ahead.</div>"
+        "<div class=\"stage\">"
+        "<div class=\"left\">"
+        "<svg class=\"phone\" viewBox=\"0 0 120 240\" xmlns=\"http://www.w3.org/2000/svg\" "
+        "aria-hidden=\"true\">"
+        "<rect x=\"4\" y=\"4\" width=\"112\" height=\"232\" rx=\"20\" fill=\"#0b1220\" "
+        "stroke=\"#2b3648\" stroke-width=\"3\"/>"
+        "<rect x=\"12\" y=\"20\" width=\"96\" height=\"200\" rx=\"8\" fill=\"#0f1826\"/>"
+        # Scene A: the app icon, "open Couchside".
+        "<g class=\"scene a\"><rect x=\"38\" y=\"78\" width=\"44\" height=\"44\" rx=\"11\" "
+        "fill=\"#38bdf8\"/><rect x=\"46\" y=\"96\" width=\"28\" height=\"14\" rx=\"4\" "
+        "fill=\"#0b1220\"/><rect x=\"44\" y=\"92\" width=\"6\" height=\"10\" fill=\"#0b1220\"/>"
+        "<rect x=\"70\" y=\"92\" width=\"6\" height=\"10\" fill=\"#0b1220\"/>"
+        "<rect x=\"40\" y=\"134\" width=\"40\" height=\"6\" rx=\"3\" fill=\"#334155\"/></g>"
+        # Scene B: a scan list with one row highlighted, "Setup -> Scan, tap it".
+        "<g class=\"scene b\"><rect x=\"22\" y=\"70\" width=\"76\" height=\"22\" rx=\"6\" "
+        "fill=\"#38bdf8\"/><rect x=\"29\" y=\"78\" width=\"40\" height=\"6\" rx=\"3\" "
+        "fill=\"#0b1220\"/><rect x=\"22\" y=\"100\" width=\"76\" height=\"16\" rx=\"5\" "
+        "fill=\"#1c2430\"/><rect x=\"22\" y=\"124\" width=\"76\" height=\"16\" rx=\"5\" "
+        "fill=\"#1c2430\"/></g>"
+        # Scene C: the six-digit PIN appearing, "a PIN shows here".
+        "<g class=\"scene c\"><rect x=\"24\" y=\"96\" width=\"10\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/><rect x=\"38\" y=\"96\" width=\"10\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/><rect x=\"52\" y=\"96\" width=\"10\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/><rect x=\"66\" y=\"96\" width=\"10\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/><rect x=\"80\" y=\"96\" width=\"10\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/><rect x=\"94\" y=\"96\" width=\"6\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/></g></svg>"
+        "<div class=\"steps\">"
+        "<div class=\"step\"><div class=\"num\">1</div><div>"
+        "<b>Open Couchside on your phone</b>"
+        "<span>Free on the App Store &amp; Google Play.</span></div></div>"
+        "<div class=\"step\"><div class=\"num\">2</div><div>"
+        "<b>Setup tab &rarr; Scan for boxes</b>"
+        "<span>Then tap this box in the list.</span></div></div>"
+        "<div class=\"step\"><div class=\"num\">3</div><div>"
+        "<b>A 6-digit PIN appears here</b>"
+        "<span>Type it into the app to finish.</span></div></div>"
+        "</div>"          # .steps
+        "</div>"          # .left
+        "<div>"
+        "<div class=\"card\"><canvas id=\"qr\" width=\"300\" height=\"300\"></canvas></div>"
+        "<div class=\"cap\">Or scan with your camera</div>"
+        "</div>"
+        "</div>"          # .stage
         "<div class=\"url\">" + url_html + "</div>"
         "<div id=\"err\" class=\"err\"></div>"
         "<script>\n" + PAIR_QR_JS + "\n"
@@ -11143,7 +11551,7 @@ def render_pair_page(token, port):
         "    var n = qr.getModuleCount();\n"
         "    var quiet = 4, total = n + quiet*2;\n"
         "    var canvas = document.getElementById('qr');\n"
-        "    var px = Math.max(4, Math.floor(560/total));\n"
+        "    var px = Math.max(4, Math.floor(300/total));\n"
         "    var size = total*px; canvas.width = size; canvas.height = size;\n"
         "    var ctx = canvas.getContext('2d');\n"
         "    ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,size,size);\n"
@@ -11153,6 +11561,20 @@ def render_pair_page(token, port):
         "  } catch (e) {\n"
         "    document.getElementById('err').textContent = 'Could not render QR: ' + e;\n"
         "  }\n"
+        # THE HANDOFF. Poll /api/pair/status on the same 3000ms cadence as
+        # render_pin_page. The instant a pairing starts (active===true) reload;
+        # the route then serves render_pin_page because pair_pin_active() is now
+        # truthy, so this idle tutorial becomes the big PIN it was teaching about.
+        # Errors are swallowed and the page left alone, verbatim from
+        # render_pin_page -- an agent restart must never paint a browser error on
+        # the TV. Only ONE reload ever fires (the guard), so a slow reload can't
+        # stack.
+        "  var gone=false;\n"
+        "  setInterval(function(){\n"
+        "    fetch('/api/pair/status').then(function(r){return r.json()})\n"
+        "    .then(function(d){if(d&&d.active===true&&!gone){gone=true;\n"
+        "      location.reload();}}).catch(function(){});\n"
+        "  },3000);\n"
         "})();\n"
         "</script></body></html>"
     )
@@ -11481,6 +11903,48 @@ class Handler(BaseHTTPRequestHandler):
                 # paths, and /api/ping is the only deliberately pre-auth route.
                 # Reads a CONSTANT path -- no client input selects a file.
                 self._send(200, {"lines": read_update_log()}, started)
+            elif path == "/api/update/flatpak":
+                # Read-only: which flatpaks have an update waiting. 404 when
+                # flatpak is absent so the capability doesn't exist on a box
+                # without it (probe-and-appear). No client input selects
+                # anything -- a fixed remote-ls runs.
+                if not self.mock and not flatpak_available():
+                    self._send(404, {"available": False}, started)
+                else:
+                    pending = (["org.mozilla.firefox 149.0",
+                                "org.freedesktop.Platform 24.08"] if self.mock
+                               else flatpak_pending_updates())
+                    # elevated tells the app whether SYSTEM flatpaks can be
+                    # updated (owner opted in) or only --user ones — so it can
+                    # prompt "enable system updates on your box" when False.
+                    elevated = True if self.mock else flatpak_can_elevate()
+                    self._send(200, {"available": True, "count": len(pending),
+                                     "updates": pending, "elevated": elevated},
+                               started)
+            elif path == "/api/update/flatpak/log":
+                # Progress transcript of a running/last flatpak update. CONSTANT
+                # path, behind the auth gate like /api/update/log above.
+                self._send(200, {"lines": (["[mock] Updating org.mozilla.firefox",
+                                            "[mock] Changes complete."]
+                                           if self.mock else read_flatpak_log())},
+                           started)
+            elif path == "/api/update/os":
+                # Read-only OS deployment state. 404 on a non-atomic box so the
+                # OS-update card never appears where it can't work. No client
+                # input; a fixed read-only status runs.
+                if self.mock:
+                    self._send(200, {"kind": "rpm-ostree", "elevated": True,
+                                     "current": "43.20260420", "staged": False},
+                               started)
+                elif os_updater_kind() is None:
+                    self._send(404, {"kind": None}, started)
+                else:
+                    self._send(200, os_status(), started)
+            elif path == "/api/update/os/log":
+                self._send(200, {"lines": (["[mock] Staging deployment…",
+                                            "[mock] Staged. Reboot to apply."]
+                                           if self.mock else read_os_update_log())},
+                           started)
             elif path == "/api/update/check":
                 # Box-side update check (agent >= 2.9.5). The app reads this over
                 # the LAN so the app never touches the internet; the box (already
@@ -11772,8 +12236,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 pair_body = self._read_body()
                 if path == "/api/pair/start":
-                    _pin, ttl = pair_pin_start()
-                    pair_show_on_box(self.port)   # pop the PIN on the box screen
+                    _pin, ttl, fresh = pair_pin_start()
+                    # Pop the PIN on the box screen ONLY on a fresh mint (KI-019).
+                    # A repeat /start inside the debounce window returns the same
+                    # PIN and must NOT re-throw the page onto the user's TV.
+                    if fresh:
+                        pair_show_on_box(self.port)
                     self._send(200, {"ok": True, "ttl": ttl}, started)
                     return
                 try:
@@ -11903,6 +12371,40 @@ class Handler(BaseHTTPRequestHandler):
                     update_show_on_box(self.port)
                 result = ({"started": True, "log": UPDATE_LOG}
                           if self.mock else update_apply())
+                self._send(200, result, started)
+                return
+
+            # POST /api/update/flatpak: fire a detached `flatpak update`. Token-
+            # authed like the reboot/poweroff actions (NOT behind
+            # ALLOW_APP_UPDATE): it can only move already-installed apps to newer
+            # versions from their trusted remotes — strictly less destructive
+            # than the reboot button. 404 when flatpak is absent so the
+            # capability doesn't exist there. Fixed argv, no client input.
+            if path == "/api/update/flatpak":
+                if not self.mock and not flatpak_available():
+                    self._send(404, {"ok": False, "available": False,
+                                     "error": "flatpak is not installed on this box"},
+                               started)
+                    return
+                result = ({"started": True, "elevated": True,
+                           "log": FLATPAK_UPDATE_LOG}
+                          if self.mock else flatpak_update())
+                self._send(200, result, started)
+                return
+
+            # POST /api/update/os: STAGE an atomic OS update. Requires the opt-in
+            # grant (no --user fallback exists for an OS image). 404 on a non-
+            # atomic box. Token-authed like the flatpak update. Fixed argv, no
+            # client input. The result stages for next boot — the app reads
+            # /api/update/os back to learn it must prompt a reboot.
+            if path == "/api/update/os":
+                if not self.mock and os_updater_kind() is None:
+                    self._send(404, {"ok": False, "kind": None,
+                                     "error": "no atomic OS updater on this box"},
+                               started)
+                    return
+                result = ({"started": True, "log": OS_UPDATE_LOG}
+                          if self.mock else os_update_apply())
                 self._send(200, result, started)
                 return
 
