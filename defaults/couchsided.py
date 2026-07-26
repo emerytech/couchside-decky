@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.52"
+VERSION = "2.9.56"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -1390,7 +1390,7 @@ def set_caps(mock):
         CAPS = {k: True for k in
                 ("gamepad", "steam", "media", "tv", "screen", "power_schedule",
                  "screensaver", "couchmode", "desktop", "steamlink", "gaming",
-                 "streamhost", "steammenus", "boxbattery")}
+                 "streamhost", "steammenus", "boxbattery", "file_upload")}
         return
     CAPS = {
         "gamepad": _uinput_writable(),
@@ -1407,7 +1407,76 @@ def set_caps(mock):
         "streamhost": safe(streamhost_available),
         "steammenus": safe(steammenus_available),
         "boxbattery": safe(box_battery_available),
+        "file_upload": safe(lambda: os.access(_drop_dir(), os.W_OK)),
     }
+
+
+def _drop_dir():
+    """Directory where phone->box file uploads land (POST /api/upload). Default
+    ~/Downloads/Couchside, overridable with COUCHSIDE_DROP_DIR; created on demand.
+    Returned realpath'd — it is the containment root every upload path is verified
+    against, so it must be absolute and symlink-resolved."""
+    base = (os.environ.get("COUCHSIDE_DROP_DIR", "").strip()
+            or os.path.join(os.path.expanduser("~"), "Downloads", "Couchside"))
+    os.makedirs(base, exist_ok=True)
+    return os.path.realpath(base)
+
+
+def drop_dir_reveal():
+    """Open the drop dir in the box's file manager (POST /api/upload/reveal).
+
+    A file that lands invisibly is a file the user has to go hunting for, so the
+    app offers a "Show on box" tap after a successful drop.
+
+    DESKTOP ONLY, deliberately. In Game Mode there is no file manager to raise —
+    gamescope shows only what Steam surfaces, so a spawned Dolphin window would
+    either do nothing visible or land behind the session. Reports an honest
+    skip-with-reason there rather than claiming success (a dead button costs more
+    trust than a missing one).
+
+    SECURITY: takes NO client input. The path is this module's own `_drop_dir()`
+    constant and the program comes from the frozen list below, so a caller can
+    only ever ask for "the drop dir" — there is nothing to point somewhere else.
+
+    Names the file manager instead of delegating to xdg-open. MEASURED on a live
+    Bazzite box: `xdg-mime query default inode/directory` returned
+    `de.leopoldluley.Clapgrep.desktop` — a text-search app — so xdg-open opened a
+    grep tool over the folder and then HUNG until the timeout (exit 124). Any
+    installed app can claim inode/directory, so asking the desktop to guess is
+    how "Show on box" silently does the wrong thing. xdg-open stays only as a
+    last resort when no known manager exists."""
+    if not desktop_available():
+        return {"opened": False,
+                "reason": "the box is in Game Mode; switch to the desktop first"}
+    path = _drop_dir()
+    # Frozen preference order: KDE first (SteamOS/Bazzite ship Plasma), then the
+    # common GTK managers. Chosen by the agent; never by the client.
+    cmd = None
+    for prog in ("dolphin", "nautilus", "nemo", "thunar", "pcmanfm"):
+        if shutil.which(prog):
+            cmd = [prog, path]
+            break
+    if cmd is None:
+        if not shutil.which("xdg-open"):
+            return {"opened": False, "reason": "no file manager on this box"}
+        cmd = ["xdg-open", path]
+    # Popen, not run(): a file manager runs for as long as its window is open, so
+    # waiting on it would pin a thread for that whole time (and xdg-open can hang
+    # outright, as measured above). Detached so it outlives this request.
+    #
+    # _session_env(), not _user_env(): a GUI app needs DISPLAY / WAYLAND_DISPLAY,
+    # and _user_env() sets only XDG_RUNTIME_DIR. Measured on the box — with the
+    # bare user env dolphin started and exited immediately (a <defunct> child and
+    # no window); the session env is what the launcher path already uses.
+    try:
+        subprocess.Popen(cmd, env=_session_env(), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception as e:
+        return {"opened": False,
+                "reason": "could not start %s on the box" % cmd[0],
+                "detail": e.__class__.__name__}
+    return {"opened": True, "path": path, "with": cmd[0]}
 
 
 # ---------------------------------------------------------------------------
@@ -8020,7 +8089,7 @@ SCREEN_LOCK = threading.Lock()    # single-flight: never stack captures
 _SCREEN = None                    # capability dict or None; set by set_screen
 _SCREEN_CACHE = {"ts": 0.0, "data": None, "mime": None}  # 500 ms frame cache
 # Grayscale 0-255. Below this a frame is ~uniform (an all-black compositor
-# readback) and is rejected as a failed capture rather than served. _png_complete
+# readback) and is rejected as a failed capture rather than served. _image_complete
 # only proves the PNG has an IEND chunk -- a perfectly well-formed all-black
 # frame passes it, and the app then shows a black preview that looks identical
 # to a working one.
@@ -8032,12 +8101,20 @@ def _screen_downscaler():
     """(argv-builder, name) for a PNG->JPEG downscaler, or (None, None). Prefers
     ImageMagick, then ffmpeg — both ship on gaming boxes; keeps the agent off PIL
     (absent on stock SteamOS)."""
+    # The jpeg:size hint is computed PER CALL (it depends on the source format,
+    # which differs by backend: spectacle gives JPEG, gamescopectl PNG) and must
+    # precede the read to have any effect. -thumbnail over -resize for the same
+    # reason as the variance probe: cheaper, and strips metadata.
     if shutil.which("magick"):
-        return (lambda src, dst: ["magick", src, "-resize", "%dx" % SCREEN_WIDTH,
-                                  "-quality", "80", dst], "magick")
+        return (lambda src, dst: (["magick"]
+                                  + _magick_size_hint(src, SCREEN_WIDTH, SCREEN_WIDTH)
+                                  + [src, "-thumbnail", "%dx" % SCREEN_WIDTH,
+                                     "-quality", "80", dst]), "magick")
     if shutil.which("convert"):
-        return (lambda src, dst: ["convert", src, "-resize", "%dx" % SCREEN_WIDTH,
-                                  "-quality", "80", dst], "convert")
+        return (lambda src, dst: (["convert"]
+                                  + _magick_size_hint(src, SCREEN_WIDTH, SCREEN_WIDTH)
+                                  + [src, "-thumbnail", "%dx" % SCREEN_WIDTH,
+                                     "-quality", "80", dst]), "convert")
     if shutil.which("ffmpeg"):
         return (lambda src, dst: ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
                                   "-vf", "scale=%d:-1" % SCREEN_WIDTH, "-q:v", "6", dst],
@@ -8109,17 +8186,27 @@ def _screen_env(live=None):
     return env
 
 
-def _png_complete(path):
-    """True when a PNG is fully written: >=100 bytes and ends in the IEND chunk.
-    gamescopectl writes async, so the file appears before it is complete."""
+def _image_complete(path):
+    """True when a captured image is FULLY written: >=100 bytes and carrying its
+    format's end marker -- PNG's IEND chunk or JPEG's EOI (FFD9).
+
+    Format-aware on purpose. gamescopectl writes PNG asynchronously (the file
+    appears before it is complete, which is why this check exists at all) and
+    offers no format choice, while spectacle is pointed at JPEG for the speed
+    win. Checking only one format would silently reject every frame from the
+    other backend -- for gamescopectl that would mean Game Mode capture failing
+    everywhere, so the two markers are both handled rather than swapped."""
     try:
         if os.path.getsize(path) < 100:
             return False
         with open(path, "rb") as f:
             f.seek(-8, os.SEEK_END)
-            return f.read(8) == b"IEND\xaeB`\x82"
+            tail = f.read(8)
     except OSError:
         return False
+    if tail == b"IEND\xaeB`\x82":          # PNG
+        return True
+    return tail.endswith(b"\xff\xd9")      # JPEG EOI
 
 
 def _grab_gamescopectl(env, outdir):
@@ -8130,36 +8217,70 @@ def _grab_gamescopectl(env, outdir):
     except OSError:
         pass
     try:
-        subprocess.run(["gamescopectl", "screenshot", png], env=env,
-                       timeout=SCREEN_CAPTURE_TIMEOUT_S,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        r = subprocess.run(["gamescopectl", "screenshot", png], env=env,
+                           timeout=SCREEN_CAPTURE_TIMEOUT_S,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
+        return None
+    # Fail FAST when the tool already gave up. gamescopectl exits non-zero in
+    # ~0.00s with "Failed to open GAMESCOPE_WAYLAND_DISPLAY" when the session is
+    # gone, but this used to poll the full SCREEN_CAPTURE_TIMEOUT_S anyway,
+    # waiting for a file the tool had already declined to write. That single
+    # ignored return code is what turned a fast fallback into 8 dead seconds on
+    # EVERY frame request (measured: 8.0s here + 0.67s spectacle = the 8.7s the
+    # app saw). The poll below exists for the ASYNC-WRITE case — a successful
+    # gamescopectl whose PNG lands a moment later — not for a failed one.
+    if r.returncode != 0:
         return None
     deadline = time.monotonic() + SCREEN_CAPTURE_TIMEOUT_S
     while time.monotonic() < deadline:
         if os.path.exists(png):
             s1 = os.path.getsize(png)
             time.sleep(0.1)
-            if s1 == os.path.getsize(png) and _png_complete(png):
+            if s1 == os.path.getsize(png) and _image_complete(png):
                 return png
         time.sleep(0.1)
     return None
 
 
 def _grab_spectacle(env, outdir):
-    """`spectacle -b -n -o <png>` (background, no notify) for a KDE desktop."""
-    png = os.path.join(outdir, "frame.png")
+    """`spectacle -b -n -o <jpg>` (background, no notify) for a KDE desktop.
+
+    Writes JPEG, not PNG, and the extension is what tells spectacle which. On a
+    3840x2160 panel that is worth ~0.4s of the frame budget on its own (measured
+    1.10-1.21s to PNG vs 0.66-0.85s to JPEG), and it also hands the downscale a
+    JPEG source, which unlocks the DCT-scaled decode in _magick_size_hint().
+    The capture is a lossy preview either way -- nothing downstream wants the
+    lossless 4MB intermediate. gamescopectl still writes PNG (it offers no
+    choice), hence the format-agnostic _image_complete()."""
+    jpg = os.path.join(outdir, "grab.jpg")
     try:
-        os.unlink(png)
+        os.unlink(jpg)
     except OSError:
         pass
     try:
-        subprocess.run(["spectacle", "-b", "-n", "-o", png], env=env,
+        subprocess.run(["spectacle", "-b", "-n", "-o", jpg], env=env,
                        timeout=SCREEN_CAPTURE_TIMEOUT_S,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         return None
-    return png if _png_complete(png) else None
+    return jpg if _image_complete(jpg) else None
+
+
+def _magick_size_hint(src, w, h):
+    """`-define jpeg:size=WxH` args for an ImageMagick read, when `src` is a JPEG.
+
+    Tells libjpeg to decode DCT-scaled straight to roughly the size we want
+    instead of unpacking the full 3840x2160 and resizing afterwards. Measured on
+    a 4K frame: the downscale stage drops 0.191s -> 0.031s and the 32x32 variance
+    probe 0.191s -> 0.023s. Decode DOMINATES this pipeline (decode-to-null floor
+    0.194s), which is also why lowering SCREEN_WIDTH or JPEG quality saved no
+    measurable time -- those shrink the OUTPUT, not the work.
+
+    Returns [] for a PNG source (the hint is JPEG-only), so gamescopectl's PNG
+    path is unaffected."""
+    return (["-define", "jpeg:size=%dx%d" % (w, h)]
+            if src.lower().endswith((".jpg", ".jpeg")) else [])
 
 
 def _grayscale_stddev(raw):
@@ -8184,12 +8305,17 @@ def _frame_variance(src, env):
     readback from a real desktop, and it is one short-lived subprocess on a path
     that already runs a downscale per capture (and is capped at ~2/sec by the
     500ms cache)."""
+    # -thumbnail, not -resize: it downsamples cheaply and strips metadata, and on
+    # a 4K frame that alone was 0.580s -> 0.195s. With the JPEG size hint in
+    # front of the read it drops to ~0.023s. Sampling quality is irrelevant here
+    # -- this only has to tell a black readback from a real desktop.
+    hint = _magick_size_hint(src, 32, 32)
     if shutil.which("magick"):
-        argv = ["magick", src, "-resize", "32x32!", "-colorspace", "Gray",
-                "-depth", "8", "GRAY:-"]
+        argv = (["magick"] + hint + [src, "-thumbnail", "32x32!",
+                "-colorspace", "Gray", "-depth", "8", "GRAY:-"])
     elif shutil.which("convert"):
-        argv = ["convert", src, "-resize", "32x32!", "-colorspace", "Gray",
-                "-depth", "8", "GRAY:-"]
+        argv = (["convert"] + hint + [src, "-thumbnail", "32x32!",
+                "-colorspace", "Gray", "-depth", "8", "GRAY:-"])
     elif shutil.which("ffmpeg"):
         argv = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vf",
                 "scale=32:32,format=gray", "-f", "rawvideo", "-"]
@@ -8262,7 +8388,7 @@ def real_screen_frame():
             if not grabbed:
                 return None
             # Checked BEFORE the downscale so a rejected frame costs nothing
-            # further. _png_complete() above only proves the file has an IEND
+            # further. _image_complete() above only proves the file has an end marker
             # chunk; an all-black readback is a perfectly well-formed PNG.
             if _reject_uniform_frame(grabbed, env):
                 return None
@@ -8281,8 +8407,11 @@ def real_screen_frame():
             return (data, "image/jpeg")
         finally:
             # Always clean tmpfs, even when the grab itself failed (no partial
-            # frame.png left behind on a box that never captures successfully).
-            for p in (png, jpg):
+            # frame left behind on a box that never captures successfully).
+            # grab.jpg is spectacle's RAW capture (distinct from the frame.jpg
+            # the downscaler writes) and must be swept too, or a 4K JPEG per
+            # capture accumulates in the runtime dir.
+            for p in (png, jpg, os.path.join(outdir, "grab.jpg")):
                 try:
                     os.unlink(p)
                 except OSError:
@@ -9110,19 +9239,85 @@ _CTRL_V_EVENTS = [
 ]
 
 
+def _socket_is_live(path):
+    """True when a compositor is actually RUNNING behind this wayland socket.
+
+    A compositor's socket file OUTLIVES the compositor: exiting Game Mode leaves
+    /run/user/<uid>/gamescope-0 behind in tmpfs indefinitely. Presence therefore
+    proves nothing, and every caller that treated it as proof mis-routed to a
+    dead session (see _wayland_display_sockets).
+
+    Checks the companion `<socket>.lock`, which is how wayland compositors mark
+    a display as taken: the compositor holds an exclusive flock on it for its
+    whole life. If WE can take that lock, nobody is home and the socket is a
+    corpse. The lock is released immediately; we never hold it.
+
+    DO NOT "simplify" this to a connect() probe. That was tried first and is
+    actively harmful: connecting consumes a slot in the listen backlog without
+    accepting, so repeated probes against a live compositor that is slow to
+    accept can make it look REFUSED -- i.e. the check would declare a healthy
+    session dead. It was caught by a test that connected twice against
+    listen(1). flock touches nothing the compositor is waiting on.
+
+    Degrades toward "assume live": no lock file (a compositor that does not use
+    one), an unreadable lock, or any unexpected error returns True, so a probe
+    failure can only ever cost us the old behaviour and never hides a working
+    session."""
+    if fcntl is None:                       # non-POSIX: no flock to consult
+        return True
+    lock = path + ".lock"
+    try:
+        fd = os.open(lock, os.O_RDWR)
+    except OSError:
+        return True                         # no/unreadable lock file -> can't tell
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True                     # held by the running compositor
+        # We took it, so no compositor holds this display. Release immediately.
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _wayland_display_sockets():
-    """Names of wayland DISPLAY sockets in XDG_RUNTIME_DIR. Recognizes the
+    """Names of LIVE wayland DISPLAY sockets in XDG_RUNTIME_DIR. Recognizes the
     standard wayland-<N> and gamescope's gamescope-<N> (Bazzite / Steam Deck
     Game Mode names its compositor socket gamescope-0, NOT wayland-0), while
-    excluding lock files and gamescope's -ei / -stats side sockets. Never raises."""
+    excluding lock files and gamescope's -ei / -stats side sockets. Never raises.
+
+    LIVENESS IS CHECKED HERE, at the source, because presence is not aliveness
+    and both callers were burned by the difference. Measured on a Bazzite box
+    after leaving Game Mode: gamescope-0 still on disk with no gamescope process
+    and nothing listening, which made
+      - _screen_live()  report session "gamescope" on a Plasma desktop, so every
+        capture fired gamescopectl at a dead compositor, and
+      - _screen_env()   pin WAYLAND_DISPLAY=gamescope-0, which then broke the
+        spectacle FALLBACK too ("Authorization required").
+    The result was 10/10 requests returning 503 after ~8.7s each — a total,
+    permanent failure until reboot, not the intermittent one it looked like.
+    Filtering dead sockets here fixes both callers at once; fixing only the
+    session decision would leave the env pinned to a corpse."""
     out = []
     try:
         for e in os.listdir(XDG_RUNTIME_DIR):
             if e.endswith(".lock"):
                 continue
             if e.startswith("wayland-") and e[len("wayland-"):].isdigit():
-                out.append(e)
+                pass
             elif e.startswith("gamescope-") and e[len("gamescope-"):].isdigit():
+                pass
+            else:
+                continue
+            if _socket_is_live(os.path.join(XDG_RUNTIME_DIR, e)):
                 out.append(e)
     except OSError:
         pass
@@ -10928,14 +11123,26 @@ def ws_send_json(conn, obj):
 GAMEPAD_LOCK = threading.Lock()
 GAMEPAD_HOLDER = None      # the entry that currently owns input devices, or None
 GAMEPAD_SESSIONS = []      # every live entry (holder + waiters)
-# Idle-reap: drop a gamepad session that has sent us NOTHING for this long. The
-# app pings every ~5s, so real silence this long means app->box is dead (a
-# Game-Mode Wi-Fi blip during a Couch Mode switch leaves the socket half-dead —
-# the phone keeps sending but nothing arrives, so the trackpad freezes). Reaping
-# fast + closing cleanly is the ONLY reliable app->box-death signal (a box->app
-# heartbeat can't detect it — it flows regardless and would just mask a dead
-# outbound). Was 60s; 12s is >2x the ping so a healthy client never false-reaps.
+# Idle-reap: drop a gamepad session that has sent us NOTHING for this long. On a
+# healthy client this never fires: the box drives its OWN keepalive now (a WS
+# PING every GAMEPAD_PING_INTERVAL_S, see _gamepad_keepalive_loop), and even a
+# fully idle phone's OS auto-answers with a PONG, so the only way to go silent
+# this long is a genuinely dead app->box path.
+#
+# CORRECTION to what this comment used to say ("a box->app heartbeat can't detect
+# a dead outbound -- it flows regardless"): true of a one-way push, FALSE of a WS
+# PING, whose PONG travels phone->box -- a dead outbound never delivers it, so the
+# reap still fires. That distinction is the whole fix. Field-diagnosed on
+# iOS->Bazzite (2026-07-24): the app's own {"t":"ping"} rides a JS setInterval
+# that iOS FREEZES whenever the app idles, so the phone sat on a live socket
+# sending nothing and got reaped at 12s -- dead trackpad, "controller
+# disconnected", then a reconnect that muted again (endless churn only a
+# force-quit cleared). The OS-level auto-PONG rides no JS timer, so it lands
+# anyway. Was 60s; 12s is >2x the app ping and 3x the box ping.
 GAMEPAD_IDLE_TIMEOUT_S = 12.0
+# Box-driven keepalive interval. Kept well under the reap window above (3 PINGs
+# per window) so a single dropped PONG can't trip a false reap.
+GAMEPAD_PING_INTERVAL_S = 4.0
 
 
 def _wsend_json(entry, obj):
@@ -10966,6 +11173,33 @@ def _gamepad_broadcast(obj):
         entries = list(GAMEPAD_SESSIONS)
     for entry in entries:
         _wsend_json(entry, obj)
+
+
+def _gamepad_keepalive_tick():
+    """Send one WS PING to every live session (holder + waiters). The phone's OS
+    answers with a PONG at the network layer -- below the app's JS runtime -- and
+    that inbound frame resets the recv loop's idle clock. This is what keeps an
+    iOS client alive while its own JS keepalive timer is frozen (see
+    GAMEPAD_IDLE_TIMEOUT_S). Snapshots the session list under the lock, then sends
+    OUTSIDE it (each _wsend_op takes only that socket's slock), so socket I/O
+    never blocks GAMEPAD_LOCK -- same discipline as _gamepad_broadcast. A dead
+    socket is skipped (_wsend_op never raises); the idle-reap, not this, closes
+    it. Split out from the loop so a test can drive one tick deterministically."""
+    with GAMEPAD_LOCK:
+        entries = list(GAMEPAD_SESSIONS)
+    for entry in entries:
+        _wsend_op(entry, WS_OP_PING)
+
+
+def _gamepad_keepalive_loop():
+    """Forever: PING every live session every GAMEPAD_PING_INTERVAL_S. Daemon
+    thread started in main(); never raises, so it can never take the agent down."""
+    while True:
+        time.sleep(GAMEPAD_PING_INTERVAL_S)
+        try:
+            _gamepad_keepalive_tick()
+        except Exception:  # a keepalive must never die on a transient send error
+            pass
 
 
 def _release_devices(entry):
@@ -11688,6 +11922,12 @@ class Handler(BaseHTTPRequestHandler):
     # only bodies this agent accepts (tiny launcher/volume/power JSON).
     MAX_BODY_BYTES = 8 * 1024 * 1024
 
+    # Cap on a phone->box file upload (/api/upload). Uploads are streamed to disk
+    # in chunks (NOT read into memory, NOT gated by MAX_BODY_BYTES), so this only
+    # bounds how much disk one request can consume. 8 GiB covers game/video files
+    # while stopping a single request from filling the drive.
+    MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024
+
     # set by main()
     token = ""
     token_file = None   # path to re-read the current token for /pair
@@ -12295,6 +12535,80 @@ class Handler(BaseHTTPRequestHandler):
             n = self.MAX_BODY_BYTES
         return self.rfile.read(n)
 
+    def _handle_upload(self, parsed, started):
+        """Stream a phone->box file upload to the drop dir. Bearer-gated by the
+        caller. The filename must be a bare, contained name (rejected, not
+        sanitised, otherwise); the destination is realpath-verified to stay inside
+        the drop root; the body is copied in 1 MiB chunks under a hard size cap.
+        Any error path that has not fully consumed the body closes the connection
+        so an undrained upload can't desync the keep-alive stream."""
+        qs = parse_qs(parsed.query)
+        name = (qs.get("name", [""])[0] or "").strip()
+        # Reject rather than sanitise (§3.6): a valid drop name has no path
+        # separators, no traversal, no NUL, and equals its own basename.
+        if (not name or name in (".", "..") or "/" in name or "\\" in name
+                or "\x00" in name or name != os.path.basename(name)):
+            self.close_connection = True
+            self._send(400, {"error": "invalid filename"}, started)
+            return
+        root = _drop_dir()
+        dest = os.path.realpath(os.path.join(root, name))
+        # Containment (§3.5): the resolved path must stay under the drop root.
+        if dest != root and not dest.startswith(root + os.sep):
+            self.close_connection = True
+            self._send(400, {"error": "invalid filename"}, started)
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length <= 0:
+            self.close_connection = True
+            self._send(411, {"error": "length required"}, started)
+            return
+        if length > self.MAX_UPLOAD_BYTES:
+            self.close_connection = True
+            self._send(413, {"error": "file too large"}, started)
+            return
+        tmp = dest + ".part"
+        written = 0
+        try:
+            with open(tmp, "wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+                    written += len(chunk)
+        except OSError:
+            self._unlink_quiet(tmp)
+            self._send(500, {"error": "write failed"}, started)
+            return
+        if written != length:
+            # Short read: client hung up mid-upload. Drop the partial and close
+            # the now-desynced keep-alive connection.
+            self._unlink_quiet(tmp)
+            self.close_connection = True
+            self._send(400, {"error": "incomplete upload"}, started)
+            return
+        try:
+            os.replace(tmp, dest)  # atomic swap into place once fully received
+        except OSError:
+            self._unlink_quiet(tmp)
+            self._send(500, {"error": "write failed"}, started)
+            return
+        self._send(200, {"ok": True, "name": name, "bytes": written,
+                         "path": dest}, started)
+
+    @staticmethod
+    def _unlink_quiet(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
     def do_POST(self):
         started = time.monotonic()
         try:
@@ -12354,12 +12668,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(401, {"error": "unauthorized"}, started)
                 return
 
+            # POST /api/upload?name=<filename> — a phone->box file drop. Handled
+            # HERE, before the generic 8 MiB memory cap and _read_body: uploads
+            # are large (games, videos) so the body is STREAMED to disk in chunks
+            # rather than read into memory. The filename is rejected (not cleaned)
+            # unless it is a bare, contained name, and the resolved destination is
+            # verified to stay inside the drop root (§3.5/§3.6).
+            if path == "/api/upload":
+                self._handle_upload(parsed, started)
+                return
+
             # Authorized: now enforce the size cap, then read the body.
             if self._body_too_large():
                 self.close_connection = True
                 self._send(413, {"error": "request body too large"}, started)
                 return
             body = self._read_body()
+
+            # POST /api/upload/reveal — open the drop dir in the box's file
+            # manager after a drop. Takes NO body and NO parameters: the path is
+            # the agent's own _drop_dir(), so there is nothing a client can point
+            # elsewhere. Always 200 with {opened: bool} — Game Mode reports an
+            # honest opened:false + reason rather than a fake success.
+            if path == "/api/upload/reveal":
+                self._send(200, (({"opened": True, "path": "/home/deck/Downloads/Couchside"})
+                                 if self.mock else drop_dir_reveal()), started)
+                return
 
             # POST /api/steam/menus {"id": "<panel>"}: open one Steam settings
             # page on the box's screen. 404 on an id that is not on the frozen
@@ -13768,6 +14102,10 @@ def main():
     server.daemon_threads = True
     threading.Thread(target=_udp_discovery_responder, args=(port,),
                      daemon=True, name="discover").start()
+    # Box-driven gamepad keepalive: PING idle sockets so their OS auto-PONG keeps
+    # the session alive even while the app's own JS keepalive timer is frozen (iOS).
+    threading.Thread(target=_gamepad_keepalive_loop,
+                     daemon=True, name="gp-keepalive").start()
     mode = "mock" if args.mock else "real"
     print("%s %s listening on %s:%d (%s mode)" % (
         APP_NAME, VERSION, args.host, port, mode), flush=True)
