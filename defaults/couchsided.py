@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.57"
+VERSION = "2.9.64"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -1391,7 +1391,7 @@ def set_caps(mock):
                 ("gamepad", "steam", "media", "tv", "screen", "power_schedule",
                  "screensaver", "couchmode", "desktop", "steamlink", "gaming",
                  "streamhost", "steammenus", "boxbattery", "file_upload",
-                 "session_default")}
+                 "session_default", "display_info", "player")}
         return
     CAPS = {
         "gamepad": _uinput_writable(),
@@ -1410,6 +1410,8 @@ def set_caps(mock):
         "steammenus": safe(steammenus_available),
         "boxbattery": safe(box_battery_available),
         "file_upload": safe(lambda: os.access(_drop_dir(), os.W_OK)),
+        "display_info": safe(display_info_available),
+        "player": safe(player_available),
     }
 
 
@@ -1730,6 +1732,20 @@ FLATPAK_UPDATE_LOG = "/tmp/couchside-flatpak-update.log"
 # run this one fixed update, never arbitrary flatpak subcommands (install / run /
 # override / remote-add). Same airtight shape as the journal wrapper.
 FLATPAK_UPDATE_WRAPPER = "/etc/couchside/couchside-flatpak-update"
+# Handle to the detached flatpak-update child, so a later status GET can report
+# whether the update is still RUNNING — the honest completion signal.
+#
+# WHY (KI-036, device-confirmed 2026-07-27): the app used to infer "done" from
+# `flatpak remote-ls --updates` reaching zero. That list counts runtimes
+# `flatpak update` will NOT apply — an end-of-life runtime (measured:
+# org.freedesktop.Platform 23.08) shows as "update available" while the update
+# says "Nothing to do" and cannot cross the EOL major boundary. So the count is
+# pinned above zero, "done" is UNREACHABLE, and the app spun ten minutes then —
+# on an "update everything" press — blocked the OS update behind that dead wait.
+# Whether OUR child is still alive IS reachable and correct. We hold the Popen
+# object (the child stays our direct child even with start_new_session), so
+# poll() is authoritative and reaps the zombie on completion.
+_FLATPAK_PROC = None
 # The no-root fallback when the wrapper grant is absent: update only the USER's
 # own --user installs, which never need root. On a box whose flatpaks are all
 # system-installed this updates nothing (honest — the app then prompts to enable
@@ -1834,9 +1850,33 @@ def flatpak_update():
     if rc is not None and rc != 0:
         return {"started": False, "elevated": elevated, "exit_code": rc,
                 "log": FLATPAK_UPDATE_LOG, "lines": read_flatpak_log()}
+    # Keep the handle so flatpak_running() can report completion. Stored only on
+    # a clean start; a same-tick failure above returns without touching it.
+    global _FLATPAK_PROC
+    _FLATPAK_PROC = proc
     print("[update] flatpak update started (elevated=%s, log: %s)"
           % (elevated, FLATPAK_UPDATE_LOG), flush=True)
     return {"started": True, "elevated": elevated, "log": FLATPAK_UPDATE_LOG}
+
+
+def flatpak_running():
+    """True while the flatpak update this agent launched is still executing.
+
+    This is the completion signal the app polls — NOT `count == 0`, which an
+    un-updatable EOL runtime can pin above zero forever (KI-036). poll() on the
+    Popen we hold is authoritative and reaps the child on exit.
+
+    Degrade-closed toward DONE: if we never launched one (None), or the agent
+    restarted and lost the handle, or poll() raises, we report False. A false
+    'still running' would strand the card on "Updating…"; a false 'done' at
+    worst shows a stale pending count the next status refresh corrects."""
+    proc = _FLATPAK_PROC
+    if proc is None:
+        return False
+    try:
+        return proc.poll() is None
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -2253,6 +2293,720 @@ def screensaver_stop():
 
 
 # ---------------------------------------------------------------------------
+# Couchside Player (/api/player) — the streaming-service tile.
+#
+# Same lifecycle as the screensaver above, for the same measured reason: it must
+# be launched THROUGH STEAM, because gamescope only surfaces what Steam focuses.
+# So this module registers the tile with steamos-add-to-steam, drops its grid
+# art, and fires steam://rungameid; the tile itself (agent/couchside-player.sh)
+# spawns the browser and holds the process Steam tracks.
+#
+# THE ALLOWLIST LIVES IN THE TILE, NOT HERE — deliberately. The tile owns the
+# frozen service table, and this module validates a request by ASKING it
+# (`--print-url <service> <path>`, rc != 0 means refused). That is a lookup, not
+# an interpolation, and it means there is exactly ONE copy of the table: the
+# validator is literally the code that will run. A second copy here would be a
+# copy that drifts, and a drifted allowlist is a hole.
+#
+# The subprocess call is an argv LIST into a path this module chose. Client
+# strings only ever appear as argv[2:], where the tile treats them as data (a
+# `case` statement, no eval). Nothing a client sends becomes a command.
+#
+# The tile is installed under ~/.local/opt/couchside-player/ rather than
+# ~/.local/opt/couchside/ because _ss_appid() anchors on the literal
+# b"couchside/Couchside" and would otherwise resolve the PLAYER's appid as the
+# screensaver's, silently breaking the screensaver's launch on any box with
+# both. tests/test_player_tile.py is the regression for that.
+# ---------------------------------------------------------------------------
+
+PLAYER_TILE = os.path.expanduser(
+    "~/.local/opt/couchside-player/Couchside Player")
+PLAYER_GRID_ART = os.path.expanduser("~/.local/opt/couchside-player")
+PLAYER_CONF = os.path.expanduser("~/.config/couchside/player.conf")
+PLAYER_PIDFILE = os.path.expanduser("~/.cache/couchside/player.pid")
+# The tile records the randomised loopback debugging port it gave Chrome here.
+# Read only; the agent never chooses it, and it is never exposed to a client.
+PLAYER_PORTFILE = os.path.expanduser("~/.cache/couchside/player.port")
+# Anchored on the install DIRECTORY, which is what keeps this lookup and the
+# screensaver's from colliding. Do not shorten it to "couchside/Couchside".
+PLAYER_VDF_ANCHOR = b"couchside-player/Couchside"
+PL_REGISTER_WAIT_S = 10
+PL_FIRST_LAUNCH_GAP_S = 4
+# How long to wait for a running tile to die before relaunching it at a new
+# service. The tile is single-instance: a rungameid fired while it is still up
+# is a no-op, so switching services MUST stop first or the request silently
+# does nothing.
+PL_RESTART_WAIT_S = 6
+
+PL_MOCK = False
+_PL_MOCK = {"running": False, "service": "netflix", "path": "", "query": ""}
+_PL_LOCK = threading.Lock()     # one start/stop mutation at a time
+# Cached at startup by set_player(): the service ids the tile allows, and
+# whether it found a Widevine-capable browser. Both come FROM the tile.
+_PLAYER_SERVICES = ()
+_PLAYER_BROWSER = None
+# {service_id: home url}, read from the tile at startup. The app needs the hosts
+# to turn a pasted/shared link into (service, path) — without this it would need
+# its own copy of the table, which would be a THIRD copy and the one furthest
+# from the thing that enforces it. Shipped as a separate field so the existing
+# `services` list keeps its shape (CLAUDE.md §4: add fields, never change one).
+_PLAYER_SERVICE_URLS = {}
+# Services with a VERIFIED search URL. A subset of _PLAYER_SERVICES: a service
+# the box can open is not necessarily one it can search, and offering a search
+# that lands nowhere is worse than not offering it.
+_PLAYER_SEARCHABLE = ()
+# {service: [host, ...]} for LINK MATCHING only. Measured: play.max.com
+# redirects to play.hbomax.com, and shared Max links use the latter — matching
+# only the canonical host rejected the one service whose deep-link pattern is
+# verified. Never used to decide what may be OPENED.
+_PLAYER_SERVICE_HOSTS = {}
+
+
+def _pl_ask(*args, timeout=15):
+    """Run one of the tile's read-only debug entry points and return its stdout,
+    or None if it refused / is missing. argv list, never a shell string."""
+    try:
+        p = subprocess.run(["bash", PLAYER_TILE, *args], timeout=timeout,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    return p.stdout.decode("utf-8", "replace").strip()
+
+
+def set_player(mock):
+    """Startup probe. Caches the tile's service list and its browser verdict, so
+    per-request handling never has to spawn the tile just to answer 'can this
+    box do it'. Degrades closed: no tile, or a tile that reports no
+    Widevine-capable browser, means the capability is simply absent."""
+    global PL_MOCK, _PLAYER_SERVICES, _PLAYER_BROWSER, _PLAYER_SERVICE_URLS
+    global _PLAYER_SEARCHABLE, _PLAYER_SERVICE_HOSTS
+    PL_MOCK = mock
+    if mock:
+        _PLAYER_SERVICES = ("netflix", "youtube", "max", "hulu", "disneyplus",
+                            "primevideo", "appletv", "paramount", "peacock",
+                            "crunchyroll", "twitch", "plutotv", "plex",
+                            "spotify")
+        _PLAYER_SERVICE_URLS = {s: "https://%s.example/" % s
+                                for s in _PLAYER_SERVICES}
+        _PLAYER_SEARCHABLE = ("youtube", "netflix", "twitch", "crunchyroll")
+        _PLAYER_SERVICE_HOSTS = {"max": ["play.max.com", "play.hbomax.com"]}
+        _PLAYER_BROWSER = "mock"
+        return
+    if not os.path.isfile(PLAYER_TILE):
+        _PLAYER_SERVICES, _PLAYER_BROWSER = (), None
+        _PLAYER_SERVICE_URLS = {}
+        _PLAYER_SEARCHABLE = ()
+        _PLAYER_SERVICE_HOSTS = {}
+        return
+    listing = _pl_ask("--list-services")
+    _PLAYER_SERVICES = tuple(listing.split()) if listing else ()
+    _PLAYER_BROWSER = _pl_ask("--print-browser")
+    # One subprocess per service, once, at startup — the tile stays the only
+    # place a service id becomes a URL.
+    urls = {}
+    for svc in _PLAYER_SERVICES:
+        u = _pl_ask("--print-url", svc, "")
+        if u:
+            urls[svc] = u
+    _PLAYER_SERVICE_URLS = urls
+    listing = _pl_ask("--list-searchable")
+    _PLAYER_SEARCHABLE = tuple(listing.split()) if listing else ()
+    hosts = {}
+    for svc in _PLAYER_SERVICES:
+        extra = _pl_ask("--print-hosts", svc)
+        if extra:
+            hosts[svc] = extra.split()
+    _PLAYER_SERVICE_HOSTS = hosts
+
+
+def player_available():
+    """Tile deployed, a Widevine-capable browser found, and the Steam launch
+    toolchain present. Boot-time hint (rides caps); GET /api/player is the live
+    authority — same contract as the screensaver."""
+    if PL_MOCK:
+        return True
+    return (os.path.isfile(PLAYER_TILE)
+            and bool(_PLAYER_SERVICES)
+            and _PLAYER_BROWSER is not None
+            and shutil.which("steam") is not None
+            and shutil.which("steamos-add-to-steam") is not None)
+
+
+def _pl_running():
+    try:
+        with open(PLAYER_PIDFILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _pl_conf_read():
+    """(service, path, query) currently written for the tile. Missing/partial
+    conf is not an error — the tile has its own default."""
+    service, path, query = "", "", ""
+    try:
+        with open(PLAYER_CONF) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("service="):
+                    service = line[len("service="):]
+                elif line.startswith("path="):
+                    path = line[len("path="):]
+                elif line.startswith("query="):
+                    query = line[len("query="):]
+    except OSError:
+        pass
+    return service, path, query
+
+
+def _pl_conf_write(service, path, query="", hub=False):
+    """A deep-link path and a search query are mutually exclusive — the tile
+    treats a query as "open this service's search results", and writing both
+    would leave which one wins to reading order."""
+    os.makedirs(os.path.dirname(PLAYER_CONF), exist_ok=True)
+    with open(PLAYER_CONF, "w") as f:
+        if hub:
+            f.write("hub=1\n")
+        f.write("service=%s\n" % service)
+        if query:
+            f.write("query=%s\n" % query)
+        elif path:
+            f.write("path=%s\n" % path)
+
+
+def _pl_validate(service, path):
+    """Ask the TILE whether this request is allowed, and what URL it means.
+    Returns the URL, or None if refused. This is the single enforcement point;
+    the agent deliberately keeps no second copy of the service table.
+
+    The cheap membership test first means a bad id costs no subprocess."""
+    if not isinstance(service, str) or service not in _PLAYER_SERVICES:
+        return None
+    if path and not isinstance(path, str):
+        return None
+    if PL_MOCK:
+        return "https://example.invalid/%s%s" % (service, path or "")
+    return _pl_ask("--print-url", service, path or "")
+
+
+def _pl_validate_search(service, query):
+    """Ask the TILE whether this search is allowed, and what URL it means.
+    Returns the URL, or None if refused.
+
+    Same principle as _pl_validate: the tile owns the search table and the
+    encoder, so there is one implementation and the validator is the code that
+    runs. The query is free text — the tile rejects it on structure (empty,
+    over-length, control bytes) and percent-encodes the rest, so it can only
+    ever land in a query-string VALUE and never change the URL's shape."""
+    if not isinstance(service, str) or service not in _PLAYER_SEARCHABLE:
+        return None
+    if not isinstance(query, str) or not query.strip():
+        return None
+    if PL_MOCK:
+        return "https://example.invalid/%s?q=%s" % (service, len(query))
+    return _pl_ask("--print-search", service, query)
+
+
+def _pl_appid():
+    """The registered tile's appid from shortcuts.vdf, or None. Same parse as
+    _ss_appid (including the +7 offset that was once wrong by a byte and made
+    fresh registrations launch nothing), anchored on the player's own directory
+    so the two tiles can coexist."""
+    for p in glob.glob(os.path.expanduser(
+            "~/.steam/steam/userdata/*/config/shortcuts.vdf")):
+        try:
+            with open(p, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        i = data.find(PLAYER_VDF_ANCHOR)
+        if i < 0:
+            continue
+        seg = data[max(0, i - 300):i]
+        j = seg.rfind(b"\x02appid\x00")
+        if j >= 0 and j + 11 <= len(seg):
+            return struct.unpack("<I", seg[j + 7:j + 11])[0]
+    return None
+
+
+def _pl_gameid(appid):
+    return (appid << 32) | 0x02000000
+
+
+def _pl_fire(gameid):
+    subprocess.Popen(
+        ["steam", "steam://rungameid/%d" % gameid],
+        env=_user_env(), start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _pl_install_grid_art(appid):
+    """Branded capsule for the player tile, same naming and same best-effort
+    contract as _ss_install_grid_art: missing art never blocks a launch."""
+    art = {"portrait": "%dp.png" % appid,
+           "landscape": "%d.png" % appid,
+           "logo": "%d_logo.png" % appid}
+    srcs = {k: os.path.join(PLAYER_GRID_ART, "player-%s.png" % k) for k in art}
+    if not all(os.path.isfile(p) for p in srcs.values()):
+        return
+    for cfg in glob.glob(os.path.expanduser(
+            "~/.steam/steam/userdata/*/config")):
+        grid = os.path.join(cfg, "grid")
+        try:
+            os.makedirs(grid, exist_ok=True)
+            for k, name in art.items():
+                with open(srcs[k], "rb") as src, \
+                        open(os.path.join(grid, name), "wb") as dst:
+                    dst.write(src.read())
+        except OSError as e:
+            print("[player] grid art copy skipped (%s)" % e, flush=True)
+
+
+def player_info():
+    """Live state. `services` is the tile's own list, so the app never carries a
+    hardcoded copy either."""
+    if PL_MOCK:
+        # Same KEYS as the real branch below, always. A mock that returns a
+        # narrower shape is how a UI gets built against a payload the box never
+        # sends — the harness showed no transport at all until this matched.
+        return {"available": True, "running": _PL_MOCK["running"],
+                "service": _PL_MOCK["service"], "path": _PL_MOCK["path"],
+                "query": _PL_MOCK.get("query", ""),
+                "services": list(_PLAYER_SERVICES),
+                "service_urls": dict(_PLAYER_SERVICE_URLS),
+                "searchable": list(_PLAYER_SEARCHABLE),
+                "service_hosts": {k: list(v) for k, v in _PLAYER_SERVICE_HOSTS.items()},
+                "playback": player_playback(),
+                "seek_secs": list(PLAYER_SEEK_SECS)}
+    service, path, query = _pl_conf_read()
+    return {"available": player_available(), "running": _pl_running(),
+            "service": service, "path": path, "query": query,
+            "services": list(_PLAYER_SERVICES),
+            "service_urls": dict(_PLAYER_SERVICE_URLS),
+            "searchable": list(_PLAYER_SEARCHABLE),
+            "service_hosts": {k: list(v) for k, v in _PLAYER_SERVICE_HOSTS.items()},
+            # Added field, never a shape change: null when nothing is playing
+            # or the browser can't be reached, so an old app ignores it and a
+            # new one hides the transport rather than showing a dead scrubber.
+            "playback": player_playback(),
+            "seek_secs": list(PLAYER_SEEK_SECS)}
+
+
+def _pl_relaunch(appid, was_running):
+    """Register if needed, then fire the tile through Steam, in a background
+    thread so the POST returns immediately.
+
+    Extracted so `open`, `search` and `hub` share ONE launch path — three copies
+    of the fresh-registration double-fire is three places for it to drift."""
+
+    def launch():
+        aid = appid
+        fresh = aid is None
+        if was_running:
+            # The tile is single-instance; relaunching before the old one is
+            # gone makes the rungameid a silent no-op.
+            deadline = time.monotonic() + PL_RESTART_WAIT_S
+            while _pl_running() and time.monotonic() < deadline:
+                time.sleep(0.5)
+        if fresh:
+            subprocess.run(
+                ["steamos-add-to-steam", PLAYER_TILE],
+                env=_user_env(), timeout=30,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + PL_REGISTER_WAIT_S
+            while aid is None and time.monotonic() < deadline:
+                time.sleep(1)
+                aid = _pl_appid()
+            if aid is None:
+                print("[player] registration did not appear in shortcuts.vdf",
+                      flush=True)
+                return
+            _pl_install_grid_art(aid)
+        _pl_fire(_pl_gameid(aid))
+        if fresh:
+            # A shortcut's very first rungameid only opens its page.
+            time.sleep(PL_FIRST_LAUNCH_GAP_S)
+            _pl_fire(_pl_gameid(aid))
+
+    threading.Thread(target=launch, daemon=True).start()
+
+
+def player_open(service, path="", query=""):
+    """Point the tile at an allowlisted service and launch it through Steam.
+
+    With `query`, the tile opens that service's OWN search results instead —
+    which is the whole of "search from the phone": nobody types a title on a TV
+    with a d-pad. A query and a deep-link path are mutually exclusive.
+
+    Raises ValueError when the service/path/query is refused — the caller turns
+    that into a 404, and NOTHING is written or launched. Registration and the
+    fresh-registration double-fire run in a background thread so the POST
+    returns immediately; the app watches `running` flip via GET."""
+    if query:
+        url = _pl_validate_search(service, query)
+        if url is None:
+            raise ValueError("service not searchable, or query rejected")
+        path = ""
+    else:
+        url = _pl_validate(service, path)
+        if url is None:
+            raise ValueError("unknown service or path not allowed")
+    if PL_MOCK:
+        _PL_MOCK.update(running=True, service=service, path=path or "",
+                        query=query or "")
+        return {"ok": True, "running": True, "url": url}
+    if not player_available():
+        raise RuntimeError("player not installed on this box")
+
+    with _PL_LOCK:
+        _pl_conf_write(service, path or "", query or "")
+        # The tile is single-instance and reads its conf at START, so switching
+        # services while it is up MUST stop it first — otherwise the rungameid
+        # below is a no-op and the request silently does nothing.
+        was_running = _pl_running()
+        if was_running:
+            player_close()
+        appid = _pl_appid()
+
+    _pl_relaunch(appid, was_running)
+    return {"ok": True, "starting": True, "service": service}
+
+
+# ---------------------------------------------------------------------------
+# Player transport over CDP (play/pause/seek).
+#
+# The tile spawns Chrome with a randomised loopback debugging port and records
+# it; this talks to that port. It is what makes the player a REMOTE rather than
+# a launcher — MPRIS is not an option here, measured: /api/media reports ZERO
+# players while a streaming site is open but idle, and web video mostly never
+# registers at all. The <video> element is the only honest source.
+#
+# CDP IS AN ARBITRARY-CODE PRIMITIVE. Runtime.evaluate runs any JS, and
+# navigating to file:// plus a DOM read is local file exfiltration. So:
+#
+#   * every script below is a CONSTANT in this module, authored here;
+#   * a request selects WHICH constant runs by looking up an op id in a frozen
+#     dict — an id that is not a key is a 404 and nothing executes;
+#   * where an op needs a number, the number that reaches the script is taken
+#     FROM the frozen tuple by index, never from the request body. The client's
+#     bytes are used only to find the index and are then discarded, so the
+#     script can only ever contain one of a fixed set of literals;
+#   * the debugging port is never exposed or proxied through a LAN route.
+#
+# Connections are made per request and closed. A persistent socket would be
+# faster and is exactly the shape that has produced this project's worst bugs
+# (half-dead sockets in the input path); a fresh loopback connect costs
+# ~milliseconds and cannot go stale.
+# ---------------------------------------------------------------------------
+
+PLAYER_CDP_TIMEOUT = 6.0
+# Offsets the skip buttons may ask for. Requested by u/Most-Bet2021 (r/SteamOS).
+PLAYER_SEEK_SECS = (-90, -30, -10, 10, 30, 90)
+
+# Picks the video to act on: a playing one if there is one, else the longest.
+# A streaming page routinely has several (trailers, previews, ads), and "the
+# first video in the DOM" is reliably the wrong one.
+_PL_JS_PICK = """
+  var vs = Array.prototype.slice.call(document.querySelectorAll('video'));
+  var v = null, i;
+  for (i = 0; i < vs.length; i++) {
+    if (!vs[i].paused && !vs[i].ended) { v = vs[i]; break; }
+  }
+  if (!v) {
+    for (i = 0; i < vs.length; i++) {
+      if (!v || (vs[i].duration || 0) > (v.duration || 0)) v = vs[i];
+    }
+  }
+"""
+
+PLAYER_JS_STATE = (
+    "(function(){%s if (!v) return null;"
+    " return {playing: !v.paused && !v.ended,"
+    "         position: v.currentTime || 0,"
+    "         duration: isFinite(v.duration) ? v.duration : 0,"
+    "         muted: !!v.muted, title: document.title || ''};"
+    "})()" % _PL_JS_PICK)
+
+# op id -> agent-authored script. Frozen: an id that is not a key never runs.
+PLAYER_JS_OPS = {
+    "play":      "(function(){%s if (v) v.play(); return !!v;})()" % _PL_JS_PICK,
+    "pause":     "(function(){%s if (v) v.pause(); return !!v;})()" % _PL_JS_PICK,
+    "playpause": ("(function(){%s if (!v) return false;"
+                  " if (v.paused) { v.play(); } else { v.pause(); }"
+                  " return true;})()" % _PL_JS_PICK),
+    "mute":      ("(function(){%s if (!v) return false;"
+                  " v.muted = !v.muted; return true;})()" % _PL_JS_PICK),
+}
+
+# Seek scripts, pre-built ONE PER ALLOWED OFFSET at import time. The request
+# path only ever indexes this dict, so no request value is ever formatted into
+# a script.
+PLAYER_JS_SEEK = {
+    secs: ("(function(){%s if (!v) return false;"
+           " var d = isFinite(v.duration) ? v.duration : 0;"
+           " var t = (v.currentTime || 0) + (%d);"
+           " v.currentTime = Math.max(0, d ? Math.min(d - 0.5, t) : t);"
+           " return true;})()" % (_PL_JS_PICK, secs))
+    for secs in PLAYER_SEEK_SECS
+}
+
+
+def _pl_cdp_port():
+    try:
+        with open(PLAYER_PORTFILE) as f:
+            port = int(f.read().strip())
+        return port if 1 <= port <= 65535 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _pl_http_get(port, path):
+    """GET one of Chrome's DevTools HTTP endpoints.
+
+    Chrome keeps the connection open even when the request says
+    `Connection: close`, so reading to EOF blocks until the socket timeout —
+    AFTER the whole body has already arrived, which reads as "CDP unreachable"
+    and cost a full debugging round during the Phase 0 spike. Read the headers,
+    then exactly Content-Length bytes."""
+    sock = socket.create_connection(("127.0.0.1", port), PLAYER_CDP_TIMEOUT)
+    try:
+        sock.settimeout(PLAYER_CDP_TIMEOUT)
+        sock.sendall(("GET %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n"
+                      % (path, port)).encode())
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise OSError("closed before headers")
+            data += chunk
+        head, _, body = data.partition(b"\r\n\r\n")
+        length = 0
+        for line in head.split(b"\r\n")[1:]:
+            if line.lower().startswith(b"content-length:"):
+                length = int(line.split(b":", 1)[1])
+        while len(body) < length:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        return json.loads(body)
+    finally:
+        sock.close()
+
+
+class _PlayerCDP:
+    """Minimal CDP client: one page target, one command, then closed.
+
+    Client frames MUST be masked (RFC6455); server frames are not. The agent
+    already hand-rolls the same shape for the WebOS TV backend."""
+
+    def __init__(self, port):
+        targets = _pl_http_get(port, "/json/list")
+        pages = [t for t in targets if t.get("type") == "page"
+                 and t.get("webSocketDebuggerUrl")]
+        # MEASURED on a real box: taking pages[0] blindly attached to
+        # about:blank while the service was playing in another target, so every
+        # read came back "no video" and the transport never appeared. /json/list
+        # order carries no meaning — pick a target that is actually on a page.
+        loaded = [t for t in pages
+                  if str(t.get("url", "")).startswith(("http://", "https://"))]
+        if not (loaded or pages):
+            raise OSError("no CDP page target")
+        url = (loaded or pages)[0]["webSocketDebuggerUrl"]
+        hostport, _, path = url[len("ws://"):].partition("/")
+        host, _, p = hostport.partition(":")
+        self.sock = socket.create_connection((host, int(p)),
+                                             PLAYER_CDP_TIMEOUT)
+        self.sock.settimeout(PLAYER_CDP_TIMEOUT)
+        key = base64.b64encode(os.urandom(16)).decode()
+        # No Origin header on purpose: Chrome rejects unknown Origins on the
+        # DevTools socket unless --remote-allow-origins is passed; omitting it
+        # entirely is accepted.
+        self.sock.sendall((
+            "GET /%s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n" % (path, hostport, key)
+        ).encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise OSError("closed during CDP handshake")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0] + b" ":
+            raise OSError("CDP handshake refused")
+        self.buf = buf.partition(b"\r\n\r\n")[2]
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _need(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise OSError("CDP socket closed")
+            self.buf += chunk
+
+    def _frame(self):
+        while True:
+            self._need(2)
+            opcode = self.buf[0] & 0x0F
+            length = self.buf[1] & 0x7F
+            off = 2
+            if length == 126:
+                self._need(4)
+                length = struct.unpack(">H", self.buf[2:4])[0]
+                off = 4
+            elif length == 127:
+                self._need(10)
+                length = struct.unpack(">Q", self.buf[2:10])[0]
+                off = 10
+            self._need(off + length)
+            payload = self.buf[off:off + length]
+            self.buf = self.buf[off + length:]
+            if opcode == 0x1:
+                return payload
+            if opcode == 0x8:
+                raise OSError("CDP peer closed")
+
+    def evaluate(self, expression):
+        """Run ONE agent-authored script and return its value. `expression` is
+        always a constant from this module — never anything a client sent."""
+        payload = json.dumps({
+            "id": 1, "method": "Runtime.evaluate",
+            "params": {"expression": expression, "returnByValue": True},
+        }).encode()
+        mask = os.urandom(4)
+        n = len(payload)
+        header = bytes([0x81])
+        if n < 126:
+            header += bytes([0x80 | n])
+        elif n < 65536:
+            header += bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            header += bytes([0x80 | 127]) + struct.pack(">Q", n)
+        self.sock.sendall(header + mask
+                          + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+        deadline = time.monotonic() + PLAYER_CDP_TIMEOUT
+        while time.monotonic() < deadline:
+            msg = json.loads(self._frame())
+            if msg.get("id") == 1:      # everything else is an event
+                res = msg.get("result", {})
+                if "exceptionDetails" in res:
+                    raise OSError("CDP script raised")
+                return res.get("result", {}).get("value")
+        raise OSError("CDP timed out")
+
+
+def _pl_cdp_run(expression):
+    """Connect, run one agent-authored script, close. None on any failure —
+    degrade closed: an unreachable browser reports 'no playback', never a
+    guess."""
+    port = _pl_cdp_port()
+    if port is None:
+        return None
+    cdp = None
+    try:
+        cdp = _PlayerCDP(port)
+        return cdp.evaluate(expression)
+    except (OSError, ValueError, KeyError):
+        return None
+    finally:
+        if cdp is not None:
+            cdp.close()
+
+
+def player_playback():
+    """Live <video> state, or None when there is nothing to report."""
+    if PL_MOCK:
+        if not _PL_MOCK["running"]:
+            return None
+        return {"playing": True, "position": 431.2, "duration": 3120.0,
+                "muted": False, "title": "Mock title"}
+    if not _pl_running():
+        return None
+    state = _pl_cdp_run(PLAYER_JS_STATE)
+    if not isinstance(state, dict):
+        return None
+    return state
+
+
+def player_transport(op, secs=None):
+    """Run one allowlisted transport op. ValueError => 404, nothing runs."""
+    if PL_MOCK:
+        if op in PLAYER_JS_OPS:
+            return {"ok": True, "op": op}
+        if op == "seek":
+            if secs not in PLAYER_SEEK_SECS:
+                raise ValueError("seek offset not allowed")
+            return {"ok": True, "op": "seek", "secs": secs}
+        raise ValueError("unknown transport op")
+
+    if op in PLAYER_JS_OPS:
+        script = PLAYER_JS_OPS[op]              # lookup, never interpolation
+    elif op == "seek":
+        if secs not in PLAYER_SEEK_SECS:
+            raise ValueError("seek offset not allowed")
+        script = PLAYER_JS_SEEK[secs]           # pre-built per allowed offset
+    else:
+        raise ValueError("unknown transport op")
+
+    if not _pl_running():
+        raise RuntimeError("player is not running")
+    ok = _pl_cdp_run(script)
+    if ok is None:
+        raise RuntimeError("could not reach the player")
+    return {"ok": bool(ok), "op": op}
+
+
+def player_hub():
+    """Open the tile's OWN page — the service grid it writes from the frozen
+    table, with a focus ring a d-pad step can land on.
+
+    There is no client input in this path at all: the request carries an op and
+    nothing else, and the page is authored by the tile. It exists for the case
+    the phone does not cover — someone opening the tile from the Steam library
+    with a controller and no phone in hand."""
+    if PL_MOCK:
+        _PL_MOCK.update(running=True, service="", path="", query="")
+        return {"ok": True, "running": True, "hub": True}
+    if not player_available():
+        raise RuntimeError("player not installed on this box")
+    with _PL_LOCK:
+        service, _, _ = _pl_conf_read()
+        _pl_conf_write(service or "netflix", "", "", hub=True)
+        was_running = _pl_running()
+        if was_running:
+            player_close()
+        appid = _pl_appid()
+    _pl_relaunch(appid, was_running)
+    return {"ok": True, "starting": True, "hub": True}
+
+
+def player_close():
+    """Stop the tile. TERMs the PIDFILE pid, never the pgid — Steam's reaper
+    owns the process group (the screensaver learned this first). The tile's own
+    trap forwards it to the browser and clears its runtime files. Idempotent."""
+    if PL_MOCK:
+        _PL_MOCK["running"] = False
+        return {"ok": True, "running": False}
+    try:
+        with open(PLAYER_PIDFILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 15)
+    except (OSError, ValueError):
+        pass  # not running = already stopped
+    return {"ok": True, "running": False}
+
+
+# ---------------------------------------------------------------------------
 # Metrics history (rides /api/status as "history").
 #
 # A small ring of recent vitals so the app can draw sparklines instead of a
@@ -2296,6 +3050,8 @@ def real_status():
     temp = read_cpu_temp_c()
     mem = read_mem()
     battery = read_box_battery()
+    display = display_info()
+    audio = audio_info()
     now = int(time.time())
     _record_history(now, temp, load[0] if load else None, mem)
     return {
@@ -2311,6 +3067,14 @@ def real_status():
         # new ones can treat "absent" as "this box has no battery" rather than
         # having to distinguish that from 0%.
         **({"battery": battery} if battery else {}),
+        # The panel the box is driving, and the default audio OUT/IN devices.
+        # Same shape of contract as `battery`: ADDITIVE, and OMITTED ENTIRELY
+        # when nothing could be read, so absence means "unavailable" and never
+        # has to be told apart from a null. Every field inside them is likewise
+        # independently optional -- see the module note above display_info() for
+        # what each name is allowed to claim.
+        **({"display": display} if display else {}),
+        **({"audio": audio} if audio else {}),
         "net": net_info_cached(),
         "agent_version": VERSION,
         # CAPS is a boot-time snapshot, but "desktop" is SESSION-volatile (it
@@ -2783,6 +3547,45 @@ _DESKTOP_SESSIONS = {
 }
 _DEFAULT_DESKTOP_FALLBACK = "plasmax11.desktop"
 
+# Where a display manager looks for session files. SDDM's Autologin Session=
+# must name a file that EXISTS in one of these, or autologin fails outright.
+_SESSION_DIRS = ("/usr/share/wayland-sessions", "/usr/share/xsessions")
+
+
+def _installed_session_files():
+    """Every .desktop session name actually present on this box.
+
+    WHY THIS EXISTS — a real stranding, 2026-07-27. `_default_desktop_session()`
+    asks `steamosctl get-default-desktop-session`; on Bazzite that D-Bus
+    interface does not exist, so the read returns empty and we fell back to
+    _DEFAULT_DESKTOP_FALLBACK = "plasmax11.desktop". That is a SteamOS name.
+    Bazzite ships plasma.desktop (Wayland) and plasma-steamos-oneshot.desktop
+    (X11) and has NO plasmax11.desktop — so "Boots into: Desktop" wrote an
+    autologin session that does not exist. SDDM said so in its own log:
+
+        Unable to find autologin session entry "plasmax11.desktop"
+        Autologin failed!
+
+    ...and the box came up at the GREETER instead. The user then logged in by
+    hand and SDDM used its [Last] session, which was gamescope — so the setting
+    appeared to do nothing while actually breaking autologin. Worse, on a box
+    whose agent is a systemd --user service, no login means NO AGENT, so the
+    phone cannot even reach the box to undo it. Stranding a box at a password
+    prompt is the exact failure this product exists to prevent.
+
+    The lesson: "degrade closed" has to mean degrading to something VERIFIED to
+    work, not to a hardcoded name that happens to be right on one distro. So we
+    now look at what is actually installed rather than assuming."""
+    names = set()
+    for d in _SESSION_DIRS:
+        try:
+            for fn in os.listdir(d):
+                if fn.endswith(".desktop"):
+                    names.add(fn)
+        except OSError:
+            continue  # directory absent on this box; not an error
+    return names
+
 
 # ---------------------------------------------------------------------------
 # Boot session default — "which mode does this box come up in?"
@@ -2841,14 +3644,251 @@ def _sddm_session_ok():
     return _sudo_nopasswd_allows(SDDM_DROPIN)
 
 
+# ---------------------------------------------------------------------------
+# Which display manager does this box actually run?
+#
+# WHY THIS EXISTS. Couchside's boot-session feature was SDDM-only, which covers
+# Bazzite and SteamOS and nothing else. The custom-built Steam machines people
+# actually assemble — Arch/CachyOS with gamescope, ChimeraOS, Nobara, a plain
+# distro running Big Picture — frequently use greetd, GDM or LightDM instead,
+# and on those the feature simply never appeared.
+#
+# There is a canonical, distro-agnostic answer and systemd maintains it for us:
+# /etc/systemd/system/display-manager.service is a SYMLINK to the unit of the
+# display manager that is actually enabled. Verified on a real Bazzite box
+# 2026-07-27:
+#
+#     readlink -f /etc/systemd/system/display-manager.service
+#     -> /usr/lib/systemd/system/sddm.service
+#
+# That beats guessing from /etc/os-release (a user can install any DM on any
+# distro) and beats probing for config files (several can exist while only one
+# DM is enabled). No binary to run, no D-Bus interface to be missing — just a
+# readlink, which also means it cannot hang.
+#
+# DEGRADE CLOSED (§3.7): an unreadable link, or a DM we do not have a writer
+# for, returns None and the capability stays absent. KI-038 is the standing
+# reminder of what the alternative costs — writing a boot config we cannot
+# vouch for stranded a box at a password prompt with no agent running.
+# ---------------------------------------------------------------------------
+
+DISPLAY_MANAGER_UNIT = "/etc/systemd/system/display-manager.service"
+
+# Display managers we can READ or WRITE a boot session for. The value is the
+# short name used throughout; extending this set means adding a real writer,
+# never a pattern match.
+_KNOWN_DMS = ("sddm", "greetd", "gdm", "lightdm")
+
+
+def detect_display_manager():
+    """Short name of the enabled display manager ("sddm"/"greetd"/...), or None.
+
+    None means "we could not tell", which is different from "there is none" —
+    both are handled the same way (no capability), because acting on a box whose
+    boot path we cannot identify is exactly how KI-038 happened.
+    """
+    try:
+        target = os.path.realpath(DISPLAY_MANAGER_UNIT)
+    except OSError:
+        return None
+    if not target or not os.path.basename(target).endswith(".service"):
+        return None
+    unit = os.path.basename(target)[: -len(".service")].lower()
+    # gdm ships as gdm.service on some distros and gdm3.service on Debian-likes.
+    if unit.startswith("gdm"):
+        return "gdm"
+    return unit if unit in _KNOWN_DMS else None
+
+
+# ---------------------------------------------------------------------------
+# greetd backend — the common DIY / custom-Steam-machine display manager.
+#
+# greetd differs from SDDM in two ways that shape everything below.
+#
+# 1. IT TAKES A COMMAND, NOT A SESSION NAME. `[initial_session] command = "..."`
+#    is the autologin lever ("takes the place of the default session on the very
+#    first start"; the greeter returns afterwards). So we derive the command
+#    from the Exec= line of the SAME .desktop file the SDDM path resolves, which
+#    means the KI-038 "must actually exist" guarantee carries over for free.
+#    MEASURED on a real box 2026-07-27:
+#      plasma.desktop            Exec=/usr/libexec/plasma-dbus-run-session-if-needed /usr/bin/startplasma-wayland
+#      gamescope-session.desktop Exec=gamescope-session-plus steam
+#
+# 2. THERE IS NO DROP-IN DIRECTORY. SDDM lets us own a separate zz- file and
+#    never touch the distro's; greetd has ONE config.toml holding the user's
+#    whole setup. So we rewrite exactly the [initial_session] table and copy
+#    every other byte through unchanged, and we keep a one-time backup so the
+#    box is recoverable by hand. Anything we cannot parse confidently, we refuse
+#    to write at all — mangling the file that decides whether a box boots is the
+#    KI-038 failure mode with a bigger blast radius.
+#
+# NOT VERIFIED ON HARDWARE. No greetd box was reachable while this was written;
+# it is built against greetd's documented config format and unit-tested against
+# realistic fixtures. Treat the first live greetd report as the real test.
+# ---------------------------------------------------------------------------
+
+GREETD_CONFIG = "/etc/greetd/config.toml"
+GREETD_BACKUP = "/etc/greetd/config.toml.couchside-backup"
+
+
+def _agent_user():
+    """The account this agent runs as — the one greetd should autologin.
+
+    The agent runs AS the desktop user (systemd user service, or a system unit
+    with User=), so our own uid is the right answer and needs no guessing. pwd
+    is stdlib. Returns "" if the uid has no passwd entry, which refuses the
+    write rather than autologging in as somebody unexpected."""
+    try:
+        import pwd
+        return pwd.getpwuid(UID).pw_name or ""
+    except Exception:
+        return ""
+
+
+def _session_exec_command(session_file):
+    """The Exec= command out of an installed session .desktop, or "".
+
+    greetd runs a command, so this is the bridge from "which session" to "what
+    to run". Returns "" if the file is missing or has no Exec — the caller then
+    refuses, rather than writing a boot command that does nothing."""
+    for d in _SESSION_DIRS:
+        path = os.path.join(d, session_file)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("Exec="):
+                        cmd = line[len("Exec="):].strip()
+                        # Strip the freedesktop field codes (%U, %f, ...): they
+                        # are placeholders a launcher substitutes, and greetd
+                        # would run them literally.
+                        cmd = re.sub(r"\s*%[a-zA-Z]", "", cmd).strip()
+                        return cmd
+        except OSError:
+            continue
+    return ""
+
+
+def _greetd_session_ok():
+    """True when greetd is the enabled DM AND we may write its config."""
+    return (detect_display_manager() == "greetd"
+            and _sudo_nopasswd_allows(GREETD_CONFIG))
+
+
+def _greetd_current_command():
+    """The command in [initial_session], or "" if absent/unreadable."""
+    try:
+        with open(GREETD_CONFIG, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return ""
+    in_initial = False
+    for line in lines:
+        st = line.strip()
+        if st.startswith("["):
+            in_initial = st.replace(" ", "") == "[initial_session]"
+            continue
+        if in_initial and st.startswith("command"):
+            _, _, val = st.partition("=")
+            return val.strip().strip('"').strip("'")
+    return ""
+
+
+def _greetd_compose(existing, command, user):
+    """The new config.toml text: every other section byte-identical, with
+    [initial_session] replaced (or appended when absent).
+
+    Returns None if `existing` looks like something we should not rewrite —
+    refusing beats mangling the file that decides whether the box boots."""
+    if command.count('"') or "\n" in command or "\n" in user or not user:
+        return None  # cannot quote safely; refuse
+    out, i, replaced = [], 0, False
+    lines = existing.splitlines()
+    while i < len(lines):
+        st = lines[i].strip()
+        if st.replace(" ", "") == "[initial_session]":
+            # Skip the old table entirely, up to the next section header.
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("["):
+                i += 1
+            if replaced:
+                return None  # two [initial_session] tables: not ours to fix
+            out.extend(["[initial_session]",
+                        '# Set by Couchside (boot session). Original config saved',
+                        '# alongside as config.toml.couchside-backup.',
+                        'command = "%s"' % command,
+                        'user = "%s"' % user,
+                        ""])
+            replaced = True
+            continue
+        out.append(lines[i])
+        i += 1
+    if not replaced:
+        out.extend(["", "[initial_session]",
+                    '# Added by Couchside (boot session). Original config saved',
+                    '# alongside as config.toml.couchside-backup.',
+                    'command = "%s"' % command,
+                    'user = "%s"' % user])
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _greetd_write(session_file):
+    """Point greetd's autologin at `session_file`. True on success.
+
+    Refuses unless the session is installed AND has a runnable Exec — the same
+    verify-before-write rule KI-038 forced on the SDDM path."""
+    installed = _installed_session_files()
+    if installed and session_file not in installed:
+        print("[session] refusing greetd write for missing session %r"
+              % (session_file,), flush=True)
+        return False
+    command = _session_exec_command(session_file)
+    if not command:
+        print("[session] refusing greetd write: no Exec in %r" % (session_file,),
+              flush=True)
+        return False
+    user = _agent_user()
+    if not user:
+        return False
+    try:
+        with open(GREETD_CONFIG, "r", encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+    except OSError:
+        return False
+    body = _greetd_compose(existing, command, user)
+    if body is None:
+        print("[session] refusing greetd write: config not safely rewritable",
+              flush=True)
+        return False
+    try:
+        # One-time backup, so "delete our block / restore this file" is real
+        # advice. cp -n never clobbers an existing backup.
+        subprocess.run(["sudo", "-n", "cp", "-n", GREETD_CONFIG, GREETD_BACKUP],
+                       capture_output=True, text=True, timeout=8)
+        r = subprocess.run(["sudo", "-n", "tee", GREETD_CONFIG],
+                           input=body, capture_output=True, text=True, timeout=8)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def session_default_backend():
     """"steamosctl" | "sddm" | None. steamosctl first: on a real Deck it is the
     supported path and keeps Valve's own state consistent."""
     if _steamosctl_session_ok():
         return "steamosctl"
-    if _sddm_session_ok():
-        return "sddm"
-    return None
+    # Pick the backend that matches the DM this box ACTUALLY runs, rather than
+    # whichever config we happen to have a grant for. A box can carry a leftover
+    # sddm.conf while booting through greetd; writing the one nobody reads is a
+    # silent no-op, which is how "I set it and nothing happened" bugs are made.
+    dm = detect_display_manager()
+    if dm == "greetd":
+        return "greetd" if _greetd_session_ok() else None
+    if dm == "sddm" or dm is None:
+        # dm is None on a box we cannot identify; SDDM stays the fallback there
+        # because it is what shipped and its writer refuses on its own if the
+        # grant or the session file is missing.
+        return "sddm" if _sddm_session_ok() else None
+    return None  # gdm / lightdm: detected, but no writer yet — honest absence
 
 
 def session_default_available():
@@ -2878,6 +3918,13 @@ def session_default_get():
     backend = session_default_backend()
     if backend is None:
         return {"available": False, "backend": None, "mode": "unknown"}
+    if backend == "greetd":
+        if _greetd_write(target):
+            return done(True)
+        return done(False, "could not set greetd's boot session "
+                           "(session not installed, no Exec, or config not "
+                           "safely rewritable)")
+
     if backend == "steamosctl":
         try:
             r = subprocess.run(["steamosctl", "get-default-login-mode"],
@@ -2901,7 +3948,19 @@ def _sddm_write(session_file):
     """Write our drop-in via a sudo tee whose PATH IS FIXED IN THE SUDOERS RULE.
 
     session_file is chosen by the agent from a frozen table — never client
-    input — and the whole file body is composed here."""
+    input — and the whole file body is composed here.
+
+    REFUSES to write a session that is not installed. An autologin entry naming
+    a missing session does not degrade gracefully: SDDM logs "Unable to find
+    autologin session entry" and drops the box at the greeter, stranding a box
+    whose agent is a user service. Measured 2026-07-27 — this guard is the
+    reason that cannot happen again, and it sits HERE, at the single write, so
+    no future caller can route around it."""
+    installed = _installed_session_files()
+    if installed and session_file not in installed:
+        print("[session] refusing to write autologin for missing session %r"
+              % (session_file,), flush=True)
+        return False
     body = ("# Written by Couchside. Delete this file to restore the box's\n"
             "# original boot behaviour; nothing else was modified.\n"
             "[Autologin]\n"
@@ -2939,7 +3998,13 @@ def session_default_set(mode):
     elif mode == "game":
         target = GAMESCOPE_SESSION_FILE
     else:
-        target, _ = _default_desktop_session()
+        # Desktop: the session must EXIST or autologin fails and the box lands
+        # at the greeter with no agent (see _installed_session_files). Refusing
+        # is strictly better than writing a name we cannot vouch for -- the user
+        # keeps a working box and gets told why.
+        target = _desktop_session_for_autologin()
+        if not target:
+            return done(False, "no desktop session installed on this box")
 
     if backend == "steamosctl":
         arg = "game" if target == GAMESCOPE_SESSION_FILE else "desktop"
@@ -2962,7 +4027,12 @@ def _default_desktop_session():
     (session_file, session_select_arg) pair from the frozen table above.
 
     Degrades closed: any read failure, or a name not on the allowlist, returns
-    the X11 pair that shipped before -- never a guess, never a raw value."""
+    the X11 pair that shipped before -- never a guess, never a raw value.
+
+    NOTE: this answers "which desktop does the box PREFER", and its fallback is
+    fine for the one-shot switch it serves (steamos-session-select validates its
+    own argument and a bad switch is transient). It is NOT safe for writing a
+    PERSISTENT autologin entry -- see _desktop_session_for_autologin()."""
     try:
         r = subprocess.run(["steamosctl", "get-default-desktop-session"],
                            capture_output=True, text=True, timeout=5)
@@ -2972,6 +4042,56 @@ def _default_desktop_session():
     if name not in _DESKTOP_SESSIONS:
         name = _DEFAULT_DESKTOP_FALLBACK
     return name, _DESKTOP_SESSIONS[name]
+
+
+# Desktop sessions we will point autologin at, best first. SteamOS and Bazzite
+# ship DIFFERENT names, which is the whole reason this list exists rather than a
+# constant: SteamOS has plasmax11.desktop, Bazzite has plasma.desktop plus the
+# plasma-steamos-*-oneshot pair. Each entry is checked against what is actually
+# installed (_installed_session_files) before it can be written.
+#
+# Wayland plasma.desktop is preferred over X11 because it is what a modern
+# Bazzite/SteamOS desktop actually runs; the X11 names follow as fallbacks for
+# older images. The oneshot variants come LAST -- they exist to bounce back to
+# Game Mode, so autologging into one every boot would be surprising.
+_AUTOLOGIN_DESKTOP_PREFERENCE = (
+    "plasma.desktop",
+    "plasmax11.desktop",
+    "plasma-steamos-oneshot.desktop",
+    "plasma-steamos-wayland-oneshot.desktop",
+)
+
+
+def _desktop_session_for_autologin():
+    """A desktop session file that EXISTS on this box, or None.
+
+    None means "do not write" — refusing is the safe answer here. An autologin
+    entry naming a missing session does not fail quietly: SDDM abandons
+    autologin and drops the box at the greeter, which on a box whose agent is a
+    user service means the agent never starts and the phone loses the box
+    entirely (measured 2026-07-27, see _installed_session_files).
+
+    Preference order: whatever the box itself reports as its configured desktop
+    (so we honour a Wayland box rather than downgrading it), then
+    _AUTOLOGIN_DESKTOP_PREFERENCE, then — since both lists are SteamOS/Bazzite
+    specific — any other installed plasma session, so a distro we have not seen
+    still works. Every candidate must be an installed file; nothing is assumed.
+    """
+    installed = _installed_session_files()
+    if not installed:
+        return None  # cannot enumerate; refuse rather than guess
+
+    configured, _ = _default_desktop_session()
+    for cand in (configured,) + _AUTOLOGIN_DESKTOP_PREFERENCE:
+        if cand in installed:
+            return cand
+    # Unknown distro: take an installed plasma session rather than fail, but
+    # still only ever a file we have SEEN, and never the gamescope session
+    # (that is Game Mode, the opposite of what was asked for).
+    for name in sorted(installed):
+        if name.startswith("plasma") and name != GAMESCOPE_SESSION_FILE:
+            return name
+    return None
 
 
 def _session_to_desktop():
@@ -3650,6 +4770,12 @@ def mock_status():
         # minutes for minutes_to_full to exercise the charging layout.
         "battery": {"pct": 58, "status": "Discharging", "on_ac": False,
                     "minutes": 251, "watts": 7.7, "profile": "balanced"},
+        # Mock drives a 4K HDR VRR TV so every display row is renderable, and a
+        # sink/source pair that are DIFFERENT devices with a long description --
+        # see mock_display_info() / mock_audio_info() for why those specific
+        # values.
+        "display": mock_display_info(),
+        "audio": mock_audio_info(),
         "net": {"iface": "eth0", "mac": "de:ad:be:ef:00:01",
                 "wired": True, "wol_armed": True},
         "agent_version": VERSION,
@@ -10927,6 +12053,1060 @@ def mock_gaming():
 
 
 # ---------------------------------------------------------------------------
+# Display + audio facts (additive blocks on GET /api/status: "display", "audio")
+#
+# What the Console tab shows: the panel the box is actually driving (resolution,
+# refresh, HDR, VRR, who made it, which connector) and the default audio OUT and
+# IN devices.
+#
+# HONESTY IS THE FEATURE HERE. Almost every source below answers "what can this
+# display do", and only two of them answer "what is it doing right now". Those
+# are different questions and this module never lets one masquerade as the
+# other, because the failure mode is a phone confidently reporting 60 Hz on a
+# box running at 120:
+#
+#   current_*    ONLY from a live compositor that told us its output mode.
+#   preferred_*  the display's own preferred timing, from EDID. A CAPABILITY.
+#   supported_*  lists of what the panel/compositor will accept. CAPABILITIES.
+#   *_supported  capability.   *_active  state. Never derived from each other
+#                except in the one direction that is a fact rather than a guess
+#                (a panel that cannot do HDR is certainly not doing HDR).
+#
+# MEASURED 2026-07-27 on the Bazzite box (Lenovo TIO24Gen3T on DP-1), IN GAME
+# MODE. Every claim below is from that capture unless marked otherwise:
+#
+#  * /sys/class/drm/card1-DP-1/modes lists "1920x1080" five times and carries NO
+#    refresh rate at all. It is the mode LIST, not the current mode -- hence
+#    `supported_modes`.
+#  * /sys/kernel/debug/dri/1/state is EACCES as the desktop user. Not used; we
+#    do not sudo for a readout.
+#  * kscreen-doctor EXISTS (/usr/bin/kscreen-doctor) and SIGABRTs with rc=134
+#    and ZERO bytes of stdout in Game Mode -- no KDE session to talk to. A crash
+#    must read as "unavailable", never as "this box has no displays", so the
+#    parser requires non-empty PARSED output and ignores the exit code.
+#  * `gamescopectl` with no arguments prints a gamescope_control info block
+#    (connector, make, model, ValidRefreshRates). Its subcommands and convar
+#    reads return "Command not found." -- convars are NOT readable, so HDR/VRR
+#    state does not come from there. NOTE also that `gamescopectl <convar>
+#    <value>` is a live WRITE surface; this module only ever runs the bare
+#    binary with no arguments.
+#  * gamescope publishes its real state as X11 root-window atoms on its PRIMARY
+#    XWayland (GAMESCOPE_XWAYLAND_SERVER_ID == 0; on server 1 every atom reads
+#    not-found, verified both ways). Read with a ~90-line stdlib X11 client
+#    below rather than xprop/xrandr, which are not guaranteed on stock SteamOS.
+#  * THE HDR TRAP: GAMESCOPE_DISPLAY_HDR_ENABLED read 1 on this box while
+#    GAMESCOPE_DISPLAY_SUPPORTS_HDR read 0, on an SDR panel whose EDID has no
+#    HDR block. In gamescope's source that atom is only ever READ by the
+#    compositor -- it is Steam's "turn HDR on if available" REQUEST, not state.
+#    Sourcing "HDR: On" from it would put HDR On on the Console tab of a machine
+#    driving an 8-bit SDR monitor. The state atom is GAMESCOPE_HDR_OUTPUT_FEEDBACK
+#    and it is written only inside gamescope's output-mode-change handler, so on
+#    this box it does not exist at all. Absent is NOT off.
+#
+# NOT VERIFIED, and deliberately recorded as such:
+#  * The kscreen-doctor path was only ever observed CRASHING. Its JSON shape here
+#    comes from libkscreen's schema, not from a capture; the parser is written to
+#    reject anything it does not fully recognise.
+#  * A gamescope box whose render size differs from its scanout mode (a Deck
+#    rendering 1280x800 into a 4K TV) is untested. current_width/height come from
+#    the X screen size of XWayland server 0, which gamescope sets from
+#    g_nOutputWidth/Height (the OUTPUT size) -- source says scanout, no hardware
+#    proved it.
+#  * vrr_supported has never been observed True, on any panel we could reach.
+#
+# Naming note: the couch-mode switch already has a client-supplied WRITE flag
+# called `hdr` (POST /api/couch-mode). These read-back fields are deliberately
+# `hdr_supported` / `hdr_active` so nobody confuses a request with a reading.
+# ---------------------------------------------------------------------------
+
+# Both blocks ride /api/status, which every app screen and every Fleet row polls
+# at ~5s -- and usePoll retries a FAILING poll every 2s. An uncached probe would
+# put gamescopectl + two wpctl forks (and, off Game Mode, a core-dumping
+# kscreen-doctor) on that path. TTL-memoized like _gaming_payload, but longer:
+# which monitor is plugged in changes on a human timescale, not a poll timescale.
+# The cache is overwritten with whatever the last probe produced, including a
+# degraded one -- a failure must never be papered over with the previous answer.
+_DISPLAY_TTL = 15.0
+_DISPLAY_CACHE = {"val": None, "at": 0.0}
+_AUDIO_CACHE = {"val": None, "at": 0.0}
+_DISPLAY_LOCK = threading.Lock()
+
+# Module constants so tests can point them at fixtures (same pattern as _DRM_DIR).
+_X11_UNIX_DIR = "/tmp/.X11-unix"
+_KSCREEN_TIMEOUT_S = 4
+_GAMESCOPECTL_TIMEOUT_S = 4
+_WPCTL_TIMEOUT_S = 4
+# kscreen-doctor does not fail, it ABORTS -- rc=134, "the monitored command
+# dumped core". Retrying that every TTL on a box sitting at a login screen would
+# hand systemd-coredump a new core dump four times a minute forever, so a failed
+# probe is remembered. This is a stale NEGATIVE (we report nothing for a while),
+# which degrades closed; it can never turn into a stale positive.
+_KSCREEN_BACKOFF_S = 120.0
+_KSCREEN_FAILED_AT = {"t": 0.0}
+
+
+# --- EDID ------------------------------------------------------------------
+#
+# EDID is the display describing ITSELF. It is burned into the monitor and is
+# byte-identical whether the box is driving it at 1920x1080@60, at 640x480, or
+# has it blanked -- confirmed indirectly on the box, where /sys EDID and
+# gamescope's cached ~/.config/gamescope/edid.bin from an earlier boot hash the
+# same. So it answers "what display is this / what can it do" and NEVER "what
+# mode is being driven right now".
+#
+# CONTROL for the parser (CLAUDE.md §11.3): on the measured box `gamescopectl`
+# independently reported Make "Lenovo Group Limited" / Model "TIO24Gen3T" for the
+# same connector, and the manufacturer word 0x30ae must decode to the Lenovo PNP
+# id "LEN". The fixture test asserts both.
+
+_EDID_HEADER = b"\x00\xff\xff\xff\xff\xff\xff\x00"
+_EDID_TAG_SERIAL = 0xFF
+_EDID_TAG_NAME = 0xFC
+_EDID_TAG_RANGE = 0xFD
+
+
+def _edid_text(block):
+    """ASCII payload of a 0xFC/0xFF/0xFE descriptor: bytes 5..17, terminated by
+    0x0A, space-padded. A non-printable byte makes the whole descriptor unusable
+    -- reject, never sanitise (§3.6): garbage here becomes a monitor name on
+    somebody's phone."""
+    raw = block[5:18]
+    nl = raw.find(b"\x0a")
+    if nl >= 0:
+        raw = raw[:nl]
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    text = text.rstrip(" ")
+    if not text or any(ord(c) < 0x20 or ord(c) > 0x7E for c in text):
+        return None
+    return text
+
+
+def _edid_manufacturer(word):
+    """3-letter PNP id from the big-endian 16-bit manufacturer field. Five bits
+    per letter, 1='A'. Bit 15 is reserved-zero, so a set bit means this is not a
+    manufacturer field -- return None rather than a plausible string."""
+    if word & 0x8000:
+        return None
+    letters = []
+    for shift in (10, 5, 0):
+        v = (word >> shift) & 0x1F
+        if not 1 <= v <= 26:
+            return None
+        letters.append(chr(ord("A") + v - 1))
+    return "".join(letters)
+
+
+def _edid_detailed_timing(block):
+    """Parse an 18-byte DETAILED TIMING descriptor -> dict, or None.
+
+    Refresh is COMPUTED, not read: EDID stores a pixel clock and blanking, so
+    Hz = pixel_clock / (htotal * vtotal). On the measured fixture that is
+    148500 kHz / (2200 * 1125) = 60.000 Hz, which agrees with gamescopectl's
+    ValidRefreshRates: 60."""
+    pixclk_10khz = block[0] | (block[1] << 8)
+    if pixclk_10khz == 0:
+        return None                       # 0 here means "not a detailed timing"
+    h_active = block[2] | ((block[4] & 0xF0) << 4)
+    h_blank = block[3] | ((block[4] & 0x0F) << 8)
+    v_active = block[5] | ((block[7] & 0xF0) << 4)
+    v_blank = block[6] | ((block[7] & 0x0F) << 8)
+    h_total = h_active + h_blank
+    v_total = v_active + v_blank
+    if h_active <= 0 or v_active <= 0 or h_total <= 0 or v_total <= 0:
+        return None
+    return {
+        "width": h_active,
+        "height": v_active,
+        "pixel_clock_khz": pixclk_10khz * 10,
+        "interlaced": bool(block[17] & 0x80),
+        "refresh_hz": round(pixclk_10khz * 10000 / float(h_total * v_total), 3),
+    }
+
+
+def _cta_data_blocks(ext):
+    """Yield (tag, extended_tag_or_None, payload) for each CTA-861 data block in
+    a 128-byte extension block. Bails out silently on any malformed length -- a
+    truncated block must not be able to produce a confident answer."""
+    if len(ext) < 128 or ext[0] != 0x02:
+        return
+    dtd_off = ext[2]
+    if dtd_off < 4 or dtd_off > 127:      # 0 = no DTDs and no data blocks
+        return
+    i = 4
+    while i < dtd_off:
+        header = ext[i]
+        tag = header >> 5
+        length = header & 0x1F
+        if length == 0 or i + 1 + length > dtd_off:
+            return
+        payload = ext[i + 1:i + 1 + length]
+        yield (tag, payload[0] if (tag == 7 and payload) else None, payload)
+        i += 1 + length
+
+
+def _edid_capabilities(blob):
+    """CAPABILITY flags from the CTA-861 extension blocks.
+
+    EVERY KEY HERE IS A CAPABILITY, NOT A STATE. hdr_supported True means the
+    panel says it CAN do HDR and says nothing about whether HDR is on. Returns {}
+    when there is no extension block to read -- "we saw no claim" is not the same
+    as "the display cannot", so callers must distinguish absent from False.
+
+    Two bugs lived here until a second real fixture (a Hisense 4K HDR TV) was
+    added as a positive control, because against the SDR Lenovo panel both
+    branches were only ever observed NOT firing: the colorimetry bitmap is
+    payload[1] (payload[2] is the metadata profile), and the HDMI Forum OUI is
+    stored LSB-first, so bytes d8 5d c4 are 0xC45DD8 and not 0x00D85D."""
+    n_ext = blob[126] if len(blob) >= 127 else 0
+    caps = {}
+    seen_cta = False
+    for k in range(n_ext):
+        ext = blob[128 * (k + 1):128 * (k + 2)]
+        if len(ext) < 128 or ext[0] != 0x02:
+            continue
+        seen_cta = True
+        for tag, ext_tag, payload in _cta_data_blocks(ext):
+            if tag == 7 and ext_tag == 0x06:            # HDR Static Metadata
+                eotf = payload[1] if len(payload) > 1 else 0
+                caps["hdr_supported"] = bool(eotf & 0x06)   # ST2084 / HLG bits
+            elif tag == 3 and len(payload) >= 3:        # Vendor Specific
+                oui = payload[0] | (payload[1] << 8) | (payload[2] << 16)
+                if oui == 0x00001A and len(payload) >= 8:   # AMD FreeSync range
+                    caps["vrr_min_hz"] = payload[6]
+                    caps["vrr_max_hz"] = payload[7]
+                    caps["vrr_supported"] = True
+                elif oui == 0xC45DD8 and len(payload) >= 10:  # HDMI Forum VSDB
+                    vmin = payload[8] & 0x3F
+                    vmax = ((payload[8] & 0xC0) << 2) | payload[9]
+                    if vmin and vmax:
+                        caps["vrr_min_hz"] = vmin
+                        caps["vrr_max_hz"] = vmax
+                        caps["vrr_supported"] = True
+    if seen_cta:
+        caps.setdefault("hdr_supported", False)
+        caps.setdefault("vrr_supported", False)
+    return caps
+
+
+def _parse_edid(blob):
+    """Parse EDID BYTES -> dict, or None if this is not a usable EDID. Requires
+    the 8-byte magic header AND a valid base-block checksum; a bad checksum is a
+    REJECT, not a warning."""
+    if not blob or len(blob) < 128:
+        return None
+    blob = bytes(blob)
+    if blob[:8] != _EDID_HEADER:
+        return None
+    if sum(blob[:128]) & 0xFF:
+        return None                       # base block checksum is 0 mod 256
+    out = {}
+    mfr = _edid_manufacturer((blob[8] << 8) | blob[9])
+    if mfr:
+        out["manufacturer"] = mfr
+    serial_num = blob[12] | (blob[13] << 8) | (blob[14] << 16) | (blob[15] << 24)
+    if serial_num:
+        out["serial_number"] = serial_num
+    week, year = blob[16], blob[17]
+    if year:
+        out["year"] = 1990 + year
+        if 1 <= week <= 54:
+            out["week"] = week
+    out["edid_version"] = "%d.%d" % (blob[18], blob[19])
+    # The four 18-byte descriptors. The first detailed timing is the PREFERRED
+    # one (EDID 1.3+ requires that); the rest are a mix of timings and 0x00 00 00
+    # <tag> display descriptors.
+    for off in (54, 72, 90, 108):
+        block = blob[off:off + 18]
+        if len(block) < 18:
+            break
+        if block[0] or block[1]:
+            timing = _edid_detailed_timing(block)
+            if timing and "preferred" not in out:
+                out["preferred"] = timing
+            continue
+        tag = block[3]
+        if tag == _EDID_TAG_NAME:
+            name = _edid_text(block)
+            if name:
+                out["name"] = name
+        elif tag == _EDID_TAG_SERIAL:
+            text = _edid_text(block)
+            if text:
+                out["serial"] = text
+        elif tag == _EDID_TAG_RANGE and block[5] and block[6]:
+            # The panel's supported vertical refresh RANGE. Capability again.
+            out["vrefresh_min_hz"] = block[5]
+            out["vrefresh_max_hz"] = block[6]
+    out.update(_edid_capabilities(blob))
+    return out
+
+
+def _edid_summary(blob):
+    """The wire fields one connector's EDID contributes, or {} when unusable.
+
+    Nothing here is called `refresh` or `resolution` unqualified, because EDID
+    cannot answer those questions -- see the module note."""
+    e = _parse_edid(blob)
+    if e is None:
+        return {}
+    out = {}
+    if "name" in e:
+        out["monitor_name"] = e["name"]
+    if "manufacturer" in e:
+        out["monitor_vendor"] = e["manufacturer"]
+    if "serial" in e:
+        out["monitor_serial"] = e["serial"]
+    elif "serial_number" in e:
+        out["monitor_serial"] = str(e["serial_number"])
+    if "year" in e:
+        out["monitor_year"] = e["year"]
+    p = e.get("preferred")
+    if p:
+        out["preferred_width"] = p["width"]
+        out["preferred_height"] = p["height"]
+        out["preferred_refresh_hz"] = round(p["refresh_hz"], 1)
+    for k in ("hdr_supported", "vrr_supported", "vrr_min_hz", "vrr_max_hz",
+              "vrefresh_min_hz", "vrefresh_max_hz"):
+        if k in e:
+            out[k] = e[k]
+    return out
+
+
+# --- DRM sysfs: the headless floor -----------------------------------------
+
+
+def _drm_connector_dir(name):
+    """Path of the flat DRM connector directory for `name` ("DP-1" ->
+    /sys/class/drm/card1-DP-1), or None. Matched with an anchored regex rather
+    than a glob so a connector name can never behave like a pattern."""
+    want = re.compile(r"card\d+-" + re.escape(name) + r"$")
+    try:
+        for entry in sorted(os.listdir(_DRM_DIR)):
+            if want.match(entry):
+                return os.path.join(_DRM_DIR, entry)
+    except OSError:
+        return None
+    return None
+
+
+def _drm_text(path):
+    """Stripped contents of a one-line sysfs file, or None (never raises)."""
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+_DRM_MODE_RE = re.compile(r"^\d{2,5}x\d{2,5}i?$")
+
+
+def _drm_modes(path):
+    """The connector's mode LIST from sysfs, deduped in order, or [].
+
+    THIS IS NOT THE CURRENT MODE and it carries no refresh rate whatsoever: the
+    measured DP-1 lists "1920x1080" four times and "1920x1080i" twice. It ships
+    as `supported_modes` for that reason."""
+    raw = _drm_text(os.path.join(path, "modes"))
+    if not raw:
+        return []
+    seen, out = set(), []
+    for line in raw.splitlines():
+        m = line.strip()
+        if not _DRM_MODE_RE.match(m) or m in seen:
+            continue
+        seen.add(m)
+        out.append(m)
+        if len(out) >= 24:                # a TV can list dozens; cap the payload
+            break
+    return out
+
+
+def _drm_display_facts(name):
+    """Everything one connector can be asked for with no session at all:
+    connected/enabled, the EDID identity + capabilities, and the mode list."""
+    path = _drm_connector_dir(name)
+    if path is None:
+        return {}
+    facts = {}
+    status = _drm_text(os.path.join(path, "status"))
+    if status in ("connected", "disconnected"):
+        facts["connected"] = status == "connected"
+    enabled = _drm_text(os.path.join(path, "enabled"))
+    if enabled in ("enabled", "disabled"):
+        facts["enabled"] = enabled == "enabled"
+    try:
+        with open(os.path.join(path, "edid"), "rb") as f:
+            blob = f.read(2048)           # base block + up to 15 extensions
+    except OSError:
+        blob = b""
+    facts.update(_edid_summary(blob))
+    modes = _drm_modes(path)
+    if modes:
+        facts["supported_modes"] = modes
+    return facts
+
+
+# --- gamescope: the only source of CURRENT mode in Game Mode ----------------
+
+
+class _X11Client:
+    """Read-only X11 client: connect to a display socket and read CARD32 root
+    properties. Pure stdlib (socket + struct), ~90 lines, because xprop and
+    xrandr are not guaranteed present on stock SteamOS and the agent may not add
+    a dependency to read a number.
+
+    Constructing it connects and performs the setup handshake, so it RAISES on
+    anything unexpected; every call site wraps it. Always .close() it."""
+
+    _CONNECT_TIMEOUT_S = 2.0
+
+    def __init__(self, display_num):
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.settimeout(self._CONNECT_TIMEOUT_S)
+        self.s.connect(os.path.join(_X11_UNIX_DIR, "X%d" % display_num))
+        name, data = self._xauth(display_num)
+        req = struct.pack("<BxHHHH2x", 0x6C, 11, 0, len(name), len(data))
+        req += name + b"\x00" * self._pad(len(name))
+        req += data + b"\x00" * self._pad(len(data))
+        self.s.sendall(req)
+        head = self._recv(8)
+        success, _, _, _, extra = struct.unpack("<BBHHH", head)
+        body = self._recv(extra * 4)
+        if success != 1:
+            raise OSError("X11 setup refused")
+        # Fixed part of the setup reply is 32 bytes, then the padded vendor
+        # string, then nformats * 8 bytes of FORMAT, then the first SCREEN.
+        (_rel, _rbase, _rmask, _motion, vlen, _maxreq,
+         _nscreens, nformats) = struct.unpack_from("<IIIIHHBB", body, 0)
+        off = 32 + vlen + self._pad(vlen) + nformats * 8
+        # SCREEN: root, default_colormap, white, black, input_masks (5 CARD32),
+        # then width_in_pixels / height_in_pixels as CARD16. The X screen size of
+        # gamescope's server 0 IS its output size, which is where the current
+        # resolution comes from -- no xrandr needed.
+        (self.root, _cmap, _white, _black, _masks,
+         self.width, self.height) = struct.unpack_from("<IIIIIHH", body, off)
+
+    @staticmethod
+    def _pad(n):
+        return (4 - (n % 4)) % 4
+
+    def _recv(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.s.recv(n - len(buf))
+            if not chunk:
+                raise OSError("short read")
+            buf += chunk
+        return buf
+
+    @staticmethod
+    def _xauth(display_num):
+        """(name, data) for this display from the Xauthority file, or empty. The
+        gamescope XWayland accepted an unauthenticated connection on the measured
+        box; this is here so an authenticated one still works."""
+        path = os.environ.get("XAUTHORITY") or os.path.expanduser("~/.Xauthority")
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return (b"", b"")
+        def field(buf, at):
+            """(bytes, next_offset) for one big-endian length-prefixed field."""
+            (ln,) = struct.unpack_from(">H", buf, at)
+            return buf[at + 2:at + 2 + ln], at + 2 + ln
+
+        i = 0
+        try:
+            while i + 2 <= len(raw):
+                i += 2                                     # family (CARD16)
+                _addr, i = field(raw, i)
+                number, i = field(raw, i)
+                name, i = field(raw, i)
+                data, i = field(raw, i)
+                if number.decode("ascii", "replace") == str(display_num):
+                    return (name, data)
+        except (struct.error, IndexError):
+            return (b"", b"")
+        return (b"", b"")
+
+    def _intern_atom(self, name):
+        """Atom id for an EXISTING atom (only-if-exists=1), or None."""
+        raw = name.encode("ascii")
+        pad = self._pad(len(raw))
+        self.s.sendall(struct.pack("<BBHHxx", 16, 1, 2 + (len(raw) + pad) // 4,
+                                   len(raw)) + raw + b"\x00" * pad)
+        head = self._recv(32)             # reply and error are both 32 bytes
+        if head[0] != 1:
+            return None
+        (atom,) = struct.unpack_from("<I", head, 8)
+        return atom or None
+
+    def read_cardinal(self, name):
+        """First CARD32 of a 32-bit root-window property, or None when the atom
+        does not exist / the property is unset / it is not 32-bit. Absent is
+        never coerced to 0 -- for HDR and VRR that difference is the whole
+        point."""
+        atom = self._intern_atom(name)
+        if atom is None:
+            return None
+        self.s.sendall(struct.pack("<BBHIIIII", 20, 0, 6, self.root, atom,
+                                   0, 0, 1024))
+        head = self._recv(32)
+        if head[0] != 1:
+            return None
+        fmt = head[1]
+        (rlen,) = struct.unpack_from("<I", head, 4)
+        (ptype, _after, nitems) = struct.unpack_from("<III", head, 8)
+        body = self._recv(rlen * 4)
+        if ptype == 0 or fmt != 32 or nitems < 1:
+            return None
+        (val,) = struct.unpack_from("<I", body, 0)
+        return val
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def _gamescope_x11():
+    """gamescope's PRIMARY XWayland as an _X11Client, or None.
+
+    gamescope runs --xwayland-count 2 and publishes the display atoms ONLY on
+    server 0; on server 1 every atom reads not-found (verified both ways). So do
+    not hardcode :0 -- open each socket, ask it for GAMESCOPE_XWAYLAND_SERVER_ID
+    and require 0. A Plasma XWayland has no such atom and is therefore skipped,
+    which is also what keeps this from reading a desktop session's numbers."""
+    try:
+        entries = sorted(os.listdir(_X11_UNIX_DIR))
+    except OSError:
+        return None
+    for entry in entries:
+        if not (entry.startswith("X") and entry[1:].isdigit()):
+            continue
+        client = None
+        try:
+            client = _X11Client(int(entry[1:]))
+            if client.read_cardinal("GAMESCOPE_XWAYLAND_SERVER_ID") == 0:
+                return client
+        except Exception:
+            pass
+        if client is not None:
+            client.close()
+    return None
+
+
+_GAMESCOPECTL_FIELD_RE = re.compile(r"^\s*-\s*([A-Za-z][A-Za-z ]*):\s*(\S.*?)\s*$")
+
+
+def _gamescopectl_display_info(gs_socket):
+    """The `gamescopectl` (no arguments) gamescope_control block, as a dict.
+
+    VERBATIM from the box:
+        gamescope_control info:
+          - Connector Name: DP-1
+          - Display Make: Lenovo Group Limited
+          - Display Model: TIO24Gen3T
+          - Display Flags: 0x0
+          - ValidRefreshRates: 60
+
+    ValidRefreshRates is the list of rates the compositor will ACCEPT, not the
+    one it is driving -- it ships as `supported_refresh_hz`. Display Flags is
+    likewise pure capability (gamescope-control.xml names the bits
+    internal_display / supports_hdr / supports_vrr), and the X11 atoms answer
+    capability more directly, so the flags are read past rather than decoded.
+
+    Run with the bare binary and NO arguments: `gamescopectl <convar> <value>` is
+    a live write surface."""
+    if not shutil.which("gamescopectl"):
+        return {}
+    env = _user_env()
+    env["WAYLAND_DISPLAY"] = gs_socket
+    try:
+        r = subprocess.run(["gamescopectl"], capture_output=True,
+                           timeout=_GAMESCOPECTL_TIMEOUT_S, env=env)
+    except Exception:
+        return {}
+    if r.returncode != 0:
+        return {}
+    text = (r.stdout or b"").decode("utf-8", "replace")
+    fields = {}
+    for line in text.splitlines():
+        m = _GAMESCOPECTL_FIELD_RE.match(line)
+        if m:
+            fields[m.group(1).strip()] = m.group(2)
+    out = {}
+    conn = fields.get("Connector Name")
+    if conn and re.match(r"^[A-Za-z]+(-[A-Za-z0-9]+)*$", conn):
+        out["connector"] = conn
+    make = fields.get("Display Make")
+    if make:
+        out["monitor_make"] = make[:64]
+    model = fields.get("Display Model")
+    if model:
+        out["monitor_model"] = model[:64]
+    rates = []
+    for tok in re.split(r"[,\s]+", fields.get("ValidRefreshRates", "")):
+        try:
+            hz = int(tok)
+        except ValueError:
+            continue
+        if 10 <= hz <= 1000 and hz not in rates:
+            rates.append(hz)
+    if rates:
+        out["supported_refresh_hz"] = sorted(rates)
+    return out
+
+
+def _gamescope_display_facts(gs_socket):
+    """Live display facts from a running gamescope. {} when it will not answer.
+
+    STATE comes from the atoms; CAPABILITY from the atoms and gamescopectl. Each
+    field is set only when its own read succeeded, so a half-answering compositor
+    yields half a block rather than a block with invented halves."""
+    facts = {}
+    client = _gamescope_x11()
+    if client is not None:
+        try:
+            if client.width and client.height:
+                facts["current_width"] = client.width
+                facts["current_height"] = client.height
+            hz = client.read_cardinal("GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK")
+            if hz is not None and 10 <= hz <= 1000:
+                facts["current_refresh_hz"] = float(hz)
+            vrr = client.read_cardinal("GAMESCOPE_VRR_FEEDBACK")
+            if vrr is not None:
+                facts["vrr_active"] = bool(vrr)
+            vrr_cap = client.read_cardinal("GAMESCOPE_VRR_CAPABLE")
+            if vrr_cap is not None:
+                facts["vrr_supported"] = bool(vrr_cap)
+            hdr_cap = client.read_cardinal("GAMESCOPE_DISPLAY_SUPPORTS_HDR")
+            if hdr_cap is not None:
+                facts["hdr_supported"] = bool(hdr_cap)
+            # ONLY this atom. GAMESCOPE_DISPLAY_HDR_ENABLED is Steam's request
+            # and read 1 on an SDR panel -- see the module note. Absent here
+            # means unknown, and unknown means the key is simply not sent.
+            hdr_on = client.read_cardinal("GAMESCOPE_HDR_OUTPUT_FEEDBACK")
+            if hdr_on is not None:
+                facts["hdr_active"] = bool(hdr_on)
+        except Exception:
+            pass
+        finally:
+            client.close()
+    facts.update(_gamescopectl_display_info(gs_socket))
+    return facts
+
+
+# --- kscreen-doctor: the desktop (Plasma) path ------------------------------
+
+
+def _kscreen_mode(output):
+    """current_* fields for one kscreen-doctor output object, or {}.
+
+    The current mode is the entry in `modes` whose id equals `currentModeId`;
+    anything else in that list is a mode the panel merely offers. Refresh is
+    range-checked, and a value over 1000 is read as mHz -- libkscreen has
+    reported both units and an unrecognised number is dropped, not guessed."""
+    cur = output.get("currentModeId")
+    modes = output.get("modes")
+    if cur is None or not isinstance(modes, list):
+        return {}
+    for m in modes:
+        if not isinstance(m, dict) or str(m.get("id")) != str(cur):
+            continue
+        out = {}
+        size = m.get("size")
+        if isinstance(size, dict):
+            w, h = size.get("width"), size.get("height")
+            if (isinstance(w, int) and isinstance(h, int)
+                    and not isinstance(w, bool) and not isinstance(h, bool)
+                    and w > 0 and h > 0):
+                out["current_width"] = w
+                out["current_height"] = h
+        hz = m.get("refreshRate")
+        if isinstance(hz, (int, float)) and not isinstance(hz, bool):
+            hz = float(hz)
+            if hz > 1000.0:
+                hz = hz / 1000.0
+            if 10.0 <= hz <= 1000.0:
+                out["current_refresh_hz"] = round(hz, 2)
+        return out
+    return {}
+
+
+def _kscreen_display_facts(connector):
+    """Live display facts from a Plasma session via `kscreen-doctor --json`, or {}.
+
+    THE EXIT CODE IS NOT CONSULTED, deliberately. MEASURED in Game Mode: the
+    binary exists and SIGABRTs (rc=134, "the monitored command dumped core") with
+    ZERO bytes on stdout and zero on stderr. `_couch_run` reports that faithfully,
+    but a crash and "this box has no displays" would look identical to any caller
+    that trusted a status code, so the gate is non-empty output that PARSES into
+    an outputs list. Everything else degrades to {}.
+
+    UNVERIFIED: the success path. kscreen-doctor was never observed answering --
+    the owner's box was in Game Mode throughout. The shape below is libkscreen's
+    documented JSON, and the parser rejects anything it does not recognise."""
+    if not shutil.which("kscreen-doctor"):
+        return {}
+    now = time.monotonic()
+    last = _KSCREEN_FAILED_AT["t"]
+    if last and now - last < _KSCREEN_BACKOFF_S:
+        return {}
+    r = _couch_run(["kscreen-doctor", "--json"],
+                   timeout=_KSCREEN_TIMEOUT_S, max_out=None)
+    data = None
+    text = (r.get("stdout") or "").strip()
+    if text:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+    outputs = data.get("outputs") if isinstance(data, dict) else None
+    if not isinstance(outputs, list) or not outputs:
+        _KSCREEN_FAILED_AT["t"] = now
+        return {}
+    _KSCREEN_FAILED_AT["t"] = 0.0
+    outputs = [o for o in outputs if isinstance(o, dict)]
+    match = None
+    for o in outputs:
+        if o.get("name") == connector:
+            match = o
+            break
+    if match is None:
+        for o in outputs:
+            if o.get("enabled") and o.get("connected"):
+                match = o
+                break
+    if match is None:
+        return {}
+    facts = {}
+    if isinstance(match.get("connected"), bool):
+        facts["connected"] = match["connected"]
+    if isinstance(match.get("enabled"), bool):
+        facts["enabled"] = match["enabled"]
+    facts.update(_kscreen_mode(match))
+    return facts
+
+
+# --- audio: default sink (OUT) and default source (IN) ----------------------
+
+
+_WPCTL_PROP_RE = re.compile(
+    r'^[\s*|│├└-]*(node\.name|node\.description)\s*=\s*"?(.*?)"?\s*$')
+
+
+def _wpctl_default_node(token):
+    """{name, description} for @DEFAULT_AUDIO_SINK@ / @DEFAULT_AUDIO_SOURCE@, or
+    None. `wpctl inspect` is used rather than parsing the `wpctl status` tree:
+    the tree marks defaults with a bare '*' in a box-drawing table, while inspect
+    hands back the node's own properties. VERBATIM from the box:
+
+        * node.description = "Built-in Audio Analog Stereo"
+        * node.name = "alsa_output.pci-0000_00_1f.3.analog-stereo"
+
+    `token` is one of two literals chosen HERE; no client input reaches this argv.
+    Missing wpctl, no pipewire, or no default device all return None, which makes
+    the field absent -- never an empty string the app would render as a device."""
+    wp = shutil.which("wpctl")
+    if wp is None:
+        return None
+    try:
+        r = subprocess.run([wp, "inspect", token], capture_output=True,
+                           timeout=_WPCTL_TIMEOUT_S, env=_user_env())
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = {}
+    for line in (r.stdout or b"").decode("utf-8", "replace").splitlines():
+        m = _WPCTL_PROP_RE.match(line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if not val:
+            continue
+        out.setdefault("name" if key == "node.name" else "description",
+                       val[:128])
+    return out or None
+
+
+def _audio_info_uncached():
+    """{output, input, output_name, input_name} or None.
+
+    `output`/`input` are what a human reads (node.description); the raw node
+    names ride along as additive extras for bug reports. When a node has no
+    description its NAME is used rather than dropping the device -- the name is
+    still a true identity, and an unnamed default device is worse than an ugly
+    one. Nothing is invented: a device we could not read at all is simply absent.
+    """
+    out = {}
+    for token, label in (("@DEFAULT_AUDIO_SINK@", "output"),
+                         ("@DEFAULT_AUDIO_SOURCE@", "input")):
+        node = _wpctl_default_node(token)
+        if not node:
+            continue
+        text = node.get("description") or node.get("name")
+        if text:
+            out[label] = text
+        if node.get("name"):
+            out[label + "_name"] = node["name"]
+    return out or None
+
+
+def audio_info():
+    """The default audio OUT and IN devices, TTL-memoized. None when neither
+    could be read, so the key is omitted rather than sent empty.
+
+    Both directions on purpose, and they are frequently DIFFERENT devices: on the
+    measured box the default sink was the built-in analog output while the
+    default source was the monitor's USB microphone."""
+    now = time.monotonic()
+    with _DISPLAY_LOCK:
+        c = _AUDIO_CACHE
+        if c["at"] and now - c["at"] <= _DISPLAY_TTL:
+            return c["val"]
+    try:
+        val = _audio_info_uncached()
+    except Exception:
+        val = None                        # a readout may never break /api/status
+    with _DISPLAY_LOCK:
+        _AUDIO_CACHE["val"] = val
+        _AUDIO_CACHE["at"] = now
+    return val
+
+
+# --- composition ------------------------------------------------------------
+#
+# The probes above each return FLAT internal facts (current_*, preferred_*,
+# hdr_supported, ...). _display_wire() turns whatever survived into the one wire
+# shape, which is deliberately NESTED so a reader cannot mistake a capability for
+# a state: `mode` is what is being scanned out, `preferred_mode` is what the
+# panel would like, `hdr.supported` vs `hdr.enabled`, `vrr.supported` vs
+# `vrr.active`. Nothing back-fills across that line. On most boxes the two are
+# equal, which is exactly why conflating them looks right everywhere except the
+# box where it is wrong.
+
+
+def _mode_obj(facts, prefix):
+    """{width, height, refresh_hz?} from `<prefix>_width/_height/_refresh_hz`, or
+    None. Requires BOTH dimensions: a mode with no size is not a mode, and the
+    app's DisplayMode type says so too. Refresh rides along only when read."""
+    w, h = facts.get(prefix + "_width"), facts.get(prefix + "_height")
+    if not isinstance(w, int) or not isinstance(h, int) or w <= 0 or h <= 0:
+        return None
+    mode = {"width": w, "height": h}
+    hz = facts.get(prefix + "_refresh_hz")
+    if isinstance(hz, (int, float)):
+        mode["refresh_hz"] = round(float(hz), 2)
+    return mode
+
+
+def _display_wire(facts, name, mode_source):
+    """Flat probe facts -> the /api/display-info `display` object."""
+    out = {"connector": name,
+           "internal": name.startswith(_INTERNAL_OUTPUT_PREFIXES)}
+    for src, dst in (("connected", "connected"), ("enabled", "enabled"),
+                     ("monitor_name", "monitor"), ("monitor_serial", "serial"),
+                     ("monitor_year", "year"),
+                     ("supported_modes", "supported_modes"),
+                     ("supported_refresh_hz", "refresh_rates_hz")):
+        if src in facts:
+            out[dst] = facts[src]
+    # `make` is the human-readable manufacturer when a compositor handed one over
+    # ("Lenovo Group Limited"); EDID itself only carries the 3-letter PNP id
+    # ("LEN"), which is a poor label but a true one, so it is the fallback rather
+    # than an omission.
+    make = facts.get("monitor_make") or facts.get("monitor_vendor")
+    if make:
+        out["make"] = make
+    mode = _mode_obj(facts, "current")
+    if mode:
+        out["mode"] = mode
+        # Extra, additive: WHICH probe produced `mode`, so a bug report says
+        # where the number came from instead of guessing. Omitted rather than
+        # sent as null if a caller ever composes a mode without one.
+        if mode_source:
+            out["mode_source"] = mode_source
+    preferred = _mode_obj(facts, "preferred")
+    if preferred:
+        out["preferred_mode"] = preferred
+    hdr, vrr = {}, {}
+    if "hdr_supported" in facts:
+        hdr["supported"] = facts["hdr_supported"]
+    if "hdr_active" in facts:
+        hdr["enabled"] = facts["hdr_active"]
+    if "vrr_supported" in facts:
+        vrr["supported"] = facts["vrr_supported"]
+    if "vrr_active" in facts:
+        vrr["active"] = facts["vrr_active"]
+    for key in ("vrr_min_hz", "vrr_max_hz"):
+        if key in facts:
+            vrr[key[4:]] = facts[key]          # vrr_min_hz -> min_hz
+    if hdr:
+        out["hdr"] = hdr
+    if vrr:
+        out["vrr"] = vrr
+    return out
+
+
+def _infer_inactive(facts):
+    """The ONE inference this module makes, in place.
+
+    A panel that MEASURABLY cannot do HDR is certainly not displaying HDR, so an
+    explicit `hdr_supported: False` settles `hdr_active: False` (same for VRR).
+    It fires only on an explicit False -- an ABSENT capability stays absent, so
+    "we could not tell" never turns into "off". That asymmetry is the whole
+    reason the gamescope probe refuses to read GAMESCOPE_DISPLAY_HDR_ENABLED:
+    the honest answer to "is HDR on" is usually silence."""
+    for cap, state in (("hdr_supported", "hdr_active"),
+                       ("vrr_supported", "vrr_active")):
+        if state not in facts and facts.get(cap) is False:
+            facts[state] = False
+    return facts
+
+
+def _display_info_uncached():
+    """Assemble one display's facts from whichever probes answered. None when
+    there is no display to describe at all."""
+    # Which session is live decides who can be asked for the CURRENT mode. The
+    # gamescope socket is liveness-filtered by _wayland_display_sockets(), which
+    # flocks the companion .lock file -- a leftover socket FILE outlives Game
+    # Mode and reading it as a live compositor already cost this project a
+    # release (2.9.56). Note that helper leans toward "assume live", so nothing
+    # here is gated on the socket: every field still requires its OWN probe to
+    # have succeeded.
+    gs = [s for s in _wayland_display_sockets() if s.startswith("gamescope-")]
+    live, mode_source = {}, None
+    if gs:
+        live, mode_source = _gamescope_display_facts(gs[0]), "gamescope"
+    # gamescope names the connector it is driving; trust that over our own guess,
+    # so on a multi-display box the EDID we read belongs to the panel whose
+    # refresh rate we are about to report.
+    active = _active_output()
+    name = live.pop("connector", None) or (active or {}).get("name")
+    if not name:
+        return None
+    if not gs:
+        live, mode_source = _kscreen_display_facts(name), "kscreen"
+
+    facts = _drm_display_facts(name)
+    # gamescopectl's Display Model backs up the EDID name; it never overrides it,
+    # because the EDID 0xFC descriptor is the source the card labels the monitor.
+    model = live.pop("monitor_model", None)
+    if model:
+        facts.setdefault("monitor_name", model)
+    facts.update(live)
+
+    return _display_wire(_infer_inactive(facts), name, mode_source)
+
+
+def display_info():
+    """The /api/status "display" block, TTL-memoized. None on a headless box."""
+    now = time.monotonic()
+    with _DISPLAY_LOCK:
+        c = _DISPLAY_CACHE
+        if c["at"] and now - c["at"] <= _DISPLAY_TTL:
+            return c["val"]
+    try:
+        val = _display_info_uncached()
+    except Exception:
+        val = None                        # a readout may never break /api/status
+    with _DISPLAY_LOCK:
+        _DISPLAY_CACHE["val"] = val
+        _DISPLAY_CACHE["at"] = now
+    return val
+
+
+def display_info_available():
+    """Boot-time caps hint for `display_info`: this box has something to report.
+    display_info() / audio_info() remain the live authority (per-field
+    probe-and-appear), so this only tells an old-app-new-agent pair whether the
+    card is worth showing at all. Never raises; False on anything unexpected."""
+    try:
+        if shutil.which("wpctl"):
+            return True
+        return _drm_connector_dir_any()
+    except Exception:
+        return False
+
+
+def _drm_connector_dir_any():
+    """True when _DRM_DIR holds at least one flat connector directory."""
+    want = re.compile(r"card\d+-\S+$")
+    try:
+        return any(want.match(e) for e in os.listdir(_DRM_DIR))
+    except OSError:
+        return False
+
+
+def display_payload():
+    """The GET /api/display-info body. `available` is False (rather than a 404)
+    when nothing could be read, so the app can tell "this agent is too old" from
+    "this box had nothing to say"."""
+    display = display_info()
+    audio = audio_info()
+    out = {"available": bool(display or audio)}
+    if display:
+        out["display"] = display
+    if audio:
+        out["audio"] = audio
+    return out
+
+
+def mock_display_info():
+    """--mock display block, so the Console card is exercisable with no hardware.
+
+    Deliberately NOT the measured Lenovo panel. The current mode (120 Hz) differs
+    from the preferred mode (60 Hz) so a card that conflates the capability with
+    the state is visibly WRONG in the harness rather than accidentally right, and
+    hdr.enabled / vrr.active are opposite so both state rows render."""
+    return {
+        "connector": "HDMI-A-1",
+        "internal": False,
+        "connected": True,
+        "enabled": True,
+        "monitor": "OLED65C9PUA",
+        "make": "LG Electronics",
+        "serial": "912NTVGCM123",
+        "year": 2019,
+        "mode": {"width": 3840, "height": 2160, "refresh_hz": 120.0},
+        "mode_source": "gamescope",
+        "preferred_mode": {"width": 3840, "height": 2160, "refresh_hz": 60.0},
+        "refresh_rates_hz": [60, 100, 120],
+        "supported_modes": ["3840x2160", "2560x1440", "1920x1080", "1280x720"],
+        "hdr": {"supported": True, "enabled": True},
+        "vrr": {"supported": True, "active": False, "min_hz": 48,
+                "max_hz": 120},
+    }
+
+
+def mock_audio_info():
+    """--mock audio block. Output and input are DIFFERENT devices (as they were
+    on the real box), and the input description is the 52-character string
+    measured there: a label/value row is exactly where a long value shoves its
+    siblings off a phone screen, and a mock with two short identical strings
+    would prove nothing about that."""
+    return {
+        "output": "LG TV SSCR2 Digital Stereo (HDMI)",
+        "output_name": "alsa_output.pci-0000_00_1f.3.hdmi-stereo",
+        "input": "Thinkcentre TIO24Gen3Touch for USB-audio Analog Stereo",
+        "input_name": "alsa_input.usb-Lenovo_Thinkcentre_TIO24Gen3Touch_for_"
+                      "USB-audio_000000000000-00.analog-stereo",
+    }
+
+
+def mock_display_payload():
+    return {"available": True, "display": mock_display_info(),
+            "audio": mock_audio_info()}
+
+
+# ---------------------------------------------------------------------------
 # Stream host detection (GET /api/stream-host) — CouchOS roadmap phase 4a.
 #
 # DETECT ONLY: is a Steam Remote Play session being served BY this box right now?
@@ -12071,12 +14251,20 @@ def render_pair_page(token, port):
     url_html = (pair_url.replace("&", "&amp;").replace("<", "&lt;")
                         .replace(">", "&gt;"))  # safe HTML text
     # One "get the app first" QR for a fresh installer who doesn't have
-    # Couchside yet. It points at couchside.tv, whose hero already carries BOTH
-    # store badges, so the phone picks its own store instead of the box making
-    # someone aim a camera at the right one of two codes. A single small canvas
-    # also leaves the one-screen layout roomier. The big QR above stays the
-    # pairing deep link for someone who already has the app.
-    get_js = json.dumps("https://couchside.tv/#get")
+    # Couchside yet. ONE code carrying BOTH stores, so the phone picks its own
+    # instead of the box making someone aim a camera at the right one of two
+    # codes. A single small canvas also leaves the one-screen layout roomier.
+    # The big QR above stays the pairing deep link for someone who has the app.
+    #
+    # /get/ is a DEDICATED page: the two store links and nothing else. It used
+    # to point at couchside.tv/#get, which is an anchor into the marketing home
+    # page — nav, pitch, footer, the agent installer, somewhere to wander off
+    # to. That is the wrong page for the only person who ever sees this code:
+    # someone standing in front of a TV, phone in hand, who has already decided.
+    # Keep this in sync with STORE_CODE in app/lib/pairLink.ts, which gives this
+    # exact string the friendly "that's the install code" answer when it is
+    # scanned into the app's pairing scanner by mistake.
+    get_js = json.dumps("https://couchside.tv/get/")
     return (
         "<!doctype html><html lang=\"en\"><head>"
         "<meta charset=\"utf-8\">"
@@ -12587,8 +14775,14 @@ class Handler(BaseHTTPRequestHandler):
                     # updated (owner opted in) or only --user ones — so it can
                     # prompt "enable system updates on your box" when False.
                     elevated = True if self.mock else flatpak_can_elevate()
+                    # running: is our update child still executing? The app polls
+                    # THIS for completion, not count==0 (KI-036: an EOL runtime
+                    # pins count above zero, so count==0 is unreachable). Mock is
+                    # never mid-update, so False.
+                    running = False if self.mock else flatpak_running()
                     self._send(200, {"available": True, "count": len(pending),
-                                     "updates": pending, "elevated": elevated},
+                                     "updates": pending, "elevated": elevated,
+                                     "running": running},
                                started)
             elif path == "/api/update/flatpak/log":
                 # Progress transcript of a running/last flatpak update. CONSTANT
@@ -12659,6 +14853,21 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(404, {"error": "not found"}, started)
                 else:
                     self._send(200, {"devices": devs}, started)
+            elif path == "/api/display-info":
+                # READ-ONLY description of the panel this box is driving plus the
+                # default audio devices. Distinct from /api/displays below, which
+                # is the Couch Mode output PICKER: this one answers on boxes that
+                # cannot do the handoff at all, and changes nothing.
+                #
+                # Always 200 with `available` rather than a 404, so the app can
+                # tell "this agent is too old" (404 -> route absent) from "this
+                # box had nothing readable to say" (available: false). The same
+                # payload also rides /api/status as the `display` / `audio` keys,
+                # from the same TTL-memoized probe -- one contract, one cost.
+                # Every field inside is independently optional; see the module
+                # note above display_info() for what each name may claim.
+                data = mock_display_payload() if self.mock else display_payload()
+                self._send(200, data, started)
             elif path == "/api/displays":
                 # Probe-and-appear: 404 unless this box can do the desktop->TV
                 # Game Mode handoff (SteamOS/Bazzite, 2+ outputs), so the app
@@ -12674,6 +14883,14 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(404, {"error": "not found"}, started)
                 else:
                     self._send(200, info, started)
+            elif path == "/api/player":
+                # Probe-and-appear: 404 when the tile is not deployed or found
+                # no Widevine-capable browser, so the app hides the Watch tab
+                # rather than offering a control that would open a black window.
+                if not player_available():
+                    self._send(404, {"error": "player not installed"}, started)
+                else:
+                    self._send(200, player_info(), started)
             elif path == "/api/couch-mode/status":
                 # Full ceremony job every poll (never a delta) so a phone joining
                 # mid-run catches up for free. Gated like the Couch Mode control
@@ -13726,6 +15943,66 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             # POST /api/screensaver: {"op":"start","theme"?,"tier"?} | {"op":"stop"}
+            # POST /api/player: {"op":"open","service":"max","path":"/video/..."}
+            #                   {"op":"close"}
+            #
+            # `service` and `path` are the ONLY client-supplied values, and both
+            # are settled by _pl_validate() BEFORE anything is written or
+            # launched: the id must be one the tile listed, and the path must
+            # clear that service's own pattern inside the tile. A refusal is a
+            # 404 and leaves no conf written and no process started — never a
+            # pass-through, never a sanitised near-miss (CLAUDE.md §3).
+            if path == "/api/player":
+                if not player_available():
+                    self._send(404, {"error": "player not installed"}, started)
+                    return
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(req, dict):
+                        raise ValueError
+                    op = req.get("op")
+                except (ValueError, UnicodeDecodeError):
+                    self._send(400, {"error": "json body with op required"}, started)
+                    return
+                if op == "open":
+                    try:
+                        r = player_open(req.get("service"),
+                                        req.get("path", ""),
+                                        req.get("query", ""))
+                    except ValueError:
+                        # Deliberately does NOT echo the rejected value back.
+                        self._send(404, {"error": "unknown service"}, started)
+                        return
+                    except RuntimeError as e:
+                        self._send(409, {"error": str(e)}, started)
+                        return
+                    self._send(200, r, started)
+                elif op == "hub":
+                    try:
+                        self._send(200, player_hub(), started)
+                    except RuntimeError as e:
+                        self._send(409, {"error": str(e)}, started)
+                elif op == "close":
+                    self._send(200, player_close(), started)
+                elif op in ("play", "pause", "playpause", "mute", "seek"):
+                    # Transport. The op id selects an agent-authored script by
+                    # dict lookup, and `secs` is checked for membership in a
+                    # frozen tuple before the CONSTANT is taken from that tuple,
+                    # so nothing a client sent is ever formatted into JS. A
+                    # rejected value is a 404 and no script runs.
+                    try:
+                        r = player_transport(op, secs=req.get("secs"))
+                    except ValueError:
+                        self._send(404, {"error": "not allowed"}, started)
+                        return
+                    except RuntimeError as e:
+                        self._send(409, {"error": str(e)}, started)
+                        return
+                    self._send(200, r, started)
+                else:
+                    self._send(400, {"error": "unknown op"}, started)
+                return
+
             if path == "/api/screensaver":
                 if not (SS_MOCK or screensaver_available()):
                     self._send(404, {"error": "screensaver not installed"}, started)
@@ -14452,6 +16729,9 @@ def main():
     set_screen(args.mock)
     set_power_schedule(args.mock)
     set_screensaver(args.mock)
+    # Asks the player tile for its own service list and browser verdict, so no
+    # request path has to spawn it just to answer "can this box do it".
+    set_player(args.mock)
     set_guide(args.mock)  # arms the guide-hold watcher when opted in
     osk_arm(args.mock)  # tails Steam's UI log; silent no-op without it
     set_couchmode(args.mock)  # ceremony engine honors --mock
