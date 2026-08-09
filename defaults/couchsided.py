@@ -14,6 +14,7 @@ defaults.
 import argparse
 import base64
 import calendar
+import errno
 import glob
 import hashlib
 import hmac
@@ -45,7 +46,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.72"
+VERSION = "2.9.76"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -1579,7 +1580,7 @@ def set_caps(mock):
         CAPS = {k: True for k in
                 ("gamepad", "steam", "media", "tv", "screen", "power_schedule",
                  "screensaver", "couchmode", "bigpicture", "desktop",
-                 "steamlink", "gaming",
+                 "steamlink", "gaming", "steaminstall", "utilities",
                  "streamhost", "steammenus", "boxbattery", "file_upload",
                  "session_default", "display_info", "player")}
         return
@@ -1599,6 +1600,15 @@ def set_caps(mock):
         "desktop": safe(desktop_available),
         "steamlink": safe(steamlink_available),
         "gaming": safe(gaming_available),
+        # Owned-but-uninstalled library + install action. Steam present is enough:
+        # the enumeration reads appcache/librarycache/ off the same root. Advertised
+        # as its own cap so old apps ignore it and new apps feature-detect the
+        # /api/steam/installable + install:<appid> pair (both absent pre-2.9.73).
+        "steaminstall": _steam_root() is not None,
+        # Setup -> Utilities endpoint present (per-utility availability is in the
+        # state, not the cap). The app also gates the section behind an OPT-IN pref,
+        # so a firmware-flashing surface is never shown unless the user turns it on.
+        "utilities": True,
         "streamhost": safe(streamhost_available),
         "steammenus": safe(steammenus_available),
         "boxbattery": safe(box_battery_available),
@@ -6465,6 +6475,249 @@ def discover_steam_games():
 
 
 # ---------------------------------------------------------------------------
+# Owned-but-uninstalled Steam games (GET /api/steam/installable + install:<appid>).
+#
+# Steam only writes an appmanifest for INSTALLED games, so discover_steam_games()
+# cannot see a game you own but have not downloaded. But the client caches library
+# ART for the whole library under appcache/librarycache/<appid>/ — MEASURED on
+# bazzite 2026-08-08: 1117 appids cached vs 12 installed. That directory listing IS
+# the owned-library enumeration, with NO Steam Web API key and no account: the box
+# only reads its own disk. It OVERCOUNTS (tools/DLC/demos, plus any store page whose
+# art the client rendered), so it is NOT authoritative ownership — the app filters
+# the DISPLAY to type=game via the keyless store lookup, and steam://install itself
+# is the final gate (Steam refuses to install an app the account does not own).
+#
+# This set is ALSO the allowlist for the install action: install:<appid> is refused
+# unless <appid> is in it, so a client can only ever trigger an install of a game
+# already in THIS box's library cache — never an arbitrary appid off the LAN.
+# ---------------------------------------------------------------------------
+_INSTALLABLE_TTL = 30.0
+_INSTALLABLE_CACHE = {"root": None, "at": 0.0, "val": None}
+_INSTALLABLE_LOCK = threading.Lock()
+
+
+def _installed_appids(root):
+    """Set of appid strings that have an appmanifest on disk (installed/installing).
+
+    Filename-only: the appid is the digits between `appmanifest_` and `.acf`, so
+    this is O(# installed) stats with no parsing. Read-only; never raises."""
+    out = set()
+    for steamapps in _steam_libraries_cached(root):
+        try:
+            for mf in glob.glob(os.path.join(steamapps, "appmanifest_*.acf")):
+                aid = os.path.basename(mf)[len("appmanifest_"):-len(".acf")]
+                if aid.isdigit():
+                    out.add(aid)
+        except Exception:
+            continue
+    return out
+
+
+def _installable_appids():
+    """Set of owned-but-uninstalled Steam appid strings, from the library art cache.
+
+    = digit-named subdirs of appcache/librarycache/  MINUS installed  MINUS known
+    Steam tools. Read-only, best-effort, and it DEGRADES CLOSED — no root, an
+    unreadable cache, or any error yields an EMPTY set, never "everything" (a
+    "fail-open" allowlist here would let any appid install). Cached for
+    _INSTALLABLE_TTL seconds, keyed on the root so a changed root invalidates it.
+
+    This is the allowlist the install action gates on: an appid not in here is not
+    installable (404), so no client-supplied appid reaches steam://install unless
+    the box's own library cache already lists it.
+    """
+    root = _steam_root()
+    if root is None:
+        return set()
+    now = time.monotonic()
+    with _INSTALLABLE_LOCK:
+        c = _INSTALLABLE_CACHE
+        if (c["val"] is not None and c["root"] == root
+                and now - c["at"] <= _INSTALLABLE_TTL):
+            return set(c["val"])
+    try:
+        entries = os.listdir(os.path.join(root, "appcache", "librarycache"))
+    except OSError:
+        entries = []
+    except Exception:
+        entries = []
+    cached = {e for e in entries if e.isdigit()}
+    installed = _installed_appids(root)
+    val = {a for a in cached if a not in installed and a not in STEAM_TOOL_APPIDS}
+    with _INSTALLABLE_LOCK:
+        _INSTALLABLE_CACHE.update(root=root, at=now, val=set(val))
+    return val
+
+
+# ---------------------------------------------------------------------------
+# appinfo.vdf — Steam's own metadata cache: name + type for every owned app.
+#
+# The first cut of the installable list shipped appid-only, on the belief that
+# "appinfo.vdf is a partial cache". MEASURED on real hardware (bazzite,
+# 2026-08-09): it carried a name for 1101/1101 (100%) of the installable set —
+# and the app-side store lookup it deferred to rate-limits at ~200/5min, which on
+# an 1101-app library meant the Not-installed page listed 88 games after days of
+# use. So the agent now parses appinfo.vdf (READ-ONLY, pure stdlib) and ships
+# name+type with the list; the store lookup remains app-side for what appinfo
+# lacks (genres, release year). Additive fields only — old apps ignore them.
+#
+# Format (binary): header magic 0x075644{27,28,29} + universe u32; v29 adds an
+# i64 offset to a string table (keys become u32 indices instead of inline
+# cstrings). Then per app: appid u32, size u32, then `size` bytes = fixed fields
+# (infoState u32, lastUpdated u32, picsToken u64, sha1[20], changeNumber u32,
+# v28+: binarySha1[20]) + a binary-VDF blob. name/type live at
+# appinfo.common.{name,type}. Node types: 0x00 dict, 0x01 str, 0x02 u32,
+# 0x07 u64, 0x08 end-of-dict.
+# ---------------------------------------------------------------------------
+_APPINFO_MAGIC_V29 = 0x07564429
+_APPINFO_MAGIC_V28 = 0x07564428
+_APPINFO_MAGIC_V27 = 0x07564427
+# Parse cache keyed on (path, mtime, size) — the file only changes when Steam
+# updates app metadata, and a full parse of a real 4.2MB file measures ~80ms.
+_APPINFO_CACHE = {"key": None, "val": None}
+
+
+def _appinfo_bvdf(buf, pos, end, strings):
+    """One binary-VDF node table -> dict. Keys: v29 = u32 string-table index;
+    v27/v28 = inline cstring. Raises on malformed input (caller degrades)."""
+    root = {}
+    stack = [root]
+    while pos < end:
+        t = buf[pos]
+        pos += 1
+        if t == 0x08:  # end of current dict
+            stack.pop()
+            if not stack:
+                break
+            continue
+        if strings is not None:
+            (idx,) = struct.unpack_from("<I", buf, pos)
+            pos += 4
+            key = strings[idx]
+        else:
+            zero = buf.index(b"\x00", pos)
+            key = buf[pos:zero].decode("utf-8", "replace")
+            pos = zero + 1
+        if t == 0x00:
+            d = {}
+            stack[-1][key] = d
+            stack.append(d)
+        elif t == 0x01:
+            zero = buf.index(b"\x00", pos)
+            stack[-1][key] = buf[pos:zero].decode("utf-8", "replace")
+            pos = zero + 1
+        elif t == 0x02:
+            (v,) = struct.unpack_from("<I", buf, pos)
+            pos += 4
+            stack[-1][key] = v
+        elif t == 0x07:
+            (v,) = struct.unpack_from("<Q", buf, pos)
+            pos += 8
+            stack[-1][key] = v
+        else:
+            raise ValueError("unknown vdf node type 0x%02X" % t)
+    return root
+
+
+def _appinfo_path():
+    root = _steam_root()
+    if not root:
+        return None
+    p = os.path.join(root, "appcache", "appinfo.vdf")
+    return p if os.path.isfile(p) else None
+
+
+def _appinfo_names():
+    """{appid: {"name": str, "type": str}} parsed from appinfo.vdf. READ-ONLY and
+    degrades CLOSED: any missing file, bad magic, or malformed blob yields {} (or
+    skips just that app) — the list then ships appid-only exactly as before."""
+    path = _appinfo_path()
+    if not path:
+        return {}
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime, st.st_size)
+        if _APPINFO_CACHE["key"] == key:
+            return _APPINFO_CACHE["val"]
+        with open(path, "rb") as f:
+            buf = f.read()
+        magic, _universe = struct.unpack_from("<II", buf, 0)
+        if magic not in (_APPINFO_MAGIC_V29, _APPINFO_MAGIC_V28, _APPINFO_MAGIC_V27):
+            return {}
+        pos = 8
+        strings = None
+        data_end = len(buf)
+        if magic == _APPINFO_MAGIC_V29:
+            (table_off,) = struct.unpack_from("<q", buf, pos)
+            pos += 8
+            (count,) = struct.unpack_from("<I", buf, table_off)
+            strings = []
+            p = table_off + 4
+            for _ in range(count):
+                zero = buf.index(b"\x00", p)
+                strings.append(buf[p:zero].decode("utf-8", "replace"))
+                p = zero + 1
+            data_end = table_off
+        out = {}
+        while pos + 8 <= data_end:
+            appid, size = struct.unpack_from("<II", buf, pos)
+            pos += 8
+            if appid == 0:
+                break
+            blob_end = pos + size
+            hdr = 4 + 4 + 8 + 20 + 4  # infoState, lastUpdated, picsToken, sha1, changeNumber
+            if magic in (_APPINFO_MAGIC_V28, _APPINFO_MAGIC_V29):
+                hdr += 20  # binarySha1
+            try:
+                kv = _appinfo_bvdf(buf, pos + hdr, blob_end, strings)
+                common = kv.get("appinfo", {}).get("common", {})
+                name = common.get("name")
+                if isinstance(name, str) and name:
+                    typ = common.get("type")
+                    out[appid] = {"name": name,
+                                  "type": (typ if isinstance(typ, str) else "").lower()}
+            except Exception:
+                pass  # one bad blob must not sink the rest
+            pos = blob_end
+        _APPINFO_CACHE.update(key=key, val=out)
+        return out
+    except Exception:
+        return {}
+
+
+def _installable_games():
+    """[{"appid": int, "name"?: str, "type"?: str}] for owned-but-uninstalled
+    apps, sorted by appid. name/type come OFFLINE from Steam's own appinfo.vdf
+    when it parses (measured 100% coverage on a real 1101-app library); entries
+    it lacks ship appid-only and the app's keyless store lookup covers them.
+    The app filters to type=game — DLC/tools/demos carry librarycache art too,
+    so the raw list overcounts games by ~2.5x. Additive fields only (§4)."""
+    meta = _appinfo_names()
+    out = []
+    for a in sorted(_installable_appids(), key=lambda a: int(a)):
+        g = {"appid": int(a)}
+        m = meta.get(int(a))
+        if m:
+            g["name"] = m["name"]
+            g["type"] = m["type"]
+        out.append(g)
+    return out
+
+
+# Mock owned-but-uninstalled list for the web harness / --mock. Real appids +
+# names/types matching what a real appinfo.vdf would supply, so the app renders
+# titles immediately and its type=game filter is exercised (620 = a non-game
+# control would be wrong here: all five are games).
+MOCK_INSTALLABLE = [
+    {"appid": 220, "name": "Half-Life 2", "type": "game"},
+    {"appid": 400, "name": "Portal", "type": "game"},
+    {"appid": 620, "name": "Portal 2", "type": "game"},
+    {"appid": 292030, "name": "The Witcher 3: Wild Hunt", "type": "game"},
+    {"appid": 570, "name": "Dota 2", "type": "game"},
+]
+
+
+# ---------------------------------------------------------------------------
 # Steam Remote Play — in-home streaming (/api/steamlink).
 #
 # The box's Steam client can stream games FROM another Steam machine on the LAN
@@ -7275,6 +7528,21 @@ def _launcher_argv(launcher_id):
         if appid in _streamable_appids():
             return ["steam", "steam://rungameid/%s" % appid]
         return None
+    if launcher_id.startswith("install:"):
+        appid = launcher_id[len("install:"):]
+        if not appid.isdigit():
+            return None
+        # Install a game you OWN but have not downloaded. Gated on the
+        # owned-but-uninstalled allowlist (_installable_appids, built from this
+        # box's own library art cache) — the client's appid selects a member of
+        # that set and NEVER reaches the command line as anything but a validated
+        # integer; the argv is the agent's own constant + that integer. steam://
+        # install is Steam's own flow, which refuses an app the account does not
+        # own, so an appid that slips through the (deliberately loose) library
+        # cache is a no-op, not a wrong install.
+        if appid in _installable_appids():
+            return ["steam", "steam://install/%s" % appid]
+        return None
     if launcher_id.startswith("shortcut:"):
         appid = launcher_id[len("shortcut:"):]
         if not appid.isdigit():
@@ -7620,6 +7888,253 @@ def cec_current():
 
 def cec_available():
     return cec_current() is not None
+
+
+# ---------------------------------------------------------------------------
+# Utilities — one-click hardware/setup helpers (app: Setup → Utilities, OPT-IN).
+#
+# Each utility is a FIXED, allowlisted operation (CLAUDE.md §3): a client selects
+# WHICH utility runs by id (looked up in _UTILITY_IDS, never interpolated); it never
+# supplies a command, a device, or firmware. Everything here is READ-ONLY DETECTION —
+# the state-changing RUN handlers (flash / enable) are a separate step, gated on the
+# same frozen id set. Launch tenants: 'openpuck' (flash an nRF52840 nice!nano into a
+# Steam Controller 2 wireless receiver) and 'cec' (enable box->TV HDMI-CEC control).
+# ---------------------------------------------------------------------------
+_UTILITY_IDS = frozenset({"openpuck", "cec"})
+
+# The state-CHANGING subset of _UTILITY_IDS, used by POST /api/utilities/<id>/run.
+# 'cec' is deliberately absent: enabling CEC is an install-time udev regroup of the
+# device into the `input` group (the agent already holds it) — NOT something the
+# daemon can do to itself at runtime (a running process cannot gain a supplementary
+# group, and the agent cannot edit its own unit). So there is no cec RUN action.
+_UTILITY_RUN_IDS = frozenset({"openpuck"})
+
+# install.sh fetches the pinned OpenPuck release .uf2 (sha256-verified, the same
+# gate as the agent asset) and drops it HERE. The flash op reads this fixed,
+# agent-owned path, selected only by the allowlisted 'openpuck' id — the client
+# never supplies a path or the firmware bytes. Absent -> the flash degrades closed.
+_OPENPUCK_FIRMWARE = "/etc/couchside/openpuck/firmware.uf2"
+
+# The nRF52840 nice!nano presents its UF2 bootloader as a mass-storage volume with
+# one of these labels + an INFO_UF2.TXT marker. That mount is the drag-drop flash
+# target; its presence is how we know a board is plugged in AND in DFU mode.
+_UF2_BOOTLOADER_LABELS = ("NICENANO", "NRF52BOOT", "FTHR840BOOT")
+# A flashed board re-enumerates as Valve's Steam Controller Puck.
+_OPENPUCK_USB = ("28de", "1304")
+# udisks automount roots for the desktop user the agent runs as. A constant so a
+# test can point detection at a fixture tree.
+_MEDIA_ROOTS = ("/run/media", "/media")
+
+_UTILITY_META = {
+    "openpuck": {
+        "label": "OpenPuck receiver",
+        "description": "Flash a plugged-in nRF52840 board into a Steam Controller 2 "
+                       "wireless receiver.",
+    },
+    "cec": {
+        "label": "TV control over HDMI-CEC",
+        "description": "Let the box power your TV and switch inputs over the HDMI "
+                       "cable — no extra hardware.",
+    },
+}
+
+
+def _openpuck_bootloader_mount():
+    """Path to a mounted nRF52840 UF2 bootloader volume (INFO_UF2.TXT present), or
+    None. Read-only; never raises. This is the flash TARGET, matched by a known
+    label + the UF2 marker file, never a client-supplied path."""
+    for root in _MEDIA_ROOTS:
+        try:
+            users = os.listdir(root)
+        except OSError:
+            continue
+        for user in users:
+            d = os.path.join(root, user)
+            try:
+                vols = os.listdir(d)
+            except OSError:
+                continue
+            for vol in vols:
+                if vol.upper() in _UF2_BOOTLOADER_LABELS:
+                    p = os.path.join(d, vol)
+                    try:
+                        if os.path.isfile(os.path.join(p, "INFO_UF2.TXT")):
+                            return p
+                    except OSError:
+                        continue
+    return None
+
+
+def _usb_present(vid, pid):
+    """True if a USB device with idVendor:idProduct is enumerated. Read-only."""
+    try:
+        names = os.listdir(_USB_DEVICES_DIR)
+    except OSError:
+        return False
+    for name in names:
+        if ":" in name:
+            continue  # interface node
+        base = os.path.join(_USB_DEVICES_DIR, name)
+        if ((_usb_read(os.path.join(base, "idVendor")) or "").lower() == vid
+                and (_usb_read(os.path.join(base, "idProduct")) or "").lower() == pid):
+            return True
+    return False
+
+
+def _openpuck_state():
+    """'board_ready' (a bootloader mount is present -> ready to flash), 'puck_present'
+    (a flashed / real Valve puck is enumerated) or 'no_board'. Read-only."""
+    if _openpuck_bootloader_mount():
+        return "board_ready"
+    if _usb_present(*_OPENPUCK_USB):
+        return "puck_present"
+    return "no_board"
+
+
+def _cec_devices_exist():
+    try:
+        return bool(glob.glob("/dev/cec[0-9]"))
+    except Exception:
+        return False
+
+
+def _cec_dev_openable(dev):
+    """True if the agent can open a specific CEC node for read+write — exactly what
+    the install-time udev regroup-to-`input` rule grants (the agent already holds
+    the `input` group). Read-only; never raises."""
+    try:
+        return bool(dev) and os.access(dev, os.R_OK | os.W_OK)
+    except Exception:
+        return False
+
+
+def _cec_util_state():
+    """Honest three-way state for the Setup->Utilities row. READ-ONLY.
+
+      'enabled'      -- the agent can drive the TV over CEC via a live backend: the
+                        kernel (cec-ctl) on a /dev/cecN it can OPEN, or a libcec
+                        USB-serial dongle (cec-client, on its own /dev/ttyACM*).
+      'needs_enable' -- a kernel /dev/cec[0-9] node exists but the agent can't open
+                        it (the group/permission gap the install-time udev
+                        regroup-to-`input` rule fixes), or a node exists with no
+                        live backend yet (e.g. the HDMI port is off; self-heals).
+      'no_adapter'   -- no CEC hardware at all.
+
+    Gating the KERNEL path's 'enabled' on real openability (os.access on the node)
+    is the §11 fix: cec_current() reports a kernel descriptor from sysfs WITHOUT
+    ever opening /dev/cecN, so a node the agent cannot open would otherwise read as
+    a false 'enabled' that only failed later in real_cec(). The libcec/dongle
+    backend is decoupled from /dev/cecN (it drives its own serial device) and is
+    genuinely usable whenever it is live, so it is NOT subject to that gate.
+    Degrades closed: any probe failure yields a non-'enabled' state."""
+    try:
+        cec = cec_current()
+    except Exception:
+        cec = None
+    if cec is not None:
+        # The kernel backend must ALSO be openable by the agent; the libcec dongle
+        # needs no /dev/cecN access, so a live descriptor there is 'enabled' as-is.
+        if cec.get("tool") == "cec-ctl" and not _cec_dev_openable(cec.get("device")):
+            return "needs_enable"
+        return "enabled"
+    # No live backend. A kernel node that merely lacks access (or whose HDMI port
+    # is off) is a fixable/transient 'needs_enable'; else there is no adapter.
+    if _cec_devices_exist():
+        return "needs_enable"
+    return "no_adapter"
+
+
+def utilities_state(mock):
+    """The Setup->Utilities list: each supported utility + its live state. READ-ONLY.
+    In --mock both appear in a ready-ish state so the harness renders them."""
+    if mock:
+        states = {"openpuck": "board_ready", "cec": "needs_enable"}
+    else:
+        states = {"openpuck": _openpuck_state(), "cec": _cec_util_state()}
+    out = []
+    for uid in ("openpuck", "cec"):
+        out.append({"id": uid, "state": states[uid], **_UTILITY_META[uid]})
+    return out
+
+
+def _is_uf2(path):
+    """True if `path` looks like a real UF2 image: non-empty, a whole number of
+    512-byte blocks, and the first block carries the UF2 magic (first word
+    0x0A324655 'UF2\\n', second word 0x9E5D5157). This guards against 'flashing' a
+    truncated / zeroed / non-UF2 file — a bootloader silently IGNORES such an image
+    and never reboots, so the copy would complete with no error and we'd falsely
+    report success. Read-only; never raises."""
+    try:
+        size = os.path.getsize(path)
+        if size == 0 or size % 512 != 0:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(8)
+        if len(head) < 8:
+            return False
+        w0, w1 = struct.unpack("<II", head)
+        return w0 == 0x0A324655 and w1 == 0x9E5D5157
+    except OSError:
+        return False
+
+
+def real_openpuck_flash():
+    """Flash the pinned OpenPuck firmware onto a plugged-in nRF52840 board that is
+    in its UF2 bootloader. Returns the standard ActionResult (ok/exit_code/stdout/
+    stderr/duration_ms).
+
+    §3-safe: the flash TARGET is _openpuck_bootloader_mount() (a label + UF2-marker
+    match, never client input), and the firmware is the agent-owned fixed-path
+    asset _OPENPUCK_FIRMWARE selected only by the 'openpuck' id — the client
+    supplies neither a path nor the bytes. The copy is shutil.copyfile into the
+    desktop user's own automount, so no sudo and no shell.
+
+    The board reboots the instant the UF2 lands and yanks its USB mass-storage
+    mid-write, so the copy errors (ENXIO/EIO) even on a SUCCESSFUL flash; that
+    specific errno is treated as success (both directions are tested)."""
+    start = time.monotonic()
+
+    def _done(ok, exit_code, stdout, stderr):
+        return {"ok": ok, "exit_code": exit_code, "stdout": stdout,
+                "stderr": stderr,
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+
+    mount = _openpuck_bootloader_mount()
+    if mount is None:
+        # Degrade closed: no board in DFU -> nothing to flash, no guessed path.
+        return _done(False, -1, "",
+                     "No board in DFU mode. Plug in an nRF52840 board (or "
+                     "double-tap its reset button) and try again.")
+    fw = _OPENPUCK_FIRMWARE
+    if not os.path.isfile(fw):
+        return _done(False, -1, "",
+                     "OpenPuck firmware is not installed on this box. Re-run the "
+                     "Couchside installer to fetch it.")
+    if not _is_uf2(fw):
+        # Degrade CLOSED: a bootloader silently ignores a truncated/garbage image
+        # and never reboots, so copying it would report a no-op flash as success.
+        return _done(False, -1, "",
+                     "OpenPuck firmware looks corrupt (not a valid UF2). Re-run "
+                     "the Couchside installer to reinstall it.")
+    dst = os.path.join(mount, os.path.basename(fw))
+    ok_msg = "Flashed. The board is rebooting as a Steam Controller Puck."
+    try:
+        shutil.copyfile(fw, dst)
+    except OSError as e:
+        if e.errno in (errno.ENXIO, errno.EIO):
+            # Expected: the board rebooted and pulled its drive mid-write. Success.
+            return _done(True, 0, ok_msg, "")
+        return _done(False, e.errno or -1, "", "Flash failed: %s" % e)
+    # Some kernels finish the copy before the board yanks the drive. Also success.
+    return _done(True, 0, ok_msg, "")
+
+
+def mock_openpuck_flash():
+    """--mock/harness: exercise the flash PRESS end-to-end without a real board."""
+    return {"ok": True, "exit_code": 0,
+            "stdout": "Flashed (mock). The board is rebooting as a Steam "
+                      "Controller Puck.",
+            "stderr": "", "duration_ms": 3}
 
 
 def _cec_argv(cec, op):
@@ -16029,6 +16544,19 @@ class Handler(BaseHTTPRequestHandler):
                                                else list_launchers()),
                                  "create_enabled": bool(ALLOW_APP_LAUNCHERS)},
                            started)
+            elif path == "/api/steam/installable":
+                # Owned-but-uninstalled Steam games (appids only; the app resolves
+                # names + type app-side from the keyless store endpoint and pulls
+                # art from GET /api/steam/<appid>/cover). Read-only; an empty list
+                # when Steam or the library cache is absent — degrades closed.
+                games = (MOCK_INSTALLABLE if self.mock else _installable_games())
+                self._send(200, {"games": games, "count": len(games)}, started)
+            elif path == "/api/utilities":
+                # Setup -> Utilities: each supported utility + its live state
+                # (openpuck: board_ready/puck_present/no_board; cec: enabled/
+                # needs_enable/no_adapter). Read-only; the app gates the whole
+                # section behind an opt-in pref.
+                self._send(200, {"utilities": utilities_state(self.mock)}, started)
             elif path == "/api/session/default":
                 # Read-only. Always 200 with available=false rather than 404 so
                 # the app can tell "old agent" (404) from "this box has no
@@ -16713,6 +17241,20 @@ class Handler(BaseHTTPRequestHandler):
                 # The app percent-encodes the id (encodeURIComponent turns the
                 # "steam:"/"custom:" colon into %3A), so decode before matching.
                 launcher_id = unquote(path[len(lprefix):])
+                # --mock/harness: _launcher_argv gates install:<appid> on the real
+                # on-disk library, which the mock box does not have. Validate against
+                # the mock installable set instead so the harness can exercise the
+                # install PRESS end-to-end. Same allowlist shape, mock data.
+                if self.mock and launcher_id.startswith("install:"):
+                    appid = launcher_id[len("install:"):]
+                    if not (appid.isdigit()
+                            and int(appid) in {g["appid"] for g in MOCK_INSTALLABLE}):
+                        self._send(404, {"ok": False,
+                                         "error": "unknown launcher"}, started)
+                        return
+                    self._send(200, mock_launch(
+                        ["steam", "steam://install/%s" % appid]), started)
+                    return
                 argv = _launcher_argv(launcher_id)
                 if argv is None:
                     self._send(404, {"ok": False,
@@ -16720,6 +17262,31 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 result = mock_launch(argv) if self.mock else real_launch(argv)
                 self._send(200, result, started)
+                return
+
+            # POST /api/utilities/<id>/run: run a Utilities tenant's state-changing
+            # action (Stage 2). The id is LOOKED UP in the frozen sets, never
+            # interpolated and never a command. Only 'openpuck' (flash a board) is
+            # runnable; 'cec' is detect-only (its enable is an install-time udev
+            # rule, not a daemon action) so it 404s with a distinct reason.
+            uprefix = "/api/utilities/"
+            if path.startswith(uprefix) and path.endswith("/run"):
+                uid = unquote(path[len(uprefix):-len("/run")])
+                if uid not in _UTILITY_IDS:
+                    self._send(404, {"ok": False,
+                                     "error": "unknown utility"}, started)
+                    return
+                if uid not in _UTILITY_RUN_IDS:
+                    self._send(404, {"ok": False,
+                                     "error": "utility has no run action"}, started)
+                    return
+                if uid == "openpuck":
+                    result = (mock_openpuck_flash() if self.mock
+                              else real_openpuck_flash())
+                    self._send(200, result, started)
+                    return
+                # Defensive: a run id in the frozen set with no dispatch branch.
+                self._send(404, {"ok": False, "error": "unknown utility"}, started)
                 return
 
             # POST /api/tv/volume: absolute volume {"level": 0-100, "target":
