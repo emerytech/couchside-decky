@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.88"
+VERSION = "2.9.93"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -4400,10 +4400,23 @@ def _read_led_raw(name):
     color = _led_color_from_intensity(mi, index, maxint, maxb) if rgb else None
     writable = _led_access_w(name, "brightness") and (
         (not rgb) or _led_access_w(name, "multi_intensity"))
+    # Some HID RGB drivers gate output behind an `enabled` flag AND flip it back to
+    # false whenever any OTHER attr is written -- the Lenovo Legion Go S thumbstick
+    # rings (node `go_s:rgb:joystick_rings`, driver hid_lenovo_go_s) do exactly this,
+    # so a colour write "succeeds" yet the rings stay dark. Such a node also carries a
+    # `mode` (custom = manual colour, dynamic = firmware effect) -- REQUIRED here so a
+    # valve-leds strip node (which also has `enabled` but no `mode`) is NOT mistaken
+    # for one. When gated: set mode first + re-assert `enabled` LAST. `enable_on` is
+    # the truthy token the device itself lists in enabled_index (looked up, not
+    # trusted); None on every ordinary LED, so the gated path is dead code for them.
+    enable_on = None
+    if _led_access_w(name, "mode") and _led_access_w(name, "enabled"):
+        toks = (_led_read_attr(name, "enabled_index") or "").split()
+        enable_on = next((t for t in toks if t.lower() in ("true", "1", "on", "enabled")), None)
     return {"name": name, "desc": name, "rgb": rgb,
             "notable": _led_notable(name, rgb), "writable": writable,
             "max_brightness": maxb, "brightness": cur, "index": index,
-            "maxint": maxint, "color": color}
+            "maxint": maxint, "color": color, "enable_on": enable_on}
 
 
 def _led_public(raw):
@@ -4486,9 +4499,10 @@ def _led_realpath_ok(name):
 def _led_write(name, attr, value):
     """Write to the FIXED-literal attribute `attr` of LED `name`. attr is NEVER
     client input -- the only literals ever passed are 'brightness',
-    'multi_intensity', 'trigger' (set_led) and 'effect', 'enabled', 'delay'
-    (the valve-leds hardware-effect strip path). The effect VALUE is validated
-    against the device's own effect_index before it reaches here."""
+    'multi_intensity', 'trigger' (set_led), 'effect', 'enabled', 'delay'
+    (the valve-leds hardware-effect strip path), and 'mode' (fixed 'custom') +
+    'enabled' (the truthy token the device lists) for the gated Lenovo go_s rings.
+    The effect VALUE is validated against the device's own effect_index first."""
     with open(os.path.join(_LEDS_ROOT, name, attr), "w") as f:
         f.write(value)
 
@@ -4551,6 +4565,14 @@ def set_led(name, brightness, color):
                 _led_write(name, "effect", "manual")
             except OSError:
                 pass
+        if raw.get("enable_on"):
+            # Gated go_s rings: manual colour only shows in mode=custom (dynamic runs
+            # the firmware effect and ignores multi_intensity). Set it BEFORE the
+            # colour; `enabled` is re-asserted last below.
+            try:
+                _led_write(name, "mode", "custom")
+            except OSError:
+                pass
         if color is not None:
             _led_write_color(name, raw, color)
         if brightness is not None:
@@ -4559,6 +4581,13 @@ def set_led(name, brightness, color):
             # OFF. int(x + 0.5) sends the midpoint to ON.
             _led_write(name, "brightness",
                        str(int(brightness / 100 * raw["max_brightness"] + 0.5)))
+        if raw.get("enable_on"):
+            # LAST: every attr write above flips this driver's `enabled` back to
+            # false, so re-assert it or the rings stay dark (the whole bug).
+            try:
+                _led_write(name, "enabled", raw["enable_on"])
+            except OSError:
+                pass
     except OSError as e:
         return {"ok": False, "status": 500,
                 "error": (str(e) or "led write failed")}
@@ -4610,14 +4639,18 @@ def _validate_led_body(req):
 #
 # The active effect (and a plain solid colour) is persisted to
 # ~/.config/couchside/leds.json and re-applied at startup, so a reboot restores
-# it instead of reverting to the firmware default -- the agent is a systemd
-# *user* service, so the restore runs on login.
+# it instead of reverting to the firmware default. The agent is a systemd SYSTEM
+# service, so it does NOT restart on a gamescope<->desktop switch -- and Steam
+# re-initializes the valve-leds on that switch, silently reverting our effect. So
+# _led_restore_worker also runs a background RECONCILER that re-asserts the strip's
+# effect whenever the live hardware drifts from what we set (session switch, boot
+# race, or anything else that resets the strip).
 _LED_STATE_CONF = os.path.expanduser("~/.config/couchside/leds.json")
 
 # Frozen allowlist of effect ids (looked up, never interpolated). 'solid'/'off'
 # are one-shot (no animation); the rest animate on the render thread.
 _LED_EFFECTS = ("solid", "off", "breathe", "pulse", "rainbow", "strobe",
-                "scanner", "manual")
+                "scanner", "manual", "circle", "comet", "wipe", "twinkle")
 _LED_STATIC = frozenset(("solid", "off"))
 
 _FX_TICK = 0.033                 # ~30 fps render cadence
@@ -4728,6 +4761,11 @@ def _fx_note_static(name, res):
     persist it as a solid so a reboot restores the colour."""
     _fx_stop(name)
     with _FX_LOCK:
+        # Painting one LED supersedes any whole-strip effect it belongs to -- drop
+        # that strip's persist so the two modes can't both restore + fight.
+        m = _STRIP_RE.match(name)
+        if m:
+            _LED_PERSIST.pop("strip:" + m.group(1), None)
         _LED_PERSIST[name] = {"effect": "solid", "color": res.get("color"),
                               "brightness": res.get("brightness_pct"), "speed": 50}
     _led_state_save()
@@ -4813,6 +4851,10 @@ def apply_led_effect(name, effect, color, speed, brightness):
         params["color"] = raw["color"] or (
             {"r": 255, "g": 0, "b": 0} if effect == "scanner"
             else {"r": 255, "g": 255, "b": 255})
+    if raw.get("enable_on"):
+        # Gated go_s rings can't be driven by the software frame writer (every tick
+        # would flip `enabled` off) -- use the firmware's own effect instead.
+        return _apply_gated_effect(name, raw, effect, params)
     _fx_start(name, raw, effect, params)
     with _FX_LOCK:
         _LED_PERSIST[name] = dict(params, effect=effect)
@@ -4822,23 +4864,43 @@ def apply_led_effect(name, effect, color, speed, brightness):
                        "speed": params["speed"], "brightness": params["brightness"]}}
 
 
+def _apply_gated_effect(name, raw, effect, params):
+    """Animated effect on a gated HID LED (Lenovo go_s rings). Two dead ends here:
+    the software frame writer can't drive it (every tick flips `enabled` off), and
+    forcing the firmware's OWN animation is UNSAFE -- writing `mode=dynamic` to the
+    hid_lenovo_go_s driver BLOCKS FOREVER (measured on real hardware; it hung a
+    request thread and took the agent down). So an effect just shows its colour as a
+    STATIC light via the reliable mode=custom path -- the rings light instead of
+    going dark or hanging. (A future software renderer could re-arm `enabled` per
+    frame in custom mode, but that is not this.)"""
+    res = set_led(name, params["brightness"], params["color"])
+    if not res or not res.get("ok"):
+        return res if res else None
+    _fx_note_static(name, res)
+    return {"ok": True, "active": None, "led": name,
+            "brightness_pct": res.get("brightness_pct"), "color": res.get("color")}
+
+
 def _validate_effect_body(req):
     """Shape check for POST /api/leds/effect. Returns
-    (effect, color|None, speed|None, brightness|None, error|None). Rejects, never
-    sanitises."""
+    (effect, color|None, speed|None, brightness|None, reverse:bool, error|None).
+    Rejects, never sanitises."""
     effect = req.get("effect")
     if effect not in _LED_EFFECTS:
-        return None, None, None, None, "unknown effect"
+        return None, None, None, None, False, "unknown effect"
     color = req.get("color")
     if color is not None and not _is_rgb_triple(color):
-        return None, None, None, None, "color must be {r,g,b} ints 0-255"
+        return None, None, None, None, False, "color must be {r,g,b} ints 0-255"
     speed = req.get("speed")
     if speed is not None and not _is_pct(speed, 1):
-        return None, None, None, None, "speed must be an int 1-100"
+        return None, None, None, None, False, "speed must be an int 1-100"
     brightness = req.get("brightness")
     if brightness is not None and not _is_pct(brightness):
-        return None, None, None, None, "brightness must be an int 0-100"
-    return effect, color, speed, brightness, None
+        return None, None, None, None, False, "brightness must be an int 0-100"
+    reverse = req.get("reverse")
+    if reverse is not None and not isinstance(reverse, bool):
+        return None, None, None, None, False, "reverse must be a boolean"
+    return effect, color, speed, brightness, bool(reverse), None
 
 
 def _led_restore():
@@ -4852,33 +4914,119 @@ def _led_restore():
         if not isinstance(st, dict):
             continue
         effect = st.get("effect")
+        # A custom sequence isn't a plain effect id -> re-arm it via its own path.
+        if effect == "sequence" and name.startswith("strip:"):
+            prefix = name[len("strip:"):]
+            frames = st.get("frames")
+            hold = st.get("hold_ms")
+            holds = st.get("holds")
+            if (prefix in strips and isinstance(frames, list) and frames
+                    and isinstance(hold, int) and not isinstance(hold, bool)):
+                fr = frames[:_SEQ_MAX_FRAMES]
+                # per-frame durations only if a clean int list matching the frames;
+                # apply_strip_sequence re-validates too (defence in depth).
+                hh = holds if (isinstance(holds, list) and len(holds) == len(fr)
+                               and all(isinstance(x, int) and not isinstance(x, bool)
+                                       for x in holds)) else None
+                try:
+                    apply_strip_sequence(
+                        prefix, fr, min(60000, max(30, hold)),
+                        st.get("brightness") if _is_pct(st.get("brightness")) else 100,
+                        bool(st.get("loop", True)), hh)
+                except OSError:
+                    pass
+            continue
         if effect not in _LED_EFFECTS:
             continue
         color = st.get("color") if _is_rgb_triple(st.get("color")) else None
         speed = st.get("speed") if _is_pct(st.get("speed"), 1) else 50
         brightness = st.get("brightness") if _is_pct(st.get("brightness")) else 100
+        reverse = bool(st.get("reverse"))
         try:
             if name.startswith("strip:"):
                 # A persisted strip (firmware effect): re-arm the whole strip so a
                 # reboot brings back the night-rider without the phone.
                 prefix = name[len("strip:"):]
                 if prefix in strips:
-                    apply_strip_effect(prefix, effect, color, speed, brightness)
+                    apply_strip_effect(prefix, effect, color, speed, brightness, reverse)
             elif name in live:
                 apply_led_effect(name, effect, color, speed, brightness)
         except OSError:
             pass
 
 
+# The reconciler re-checks each strip's hardware effect this often. Cheap (one
+# sysfs read per strip) and only WRITES on a real mismatch -> never flickers, never
+# fights a steady strip.
+_LED_RECONCILE_INTERVAL_S = 4.0
+
+
+def _led_desired_hw_effect(effect, member):
+    """The firmware `effect` value apply_strip_effect() would write for our effect
+    id on this strip: the mapped name IF the device publishes it, else the manual/
+    off fallback. Read-only -- used to tell whether the live strip drifted from us."""
+    fw = _STRIP_HW_MAP.get(effect)
+    if fw and fw in _strip_hw_effects(member):
+        return fw
+    return "off" if effect == "off" else "manual"
+
+
+def _led_reconcile():
+    """Re-assert each persisted STRIP effect IF the live hardware drifted from it.
+
+    The agent is a systemd SYSTEM service, so a gamescope<->desktop switch (Steam
+    re-inits the valve-leds back to its own default) never restarts us and the
+    one-shot startup restore never re-runs -- the strip silently reverts. This
+    reads ONE `effect` attr per strip and re-applies ONLY on a mismatch, so a
+    steady strip is never rewritten (no flicker, no fight with a stable state)."""
+    strips = _led_strips()
+    for name, st in _led_state_load().items():
+        if not name.startswith("strip:") or not isinstance(st, dict):
+            continue
+        effect = st.get("effect")
+        if effect not in _LED_EFFECTS:
+            continue
+        if effect in _STRIP_SEQ_EFFECTS:
+            continue  # agent-rendered: the render thread re-writes it every frame,
+                      # so it self-heals a reset without a reconcile re-arm (which
+                      # would restart the animation with a visible jump).
+        members = strips.get(name[len("strip:"):])
+        if not members:
+            continue
+        try:
+            cur = _led_read_attr(members[0], "effect")
+        except OSError:
+            continue
+        if cur == _led_desired_hw_effect(effect, members[0]):
+            continue
+        color = st.get("color") if _is_rgb_triple(st.get("color")) else None
+        speed = st.get("speed") if _is_pct(st.get("speed"), 1) else 50
+        brightness = st.get("brightness") if _is_pct(st.get("brightness")) else 100
+        try:
+            apply_strip_effect(name[len("strip:"):], effect, color, speed, brightness)
+            print("[led] reconciled %s (hw effect was %r)" % (name, cur), flush=True)
+        except OSError:
+            pass
+
+
 def _led_restore_worker():
-    """Startup thread: wait for the OS/Steam to finish its own LED init, then
-    restore. One retry covers the boot race where the LED node appears late."""
+    """Startup: wait out the OS/Steam LED init, restore once, THEN keep reconciling.
+    Because the agent is a SYSTEM service a session switch never restarts us, so a
+    periodic drift check is what re-asserts our effect after Steam resets the strip.
+    The two initial delays cover the boot race where the node / Steam init lands
+    late. Runs on a daemon thread; the reconcile loop lives for the process."""
     for delay in (2.0, 6.0):
         time.sleep(delay)
         try:
             if _list_led_names():
                 _led_restore()
-                return
+                break
+        except OSError:
+            pass
+    while not _FX_STOP.is_set():
+        time.sleep(_LED_RECONCILE_INTERVAL_S)
+        try:
+            _led_reconcile()
         except OSError:
             pass
 
@@ -4906,6 +5054,10 @@ _STRIP_HW_MAP = {"scanner": "patrol", "breathe": "breath", "rainbow": "rainbow",
                  "manual": "manual", "off": "off"}
 # effects whose look depends on the picked colour (set multi_intensity first).
 _STRIP_COLOUR_FX = ("scanner", "breathe", "pulse", "strobe", "solid")
+# Strip effects the AGENT renders per-LED (no firmware effect exists for them):
+# a one-way "circle"/comet the render thread sweeps + wraps. These are looked up
+# like any effect id; the agent owns every frame (fixed-literal writers, §3).
+_STRIP_SEQ_EFFECTS = ("circle", "comet", "wipe", "twinkle")
 
 
 def _led_strips(names=None):
@@ -4951,13 +5103,209 @@ def _strip_public(prefix, members):
             "hw_effects": _strip_hw_effects(members[0])}
 
 
-def apply_strip_effect(prefix, effect, color, speed, brightness):
+# ---- Agent-rendered strip animations (circle/comet + future custom sequences) --
+# Some looks have NO firmware effect -- a one-way "circle"/comet that runs off one
+# end and restarts at the other. The AGENT renders those per-LED on this thread,
+# same discipline as _fx_loop: fixed-literal writers, and the client only picks an
+# allowlisted effect id + range-checked colour/speed/brightness (validated frame
+# DATA for custom sequences comes later). ONE animation per strip. The thread
+# writes ~30x/s, so a Steam reset self-heals within a frame (the reconciler skips
+# these); persisted like any strip effect, so a reboot re-arms it.
+_SEQ_TICK = 0.033                # ~30 fps
+_SEQ_LOCK = threading.RLock()
+_SEQ_ACTIVE = {}                 # prefix -> spec (members/effect/color/speed/brightness/t0/raws)
+_SEQ_THREAD = [None]
+_SEQ_TAIL = 3                    # comet head + fading-tail length
+
+
+def _seq_period(speed):
+    """Speed 1..100 -> seconds for one full lap around the strip (higher = faster).
+    100 -> ~0.5s (snappy), 55 -> ~2s, 25 -> ~3.1s, 1 -> ~4s."""
+    s = speed if _is_pct(speed, 1) else 50
+    return 4.0 - (s / 100.0) * 3.5
+
+
+def _seq_frame_sweep(n, t, period, color, tail, reverse=False):
+    """A bright head + a `tail`-LED fading trail sweeping ONE direction and WRAPPING.
+    Short tail = a "circle" dot; long tail = a comet. reverse -> the other way; the
+    tail always trails BEHIND the head's motion."""
+    frame = [None] * n
+    d = -1 if reverse else 1
+    head = (t / period) * n * d
+    for k in range(min(tail, n)):
+        pos = int(head - d * k) % n
+        frac = 1.0 - (k / float(tail))               # head brightest, tail fades
+        frame[pos] = {"r": int(color["r"] * frac),
+                      "g": int(color["g"] * frac),
+                      "b": int(color["b"] * frac)}
+    return frame
+
+
+# circle keeps its old name for callers/tests; it's a short-tail sweep.
+def _seq_frame_circle(n, t, period, color):
+    return _seq_frame_sweep(n, t, period, color, _SEQ_TAIL)
+
+
+def _seq_frame_wipe(n, t, period, color, reverse=False):
+    """Fill the strip one direction over the first half of the period, then clear it
+    over the second half -- a repeating colour wipe. reverse -> from the other end."""
+    frame = [None] * n
+    phase = (t % period) / period                    # 0..1
+    if phase < 0.5:
+        upto = int((phase / 0.5) * n + 0.5)          # filling
+        idxs = range(min(upto, n)) if not reverse else range(max(0, n - upto), n)
+    else:
+        frm = int(((phase - 0.5) / 0.5) * n + 0.5)   # clearing
+        idxs = range(min(frm, n), n) if not reverse else range(0, max(0, n - frm))
+    for i in idxs:
+        frame[i] = color
+    return frame
+
+
+def _seq_frame_twinkle(n, t, period, color):
+    """Each LED sparkles in `color` on its own index-derived phase (no RNG state):
+    a sharpened sine -> mostly dim with occasional bright pops = a twinkle."""
+    frame = [None] * n
+    for i in range(n):
+        ph = (i * 0.6180339887) % 1.0                # golden-ratio spread of phases
+        f = 0.5 + 0.5 * math.sin(2 * math.pi * ((t / (period * 0.5)) + ph))
+        f = f * f * f                                # sharpen: dim base, rare pops
+        if f > 0.06:
+            frame[i] = {"r": int(color["r"] * f),
+                        "g": int(color["g"] * f),
+                        "b": int(color["b"] * f)}
+    return frame
+
+
+def _seq_render(spec, now):
+    """Write ONE frame of `spec` to its strip via the fixed-literal writers."""
+    members = spec["members"]
+    n = len(members)
+    t = now - spec["t0"]
+    e = spec["effect"]
+    period = _seq_period(spec["speed"])
+    color = spec["color"]
+    rev = bool(spec.get("reverse"))
+    if e == "circle":
+        frame = _seq_frame_sweep(n, t, period, color, _SEQ_TAIL, rev)
+    elif e == "comet":
+        frame = _seq_frame_sweep(n, t, period, color, max(4, n // 2), rev)
+    elif e == "wipe":
+        frame = _seq_frame_wipe(n, t, period, color, rev)
+    elif e == "twinkle":
+        frame = _seq_frame_twinkle(n, t, period, color)
+    elif e == "sequence":
+        # A custom TIMED sequence: a list of per-LED frames (already normalized to n
+        # members at validation). With per-frame `holds` (one ms per frame) we walk a
+        # cumulative timeline; without them every frame shows for the uniform
+        # `hold_ms`. loop -> wrap; else hold the last frame. This is what the app's
+        # alternate-colour feature builds (2 frames) and the N-frame editor builds.
+        frames = spec.get("frames") or []
+        if not frames:
+            return
+        loop = spec.get("loop", True)
+        holds = spec.get("holds")
+        if holds and len(holds) == len(frames):
+            total = sum(holds) / 1000.0
+            if total <= 0:
+                idx = 0
+            elif loop:
+                tm = t % total
+                acc = 0.0
+                idx = len(frames) - 1
+                for j, h in enumerate(holds):
+                    acc += h / 1000.0
+                    if tm < acc:
+                        idx = j
+                        break
+            else:
+                acc = 0.0
+                idx = len(frames) - 1
+                for j, h in enumerate(holds):
+                    acc += h / 1000.0
+                    if t < acc:
+                        idx = j
+                        break
+        else:
+            hold = max(0.03, spec.get("hold_ms", 500) / 1000.0)
+            step = int(t / hold)
+            idx = (step % len(frames)) if loop else min(step, len(frames) - 1)
+        frame = frames[idx]
+    else:
+        return
+    bmax = spec["brightness"]
+    for i, name in enumerate(members):
+        raw = spec["raws"].get(name)
+        if not raw:
+            continue
+        c = frame[i]
+        try:
+            if c is not None and raw.get("rgb"):
+                _led_write_color(name, raw, c)
+                _led_write(name, "brightness",
+                           str(int(bmax / 100.0 * raw["max_brightness"] + 0.5)))
+            else:
+                _led_write(name, "brightness", "0")
+        except OSError:
+            pass
+
+
+def _seq_loop():
+    """Render every active agent strip animation until none remain (or shutdown)."""
+    while not _FX_STOP.is_set():
+        with _SEQ_LOCK:
+            active = list(_SEQ_ACTIVE.values())
+        if not active:
+            return
+        now = time.monotonic()
+        for spec in active:
+            _seq_render(spec, now)
+        _FX_STOP.wait(_SEQ_TICK)
+
+
+def _seq_ensure_thread():
+    with _SEQ_LOCK:
+        th = _SEQ_THREAD[0]
+        if th is None or not th.is_alive():
+            _SEQ_THREAD[0] = threading.Thread(target=_seq_loop, daemon=True,
+                                              name="led-seq")
+            _SEQ_THREAD[0].start()
+
+
+def _seq_start(prefix, members, effect, color, speed, brightness, reverse=False):
+    """Begin an agent-rendered animation on the strip: flip every member to manual
+    (so the firmware isn't also animating), register the spec, start the thread."""
+    raws = {n: _read_led_raw(n) for n in members}
+    for n in members:
+        try:
+            _led_write(n, "effect", "manual")
+        except OSError:
+            pass
+    with _SEQ_LOCK:
+        _SEQ_ACTIVE[prefix] = {
+            "members": members, "effect": effect,
+            "color": color or {"r": 255, "g": 0, "b": 0},
+            "speed": speed if _is_pct(speed, 1) else 50,
+            "brightness": brightness if _is_pct(brightness) else 100,
+            "reverse": bool(reverse),
+            "t0": time.monotonic(), "raws": raws}
+    _seq_ensure_thread()
+
+
+def _seq_stop(prefix):
+    """Stop any agent animation on `prefix` (leaves its last frame lit)."""
+    with _SEQ_LOCK:
+        _SEQ_ACTIVE.pop(prefix, None)
+
+
+def apply_strip_effect(prefix, effect, color, speed, brightness, reverse=False):
     """Set an addressable strip to a FIRMWARE effect (or a manual solid/off).
 
     Returns {"ok":True,"active":..} | {"ok":False,"status":..} | None(->404).
     The heavy lifting is the driver's: for a hardware effect we set the base
     colour/brightness then write `effect`=<firmware name> + `delay`, and the strip
-    animates itself. `solid` paints every LED (effect=manual); `off` zeroes them."""
+    animates itself. `solid` paints every LED (effect=manual); `off` zeroes them.
+    `reverse` only affects the agent-rendered sweeps (circle/comet/wipe)."""
     if effect not in _LED_EFFECTS:
         return {"ok": False, "status": 400, "error": "unknown effect"}
     if not isinstance(prefix, str):
@@ -4977,6 +5325,25 @@ def apply_strip_effect(prefix, effect, color, speed, brightness):
 
     def _bval(raw):
         return str(int(b / 100 * raw["max_brightness"] + 0.5))
+
+    # Agent-rendered animation (no firmware effect for it -- a one-way "circle"):
+    # the render thread drives per-LED frames. Supersedes per-LED paints; persisted
+    # so a reboot re-arms it via _seq_start again.
+    if effect in _STRIP_SEQ_EFFECTS:
+        rev = bool(reverse)
+        _seq_start(prefix, members, effect, col, sp, b, rev)
+        with _FX_LOCK:
+            for m in members:
+                _LED_PERSIST.pop(m, None)
+            _LED_PERSIST["strip:" + prefix] = {"effect": effect, "color": col,
+                                               "speed": sp, "brightness": b,
+                                               "reverse": rev}
+        _led_state_save()
+        return {"ok": True, "strip": prefix,
+                "active": {"effect": effect, "color": col, "speed": sp,
+                           "brightness": b, "reverse": rev}}
+    # A firmware / manual effect supersedes any running agent animation here.
+    _seq_stop(prefix)
 
     try:
         if effect == "off":
@@ -5026,11 +5393,121 @@ def apply_strip_effect(prefix, effect, color, speed, brightness):
         return {"ok": False, "status": 500, "error": str(e) or "strip write failed"}
 
     with _FX_LOCK:
+        # A whole-strip effect supersedes any per-LED paints on this strip: drop
+        # their persists so a restore/reconcile can never re-apply a conflicting
+        # mix (the "weird" state -- a scanner + stale solids fighting each other).
+        for m in members:
+            _LED_PERSIST.pop(m, None)
         _LED_PERSIST["strip:" + prefix] = {"effect": effect, "color": col,
                                            "speed": sp, "brightness": b}
     _led_state_save()
     return {"ok": True, "strip": prefix,
             "active": {"effect": effect, "color": col, "speed": sp, "brightness": b}}
+
+
+_SEQ_MAX_FRAMES = 64          # cap on a custom sequence's frame count (bounds memory)
+
+
+def apply_strip_sequence(prefix, frames, hold_ms, brightness, loop=True, holds=None):
+    """Play a custom TIMED SEQUENCE of per-LED frames on the strip (agent-rendered):
+    the general form behind the app's alternate-colour feature (2 frames) and the
+    N-frame editor. `frames` is validated per-LED colour DATA; the render thread
+    owns every write (fixed literals, §3). `holds` is an OPTIONAL per-frame duration
+    list (len == frames); absent -> every frame shows for the uniform `hold_ms`.
+    Persisted -> re-arms on reboot. Returns {"ok":True,..} | None (-> 404)."""
+    if not isinstance(prefix, str):
+        return None
+    members = _led_strips().get(prefix)
+    if not members:
+        return None
+    raws = {n: _read_led_raw(n) for n in members}
+    if not all(r and r["writable"] for r in raws.values()):
+        return None
+    b = brightness if _is_pct(brightness) else 100
+    n = len(members)
+    # Normalize each frame to EXACTLY the member count (pad short with off, drop
+    # extra), keeping only valid RGB triples -- nothing client-shaped reaches a write.
+    norm = [[(fr[i] if i < len(fr) and _is_rgb_triple(fr[i]) else None)
+             for i in range(n)] for fr in frames]
+    # Optional per-frame durations: keep only a full, in-range int list (one per
+    # frame); anything else -> None (uniform hold_ms). Defensively re-validated here
+    # too, so a junk persist file / caller can never drive an out-of-range timeline.
+    hnorm = None
+    if isinstance(holds, list) and len(holds) == len(norm) and norm:
+        try:
+            cand = [min(60000, max(30, int(h))) for h in holds
+                    if not isinstance(h, bool)]
+            if len(cand) == len(norm):
+                hnorm = cand
+        except (TypeError, ValueError):
+            hnorm = None
+    for name in members:
+        try:
+            _led_write(name, "effect", "manual")
+        except OSError:
+            pass
+    with _SEQ_LOCK:
+        _SEQ_ACTIVE[prefix] = {
+            "members": members, "effect": "sequence", "frames": norm,
+            "hold_ms": int(hold_ms), "holds": hnorm, "loop": bool(loop), "brightness": b,
+            "color": {"r": 255, "g": 255, "b": 255}, "speed": 50,
+            "t0": time.monotonic(), "raws": raws}
+    _seq_ensure_thread()
+    with _FX_LOCK:
+        for m in members:
+            _LED_PERSIST.pop(m, None)
+        _LED_PERSIST["strip:" + prefix] = {"effect": "sequence", "frames": norm,
+                                           "hold_ms": int(hold_ms), "holds": hnorm,
+                                           "loop": bool(loop), "brightness": b}
+    _led_state_save()
+    active = {"effect": "sequence", "frames": len(norm),
+              "hold_ms": int(hold_ms), "loop": bool(loop), "brightness": b}
+    if hnorm is not None:
+        active["holds"] = hnorm
+    return {"ok": True, "strip": prefix, "active": active}
+
+
+def _validate_sequence_body(req):
+    """Shape-check POST /api/leds/sequence. Returns
+    (frames, hold_ms, holds, brightness|None, loop, error|None). Rejects, never
+    sanitises. `holds` is an OPTIONAL per-frame duration list (one int ms per
+    frame, len == frames); absent -> None and the uniform `hold_ms` governs every
+    frame. Old clients that omit it keep the uniform-cadence behaviour."""
+    frames = req.get("frames")
+    if not isinstance(frames, list) or not (1 <= len(frames) <= _SEQ_MAX_FRAMES):
+        return None, None, None, None, None, \
+            "frames must be a list of 1..%d frames" % _SEQ_MAX_FRAMES
+    out = []
+    for fr in frames:
+        if not isinstance(fr, list) or len(fr) > 512:
+            return None, None, None, None, None, "each frame is a list of <=512 colours"
+        row = []
+        for c in fr:
+            if c is None:
+                row.append(None)
+            elif _is_rgb_triple(c):
+                row.append(c)
+            else:
+                return None, None, None, None, None, "frame colours must be {r,g,b} ints or null"
+        out.append(row)
+    hold_ms = req.get("hold_ms", 500)
+    if isinstance(hold_ms, bool) or not isinstance(hold_ms, int) or not (30 <= hold_ms <= 60000):
+        return None, None, None, None, None, "hold_ms must be an int 30..60000"
+    holds = req.get("holds")
+    if holds is not None:
+        if not isinstance(holds, list) or len(holds) != len(out):
+            return None, None, None, None, None, \
+                "holds must be a list of one duration per frame"
+        for h in holds:
+            if isinstance(h, bool) or not isinstance(h, int) or not (30 <= h <= 60000):
+                return None, None, None, None, None, "each hold must be an int 30..60000"
+    brightness = req.get("brightness")
+    if brightness is not None and not _is_pct(brightness):
+        return None, None, None, None, None, "brightness must be an int 0-100"
+    loop = req.get("loop", True)
+    if not isinstance(loop, bool):
+        return None, None, None, None, None, "loop must be a boolean"
+    return out, hold_ms, holds, brightness, loop, None
 
 
 # ---- OpenRGB backend (cap: openrgb) -----------------------------------------
@@ -8359,8 +8836,18 @@ _APPINFO_MAGIC_V29 = 0x07564429
 _APPINFO_MAGIC_V28 = 0x07564428
 _APPINFO_MAGIC_V27 = 0x07564427
 # Parse cache keyed on (path, mtime, size) — the file only changes when Steam
-# updates app metadata, and a full parse of a real 4.2MB file measures ~80ms.
-_APPINFO_CACHE = {"key": None, "val": None}
+# updates app metadata. A full parse of a real 4.2MB / 1562-app file measures
+# 172ms on the bazzite box (2026-08-16; the older ~80ms figure was a smaller
+# library, kept here as the reason the cache exists at all).
+#
+# ONE cache, ONE key shape, ONE parser. A second complete parser used to live
+# ~150 lines below with its own `_APPINFO_CACHE = {...}` that redefined this at
+# import and keyed it (mtime, size) instead — see _steam_appinfo_names for what
+# that cost. `val` is the rich {appid: {name, type}} view; `names` memoizes the
+# {appid: name} projection under the same key. Measured after: six alternating
+# calls across both views cost 0.2ms total, against ~1s of re-parsing before.
+_APPINFO_LOCK = threading.Lock()
+_APPINFO_CACHE = {"key": None, "val": None, "names": None}
 
 
 def _appinfo_bvdf(buf, pos, end, strings):
@@ -8423,8 +8910,9 @@ def _appinfo_names():
     try:
         st = os.stat(path)
         key = (path, st.st_mtime, st.st_size)
-        if _APPINFO_CACHE["key"] == key:
-            return _APPINFO_CACHE["val"]
+        with _APPINFO_LOCK:
+            if _APPINFO_CACHE["key"] == key:
+                return _APPINFO_CACHE["val"]
         with open(path, "rb") as f:
             buf = f.read()
         magic, _universe = struct.unpack_from("<II", buf, 0)
@@ -8465,7 +8953,9 @@ def _appinfo_names():
             except Exception:
                 pass  # one bad blob must not sink the rest
             pos = blob_end
-        _APPINFO_CACHE.update(key=key, val=out)
+        with _APPINFO_LOCK:
+            # A new key invalidates the memoized names projection too.
+            _APPINFO_CACHE.update(key=key, val=out, names=None)
         return out
     except Exception:
         return {}
@@ -8522,141 +9012,36 @@ MOCK_INSTALLABLE = [
 # 404s for uncached art; the app falls back to the title.
 # ---------------------------------------------------------------------------
 
-# appinfo.vdf name cache: parsing the (multi-MB) blob on every /api/steamlink
-# poll is wasteful, and it changes rarely. Cache the full {appid:int -> name}
-# map keyed by the file's mtime+size so a Steam metadata refresh invalidates it.
-_APPINFO_CACHE = {"key": None, "names": {}}
-_APPINFO_LOCK = threading.Lock()
-_APPINFO_MAGIC_V29 = 0x07564429
-_APPINFO_MAGIC_V28 = 0x07564428
-
-
-def _appinfo_path():
-    root = _steam_root()
-    if root is None:
-        return None
-    p = os.path.join(root, "appcache", "appinfo.vdf")
-    return p if os.path.isfile(p) else None
-
-
-def _parse_appinfo_names(data):
-    """{appid:int -> name:str} from an appinfo.vdf blob (v28 inline-key or v29
-    string-table). Defensive: a malformed app entry is skipped, never raised;
-    a wholly unparseable blob yields {}. Only common->name is extracted."""
-    names = {}
-    try:
-        magic = struct.unpack_from("<I", data, 0)[0]
-    except struct.error:
-        return names
-    if magic not in (_APPINFO_MAGIC_V29, _APPINFO_MAGIC_V28):
-        return names
-    v29 = magic == _APPINFO_MAGIC_V29
-    # string table (v29 only): keys in the KV blob are int32 indices into it.
-    name_idx = None
-    if v29:
-        try:
-            st_off = struct.unpack_from("<q", data, 8)[0]
-            count = struct.unpack_from("<I", data, st_off)[0]
-            strings, p = [], st_off + 4
-            for _ in range(count):
-                e = data.index(b"\x00", p)
-                strings.append(data[p:e])
-                p = e + 1
-            name_idx = strings.index(b"name")
-        except (struct.error, ValueError, IndexError):
-            return names
-        section = 16
-    else:
-        section = 12
-    # Within an app entry the KV blob begins after the fixed header fields:
-    # infoState(4) lastUpdated(4) picsToken(8) sha1(20) changeNumber(4)
-    # + v29's second (binary-vdf) sha1(20).
-    kv_off = 4 + 4 + 8 + 20 + 4 + (20 if v29 else 0)
-    n = len(data)
-    p = section
-    while p + 8 <= n:
-        try:
-            appid = struct.unpack_from("<I", data, p)[0]
-            if appid == 0:
-                break
-            size = struct.unpack_from("<I", data, p + 4)[0]
-            blob_start = p + 8
-            blob_end = blob_start + size
-            p = blob_end
-            names_val = _appinfo_find_name(data, blob_start + kv_off,
-                                           min(blob_end, n), name_idx, v29)
-            if names_val:
-                names[appid] = names_val
-        except (struct.error, ValueError, IndexError):
-            break
-    return names
-
-
-def _appinfo_find_name(data, start, end, name_idx, v29):
-    """The first string field named "name" in one app's KV blob, or None. Keys
-    are int32 string-table indices (v29) or inline NUL-terminated (v28)."""
-    p = start
-    depth = 0
-    try:
-        while p < end:
-            t = data[p]
-            p += 1
-            if t == 0x08:            # end of map
-                depth -= 1
-                if depth < 0:
-                    return None
-                continue
-            if v29:
-                key = struct.unpack_from("<I", data, p)[0]
-                p += 4
-            else:
-                e = data.index(b"\x00", p)
-                key = data[p:e]
-                p = e + 1
-            if t == 0x00:            # nested map
-                depth += 1
-                continue
-            if t == 0x01:            # string value
-                e = data.index(b"\x00", p)
-                val = data[p:e]
-                p = e + 1
-                if (name_idx is not None and key == name_idx) or \
-                        (name_idx is None and key == b"name"):
-                    return val.decode("utf-8", "replace")
-                continue
-            if t == 0x02:            # int32
-                p += 4
-                continue
-            if t == 0x07:            # int64
-                p += 8
-                continue
-            return None              # unknown type: stop this app safely
-    except (IndexError, struct.error):
-        return None
-    return None
-
-
+# Steam Link's name lookup is a PROJECTION of the parser above, not a second
+# parser. It used to be exactly that: ~135 lines re-implementing binary-VDF
+# traversal, with its own magic constants, its own _appinfo_path, and its own
+# `_APPINFO_CACHE = {...}` that REDEFINED the real one at import (last
+# definition wins) under an incompatible key shape. The two consumers then
+# evicted each other on every alternation between /api/steamlink and
+# /api/steam/installable, paying the full ~80ms re-parse each time. It degraded
+# closed rather than crashing, which is why it went unnoticed.
+#
+# The surviving parser is a strict superset: it also handles v27 and carries
+# `type`, which is why this direction was the safe one to collapse.
 def _steam_appinfo_names():
-    """{appid:int -> name}, cached by appinfo.vdf mtime+size. {} on any error."""
-    path = _appinfo_path()
-    if path is None:
-        return {}
-    try:
-        st = os.stat(path)
-        key = (st.st_mtime, st.st_size)
-    except OSError:
+    """{appid:int -> name} from appinfo.vdf. {} on any error (degrades closed).
+
+    Memoized under the SHARED cache key, so the /proc scan in _running_game and
+    the Steam Link poll do not rebuild a ~1100-entry dict on every call."""
+    meta = _appinfo_names()
+    if not meta:
         return {}
     with _APPINFO_LOCK:
+        key = _APPINFO_CACHE["key"]
+        cached = _APPINFO_CACHE["names"]
+        if cached is not None:
+            return cached
+    names = {aid: m["name"] for aid, m in meta.items()}
+    with _APPINFO_LOCK:
+        # Publish only if the parse we derived from is still the current one;
+        # a concurrent re-parse must win rather than be silently overwritten.
         if _APPINFO_CACHE["key"] == key:
-            return _APPINFO_CACHE["names"]
-    try:
-        with open(path, "rb") as f:
-            names = _parse_appinfo_names(f.read())
-    except OSError:
-        return {}
-    with _APPINFO_LOCK:
-        _APPINFO_CACHE["key"] = key
-        _APPINFO_CACHE["names"] = names
+            _APPINFO_CACHE["names"] = names
     return names
 
 
@@ -12614,6 +12999,11 @@ _LGCOM_OPS = {
                                 # NIC alive in standby, unlike a consumer TV
                                 # which needs Wake-on-LAN.
 }
+# Input switching is NOT wired: there is no "input" op here, and real_lgcom
+# consults only this table (plus the special-cased "mute"). If it is ever added,
+# the command is "xb" with LG's input byte — 90 = HDMI1, 91 = HDMI2, and so on.
+# That mapping is the only thing worth keeping from the unreachable lgcom_input()
+# helper that sat below until 2026-08-16.
 
 
 def lgcom_available():
@@ -12654,11 +13044,6 @@ def _lgcom_value(reply):
     i = reply.index("OK") + 2
     v = reply[i:i + 2]
     return v if len(v) == 2 else None
-
-
-def lgcom_input(host, code):
-    """Switch input. `code` is LG's input byte (90 = HDMI1, 91 = HDMI2, ...)."""
-    return _lgcom_ok(_lgcom_cmd(host, "xb", code))
 
 
 def lgcom_mute(host, on):
@@ -18108,7 +18493,14 @@ def pair_pin_active():
 def pair_pin_check(pin):
     """Validate a submitted PIN. True (and burns the session) on match; raises
     ValueError with a user-facing reason on no-session / expired / locked /
-    wrong. A wrong guess counts toward the attempt cap."""
+    wrong. A wrong guess counts toward the attempt cap.
+
+    `pin` is UNTRUSTED and arrives from an unauthenticated route, so a non-string
+    is REJECTED rather than coerced (§3.6). It used to be `(pin or "").strip()`,
+    which raises AttributeError on any truthy non-string — `{"pin": 5}` and
+    `{"pin": 3.4}` both escaped the caller's except tuple and surfaced as a 500.
+    A falsy non-string (None, [], 0) happened to survive via the `or`, which is
+    why this was never noticed."""
     global PAIR_PIN
     with PAIR_PIN_LOCK:
         s = PAIR_PIN
@@ -18118,7 +18510,7 @@ def pair_pin_check(pin):
         if s["attempts"] >= PAIR_PIN_MAX_ATTEMPTS:
             PAIR_PIN = None
             raise ValueError("too many wrong PINs — start again")
-        if (pin or "").strip() != s["pin"]:
+        if not isinstance(pin, str) or pin.strip() != s["pin"]:
             s["attempts"] += 1
             raise ValueError("wrong PIN")
         PAIR_PIN = None                       # consume on success
@@ -19414,11 +19806,17 @@ class Handler(BaseHTTPRequestHandler):
                         pair_show_on_box(self.port)
                     self._send(200, {"ok": True, "ttl": ttl}, started)
                     return
+                # .get() stays OUTSIDE the try on purpose. It used to sit inside,
+                # so a body that PARSES but is not an object ([], "x", 5) raised
+                # AttributeError past this except tuple into the do_POST catch-all
+                # and answered 500 on a pre-auth route. Widening the tuple would
+                # have hidden it instead: any future AttributeError in the
+                # token-issuing block below would silently read as "no PIN sent".
                 try:
                     req = json.loads(pair_body.decode("utf-8")) if pair_body else {}
-                    submitted = req.get("pin")
                 except (ValueError, UnicodeDecodeError):
-                    submitted = None
+                    req = None
+                submitted = req.get("pin") if isinstance(req, dict) else None
                 try:
                     pair_pin_check(submitted)
                 except ValueError as e:
@@ -19635,6 +20033,45 @@ class Handler(BaseHTTPRequestHandler):
                            res, started)
                 return
 
+            if path == "/api/leds/sequence":
+                # Play a custom TIMED sequence on a STRIP: the client sends `frames`
+                # (per-LED colour DATA, each validated to {r,g,b}|null), `hold_ms`,
+                # `loop`. SAME allowlist discipline as the paint path -- the client
+                # provides colour DATA the agent renders via fixed-literal writers;
+                # the strip PREFIX is looked up in the live listdir, never interpolated.
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(req, dict):
+                        raise ValueError("body must be a JSON object")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "body must be a JSON object"}, started)
+                    return
+                strip_name = req.get("strip")
+                frames, hold_ms, holds, brightness, loop, verr = _validate_sequence_body(req)
+                if verr is not None:
+                    self._send(400, {"error": verr}, started)
+                    return
+                if self.mock:
+                    ms = _led_strips([l["name"] for l in MOCK_LEDS if l["writable"]])
+                    if not isinstance(strip_name, str) or strip_name not in ms:
+                        self._send(404, {"error": "unknown strip"}, started)
+                        return
+                    active = {
+                        "effect": "sequence", "frames": len(frames), "hold_ms": hold_ms,
+                        "loop": loop, "brightness": brightness if brightness is not None else 100}
+                    if holds is not None:
+                        active["holds"] = list(holds)
+                    _MOCK_FX["strip:" + strip_name] = active
+                    self._send(200, {"ok": True, "strip": strip_name,
+                                     "active": _MOCK_FX["strip:" + strip_name]}, started)
+                    return
+                res = apply_strip_sequence(strip_name, frames, hold_ms, brightness, loop, holds)
+                if res is None:
+                    self._send(404, {"error": "unknown strip"}, started)
+                    return
+                self._send(200, res, started)
+                return
+
             if path == "/api/leds/effect":
                 # Start/replace an animated effect (breathe/pulse/rainbow/strobe/
                 # scanner) or a solid/off on an LED. SAME allowlist shape as
@@ -19651,7 +20088,7 @@ class Handler(BaseHTTPRequestHandler):
                                started)
                     return
                 led_name = req.get("led")
-                effect, color, speed, brightness, verr = _validate_effect_body(req)
+                effect, color, speed, brightness, reverse, verr = _validate_effect_body(req)
                 if verr is not None:
                     self._send(400, {"error": verr}, started)
                     return
@@ -19679,7 +20116,7 @@ class Handler(BaseHTTPRequestHandler):
                         self._send(200, {"ok": True, "strip": strip_name,
                                          "active": _MOCK_FX.get(key)}, started)
                         return
-                    res = apply_strip_effect(strip_name, effect, color, speed, brightness)
+                    res = apply_strip_effect(strip_name, effect, color, speed, brightness, reverse)
                     if res is None:
                         self._send(404, {"error": "unknown strip"}, started)
                         return
@@ -19734,7 +20171,7 @@ class Handler(BaseHTTPRequestHandler):
                                started)
                     return
                 device = req.get("device")
-                effect, color, speed, brightness, verr = _validate_effect_body(req)
+                effect, color, speed, brightness, reverse, verr = _validate_effect_body(req)
                 if verr is not None:
                     self._send(400, {"error": verr}, started)
                     return
