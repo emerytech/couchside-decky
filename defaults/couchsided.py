@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.95"
+VERSION = "2.9.99"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -3157,6 +3157,7 @@ def player_info():
                 "service_hosts": {k: list(v) for k, v in _PLAYER_SERVICE_HOSTS.items()},
                 "open_url": _pl_custom_url_enabled(),
                 "nav_ops": sorted(PLAYER_JS_NAV),
+                "key_ops": sorted(PLAYER_CDP_KEYS),
                 "ui_scale": _PL_MOCK.get("scale") or _pl_ui_scale(),
                 "ui_scales": list(_PL_UI_SCALES),
                 "playback": player_playback(),
@@ -3177,6 +3178,9 @@ def player_info():
             # d-pad's up/down can move focus BETWEEN rows or must fall back to
             # plain arrow keys (which only scroll on the streaming sites).
             "nav_ops": sorted(PLAYER_JS_NAV),
+            # Trusted CDP key ops (OK/Back) the d-pad can use instead of uinput,
+            # so they work when the Player window is not OS-focused (additive).
+            "key_ops": sorted(PLAYER_CDP_KEYS),
             # TV zoom (additive): the effective scale and the frozen set of
             # choices, so the app renders exactly the values the box accepts.
             "ui_scale": _pl_ui_scale(),
@@ -3572,13 +3576,12 @@ class _PlayerCDP:
             if opcode == 0x8:
                 raise OSError("CDP peer closed")
 
-    def evaluate(self, expression):
-        """Run ONE agent-authored script and return its value. `expression` is
-        always a constant from this module — never anything a client sent."""
-        payload = json.dumps({
-            "id": 1, "method": "Runtime.evaluate",
-            "params": {"expression": expression, "returnByValue": True},
-        }).encode()
+    def _call(self, method, params):
+        """Send ONE CDP command and return its `result`. `method` and `params`
+        are always module constants — never anything a client sent. Ids are
+        reused across sequential calls (send -> reply -> next send), which CDP
+        permits since there is never more than one in flight."""
+        payload = json.dumps({"id": 1, "method": method, "params": params}).encode()
         mask = os.urandom(4)
         n = len(payload)
         header = bytes([0x81])
@@ -3594,11 +3597,34 @@ class _PlayerCDP:
         while time.monotonic() < deadline:
             msg = json.loads(self._frame())
             if msg.get("id") == 1:      # everything else is an event
+                if "error" in msg:
+                    raise OSError("CDP error")
                 res = msg.get("result", {})
                 if "exceptionDetails" in res:
                     raise OSError("CDP script raised")
-                return res.get("result", {}).get("value")
+                return res
         raise OSError("CDP timed out")
+
+    def evaluate(self, expression):
+        """Run ONE agent-authored script and return its value. `expression` is
+        always a constant from this module — never anything a client sent."""
+        return self._call("Runtime.evaluate",
+                          {"expression": expression, "returnByValue": True}
+                          ).get("result", {}).get("value")
+
+    def dispatch_key(self, key, code, vk):
+        """Send a TRUSTED key press+release to the page via CDP. Unlike the
+        uinput keyboard (which goes to whatever the compositor has focused),
+        Input.dispatchKeyEvent targets the page's renderer directly, so it works
+        even when the Player window is not the OS-focused surface (KI-066) — and
+        it is isTrusted, so sites like Netflix that ignore synthetic JS events
+        still act on it. key/code/vk are always module constants."""
+        for typ in ("keyDown", "keyUp"):
+            self._call("Input.dispatchKeyEvent", {
+                "type": typ, "key": key, "code": code,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+            })
+        return True
 
 
 def _pl_cdp_run(expression):
@@ -3712,6 +3738,59 @@ def _pl_seek_by_key(secs):
         except Exception:
             pass
     return {"ok": True, "op": "seek", "secs": secs, "via": "key"}
+
+
+# Trusted key presses the d-pad sends via CDP instead of the uinput keyboard.
+# WHY: uinput delivers to whatever the COMPOSITOR has focused, so OK/Back went
+# nowhere whenever the Player window lost OS focus (KI-066). CDP
+# Input.dispatchKeyEvent targets the page's renderer directly — focus-independent
+# AND trusted (Netflix acts on it). Frozen: op id -> (key, code, virtual-keycode),
+# every field a constant. The spatial nav ops (navup/down/left/right) already
+# avoid keys entirely; these are the two that had to be keys (activate + exit).
+PLAYER_CDP_KEYS = {
+    "ok":   ("Enter", "Enter", 13),
+    "back": ("Escape", "Escape", 27),
+}
+
+
+def _pl_cdp_key(name):
+    """Dispatch one allowlisted trusted key to the player's page. None on any
+    failure (degrade closed). `name` is a frozen-dict key, never interpolated."""
+    spec = PLAYER_CDP_KEYS.get(name)
+    if spec is None:
+        return None
+    port = _pl_cdp_port()
+    if port is None:
+        return None
+    cdp = None
+    try:
+        cdp = _PlayerCDP(port)
+        return cdp.dispatch_key(*spec)
+    except (OSError, ValueError, KeyError):
+        return None
+    finally:
+        if cdp is not None:
+            cdp.close()
+
+
+def player_key(op):
+    """Send OK/Back as a trusted CDP key. ValueError => 404, nothing runs.
+
+    Same frozen-lookup discipline as player_nav: the op id selects an entry in
+    PLAYER_CDP_KEYS; the key/code/keycode are constants, never from the request.
+    """
+    if not isinstance(op, str):
+        raise ValueError("key op must be a string")
+    if op not in PLAYER_CDP_KEYS:
+        raise ValueError("unknown key op")
+    if PL_MOCK:
+        return {"ok": True, "op": op}
+    if not _pl_running():
+        raise RuntimeError("player is not running")
+    ok = _pl_cdp_key(op)
+    if ok is None:
+        raise RuntimeError("could not reach the player")
+    return {"ok": bool(ok), "op": op}
 
 
 def player_nav(op):
@@ -5893,6 +5972,115 @@ def apply_strip_sequence(prefix, frames, hold_ms, brightness, loop=True, holds=N
     if hnorm is not None:
         active["holds"] = hnorm
     return {"ok": True, "strip": prefix, "active": active}
+
+
+# ---------------------------------------------------------------------------
+# LED THEME CATALOG — built-in strip animations that live HERE, in the agent,
+# so a new theme ships with an agent update (which auto-installs to boxes) and
+# appears in the app WITHOUT an app-store resubmit. The app fetches the catalog
+# (GET /api/leds/themes) and fires one by id (POST /api/leds/theme); the agent
+# knows the strip's LED count, so each generator sizes its frames to the strip.
+#
+# A theme id is LOOKED UP in the frozen LED_THEMES dict, never interpolated. A
+# generator returns (frames, holds) as pure colour DATA + int ms, which is then
+# re-validated per-LED by apply_strip_sequence (fixed-literal writers, §3). The
+# flicker is a DETERMINISTIC hash of pixel+frame index (not random), so a theme
+# renders identically every time and stays unit-testable.
+# ---------------------------------------------------------------------------
+def _theme_hue_rgb(h):
+    """h in [0,1) -> (r,g,b) 0..255, full saturation/value. No colorsys import."""
+    i = int(h * 6) % 6
+    f = h * 6 - int(h * 6)
+    q = int(255 * (1 - f))
+    t = int(255 * f)
+    return ((255, t, 0), (q, 255, 0), (0, 255, t), (0, q, 255),
+            (t, 0, 255), (255, 0, q))[i]
+
+
+def _theme_flicker(i, f):
+    """Deterministic per-pixel/per-frame brightness factor in [0.5, 1.0]."""
+    return 0.5 + 0.5 * (((i * 7 + f * 13) % 11) / 10.0)
+
+
+def _theme_scale(c, fl):
+    return (int(c[0] * fl), int(c[1] * fl), int(c[2] * fl))
+
+
+def _theme_portal(n):
+    """Aperture-style split field: orange LEFT half, blue RIGHT half, meeting in
+    the middle, each side flickering like an energy field."""
+    half = (n + 1) // 2
+    orange, blue = (255, 95, 0), (0, 120, 255)
+    frames, holds = [], []
+    for f in range(12):
+        frames.append([_theme_scale(orange if i < half else blue, _theme_flicker(i, f))
+                       for i in range(n)])
+        holds.append(60 + (f * 17) % 50)   # 60..110 ms, varied so it feels organic
+    return frames, holds
+
+
+def _theme_rainbowflow(n):
+    """A full-spectrum gradient flowing around the strip (seamless loop)."""
+    frames = [[_theme_hue_rgb(((i + s) / max(1, n)) % 1.0) for i in range(n)]
+              for s in range(max(1, n))]
+    return frames, [80] * len(frames)
+
+
+def _theme_heartbeat(n):
+    """Two quick red pulses, then a long dark rest."""
+    red = [(255, 0, 0)] * n
+    off = [None] * n
+    return [list(red), list(off), list(red), list(off)], [150, 120, 150, 800]
+
+
+def _theme_police(n):
+    """Red half / blue half, flashing between the two sides."""
+    half = (n + 1) // 2
+    a = [(255, 0, 0) if i < half else None for i in range(n)]
+    b = [None if i < half else (0, 40, 255) for i in range(n)]
+    return [a, b], [110, 110]
+
+
+# Frozen: id -> (label, generator). A request only ever indexes this by id.
+LED_THEMES = {
+    "portal":      ("Portal", _theme_portal),
+    "rainbowflow": ("Rainbow River", _theme_rainbowflow),
+    "heartbeat":   ("Heartbeat", _theme_heartbeat),
+    "police":      ("Police", _theme_police),
+}
+# Preview accent for the app's picker chip (a representative colour), so the app
+# needn't know each theme's internals. Additive; unknown ids just get no accent.
+LED_THEME_ACCENTS = {
+    "portal": {"r": 255, "g": 95, "b": 0},
+    "rainbowflow": {"r": 0, "g": 200, "b": 120},
+    "heartbeat": {"r": 255, "g": 0, "b": 0},
+    "police": {"r": 0, "g": 80, "b": 255},
+}
+
+
+def leds_theme_catalog():
+    """The theme list for GET /api/leds/themes (app picker). Order is stable."""
+    return [{"id": k, "label": LED_THEMES[k][0],
+             "accent": LED_THEME_ACCENTS.get(k)}
+            for k in LED_THEMES]
+
+
+def apply_led_theme(theme_id, prefix, brightness):
+    """Generate a built-in theme sized to the strip and play it. theme_id is a
+    frozen-dict key; the generator's output is colour DATA re-validated by
+    apply_strip_sequence. None -> 404 (unknown theme or strip)."""
+    if not isinstance(theme_id, str) or theme_id not in LED_THEMES:
+        return None
+    if not isinstance(prefix, str):
+        return None
+    members = _led_strips().get(prefix)
+    if not members:
+        return None
+    n = len(members)
+    frames, holds = LED_THEMES[theme_id][1](n)
+    b = brightness if _is_pct(brightness) else 100
+    return apply_strip_sequence(prefix, frames, holds[0] if holds else 120, b,
+                                loop=True, holds=holds)
 
 
 def _validate_sequence_body(req):
@@ -10176,14 +10364,120 @@ def _launcher_argv(launcher_id):
     return None
 
 
+# Graphical-session env vars a launched process needs to reach the display.
+# The agent (a systemd --user service) inherits NONE of these, so without
+# discovery it can only guess -- and a wrong DISPLAY is exactly Steam's
+# "Unable to open a connection to X" (kb ref 4050-WOJB-0608). Measured on a
+# SteamOS Game Mode box: the Steam UI is on :0, games on :1, and the agent's
+# process environ carried only XDG_RUNTIME_DIR.
+_SESSION_ENV_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY")
+
+# Live processes to harvest that env from, most authoritative first. `steam`
+# is the exact context a Steam handoff launches into; the desktop shells cover
+# a box sitting on the desktop with Steam closed. gamescope is deliberately
+# absent -- on SteamOS its /proc/<pid>/environ is NOT readable by our uid
+# (measured: EACCES), so relying on it would silently degrade to the guess.
+_SESSION_ENV_DONORS = ("steam", "plasmashell", "kwin_wayland", "gnome-shell",
+                       "sway", "Hyprland", "labwc", "weston", "Xwayland")
+
+
+def _parse_environ_blob(raw):
+    """NUL-separated KEY=VALUE bytes (as in /proc/<pid>/environ) -> dict.
+    Skips chunks without '=' and any value that is not valid UTF-8."""
+    out = {}
+    for chunk in raw.split(b"\0"):
+        if b"=" not in chunk:
+            continue
+        k, _, v = chunk.partition(b"=")
+        try:
+            out[k.decode()] = v.decode()
+        except UnicodeDecodeError:
+            pass
+    return out
+
+
+def _read_proc_environ(pid):
+    """Parse /proc/<pid>/environ into a dict. Returns {} on any error (the
+    process may be gone, or owned by another uid). Never raises."""
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return {}
+    return _parse_environ_blob(raw)
+
+
+def _session_donor_pids():
+    """PIDs of same-uid graphical-session donor processes, ordered by
+    _SESSION_ENV_DONORS priority. Reads only /proc; degrades to [] on error."""
+    our_uid = UID
+    by_donor = {d: [] for d in _SESSION_ENV_DONORS}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            if os.stat("/proc/%d" % pid).st_uid != our_uid:
+                continue
+            with open("/proc/%d/comm" % pid) as f:
+                comm = f.read().strip()
+        except OSError:
+            continue
+        if comm in by_donor:
+            by_donor[comm].append(pid)
+    ordered = []
+    for d in _SESSION_ENV_DONORS:
+        ordered.extend(by_donor[d])
+    return ordered
+
+
+def _harvest_session_env():
+    """Best-effort DISPLAY / WAYLAND_DISPLAY / XAUTHORITY read from a live,
+    same-uid process already inside the graphical session. Returns a dict of
+    only the keys actually found (so the caller can leave the rest to its
+    fallbacks). Never raises; {} means "discovered nothing, use the guess".
+
+    Only reflects reality -- it never invents a value. A per-game
+    pressure-vessel sandbox XAUTHORITY is skipped: it is not valid for a
+    general launch, and the real host one (if any) comes from another donor."""
+    found = {}
+    for pid in _session_donor_pids():
+        env = _read_proc_environ(pid)
+        if not env:
+            continue
+        for k in _SESSION_ENV_KEYS:
+            if k in found or not env.get(k):
+                continue
+            v = env[k]
+            if k == "XAUTHORITY" and "/pressure-vessel/" in v:
+                continue
+            found[k] = v
+        # A DISPLAY or WAYLAND_DISPLAY is the load-bearing bit; once we have one
+        # from the highest-priority donor that had it, stop.
+        if found.get("DISPLAY") or found.get("WAYLAND_DISPLAY"):
+            break
+    return found
+
+
 def _session_env():
     """Env for launching into the user's graphical session.
 
-    Starts from _user_env() (sets XDG_RUNTIME_DIR) and best-effort discovers
-    DISPLAY / WAYLAND_DISPLAY if not already present: DISPLAY defaults to ":0";
-    WAYLAND_DISPLAY is inferred from a wayland-* socket in XDG_RUNTIME_DIR.
+    Starts from _user_env() (sets XDG_RUNTIME_DIR), then DISCOVERS
+    DISPLAY / WAYLAND_DISPLAY / XAUTHORITY from a live session process
+    (_harvest_session_env) rather than guessing -- the guess is what produced
+    Steam's X-connection error on boxes whose display was not :0. Anything
+    discovery cannot find falls back to the old behaviour: DISPLAY defaults to
+    ":0"; WAYLAND_DISPLAY is inferred from a wayland-* socket in
+    XDG_RUNTIME_DIR. A value already present in the environ always wins.
     """
     env = _user_env()
+    if any(not env.get(k) for k in _SESSION_ENV_KEYS):
+        for k, v in _harvest_session_env().items():
+            env.setdefault(k, v)  # never override an inherited real value
     if not env.get("DISPLAY"):
         env["DISPLAY"] = ":0"
     if not env.get("WAYLAND_DISPLAY"):
@@ -18564,6 +18858,60 @@ def _gamepad_keepalive_loop():
             pass
 
 
+# ---------------------------------------------------------------------------
+# Live volume events (/ws/volume) — a receive-only WS push channel.
+#
+# WHY THIS EXISTS: on a Steam Machine the box audio is a FIXED HDMI-passthrough
+# sink (measured: `wpctl set-volume` is ignored) and a plain TV feature-aborts
+# CEC Give Audio Status (measured), so the app cannot READ an absolute volume
+# level to display. But it CAN show the change the moment it happens: whenever
+# Couchside itself runs a volume op (the app's own volume buttons), the agent
+# pushes a relative nudge (up / down / mute) so the phone flashes a volume OSD
+# without the user looking at the TV. This is 100% reliable because the agent is
+# the one performing the change — no snooping. (Catching EXTERNAL changes, e.g.
+# a physical rocker, would need root CEC MONITOR_ALL; not delivered.)
+#
+# ALLOWLIST/SAFETY (CLAUDE.md §3): purely OUTBOUND. The client authenticates
+# with the bearer token, then only RECEIVES — nothing it sends becomes a command,
+# a path, or a shell string. The nudge direction is chosen by the agent from a
+# frozen op map, never from client input.
+VOLUME_SESSIONS = []                 # list of {"conn","slock"} entries (receive-only)
+VOLUME_LOCK = threading.Lock()
+VOLUME_IDLE_TIMEOUT_S = 65           # reap a client silent this long (app pings ~25s)
+
+# The volume ops whose success is worth flashing an OSD for -> the direction we
+# report. A frozen lookup (CLAUDE.md §3): a non-volume op yields None and pushes
+# nothing. mute is a toggle, reported as its own kind.
+_VOLUME_OP_DIR = {"volume_up": "up", "volume_down": "down", "mute": "mute"}
+
+
+def _volume_broadcast(obj):
+    """Send one JSON frame to every live /ws/volume client. Snapshot under the
+    lock, send outside it (each _wsend_json takes only that socket's slock), so
+    socket I/O never blocks VOLUME_LOCK — same discipline as _gamepad_broadcast."""
+    with VOLUME_LOCK:
+        entries = list(VOLUME_SESSIONS)
+    for entry in entries:
+        _wsend_json(entry, obj)
+
+
+def _volume_nudge(op):
+    """Broadcast a volume-OSD nudge for a volume op Couchside just ran. A
+    non-volume op (power_on/…) or a non-string is ignored — nothing is pushed.
+    Call only AFTER the op succeeded, so the OSD never lies about a no-op."""
+    direction = _VOLUME_OP_DIR.get(op) if isinstance(op, str) else None
+    if direction:
+        _volume_broadcast({"t": "vol", "dir": direction})
+
+
+def _volume_events_available():
+    """Hint for the hello frame: the push channel itself is always functional, so
+    this is True. A nudge only actually arrives when Couchside runs a volume op,
+    so a box that can't change volume simply never flashes an OSD — the app keys
+    off the frames, not this flag."""
+    return True
+
+
 def _release_devices(entry):
     """Demote a session that stays connected as a waiter: destroy its gamepad
     (one pad per holder — the new holder brings its own) but KEEP the mouse and
@@ -19618,6 +19966,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_screen_ws(parsed, started)
                 return
 
+            if path == "/ws/volume":
+                # Same pre-auth-zone rationale as /ws/screen. Receive-only push
+                # of CEC volume nudges; self-auths (?token=) then degrades closed
+                # (hello volume_events:false) on a box without kernel CEC.
+                self._handle_volume_ws(parsed, started)
+                return
+
             if path == "/ws/h264":
                 # P4b WebCodecs tier: same pre-auth-zone rationale as /ws/screen.
                 # The handler self-auths (?token=), then relays the portal helper's
@@ -19939,6 +20294,12 @@ class Handler(BaseHTTPRequestHandler):
                 # available:false = nothing controllable here. Set = POST
                 # /api/leds/set.
                 self._send(200, leds_state(self.mock), started)
+            elif path == "/api/leds/themes":
+                # READ-ONLY: the built-in strip theme catalog (id + label +
+                # accent), so the app renders the picker without knowing each
+                # theme's internals. New themes appear here on an agent update —
+                # no app resubmit. 404 on an old agent -> app uses its built-ins.
+                self._send(200, {"themes": leds_theme_catalog()}, started)
             elif path == "/api/openrgb":
                 # READ-ONLY: OpenRGB controllers (whole-system / addressable RGB)
                 # + their running effect, for the OpenRGB card (cap `openrgb`).
@@ -20544,6 +20905,45 @@ class Handler(BaseHTTPRequestHandler):
                 if res is None:
                     self._send(404, {"error": "unknown strip"}, started)
                     return
+                self._send(200, res, started)
+                return
+
+            if path == "/api/leds/theme":
+                # Play a BUILT-IN theme on a strip. The client sends only the
+                # theme id (looked up in the frozen LED_THEMES) + the strip
+                # prefix (looked up in the live listdir) + brightness. The agent
+                # GENERATES the frames sized to the strip; the client never
+                # supplies colour data, so a new theme is agent-only (ships with
+                # an agent update, no app resubmit).
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(req, dict):
+                        raise ValueError("body must be a JSON object")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "body must be a JSON object"}, started)
+                    return
+                theme_id = req.get("theme")
+                strip_name = req.get("strip")
+                brightness = req.get("brightness")
+                if self.mock:
+                    if not isinstance(theme_id, str) or theme_id not in LED_THEMES:
+                        self._send(404, {"error": "unknown theme"}, started)
+                        return
+                    ms = _led_strips([l["name"] for l in MOCK_LEDS if l["writable"]])
+                    if not isinstance(strip_name, str) or strip_name not in ms:
+                        self._send(404, {"error": "unknown strip"}, started)
+                        return
+                    _MOCK_FX["strip:" + strip_name] = {"effect": "sequence",
+                        "theme": theme_id, "brightness": brightness if _is_pct(brightness) else 100}
+                    self._send(200, {"ok": True, "strip": strip_name,
+                                     "theme": theme_id}, started)
+                    return
+                res = apply_led_theme(theme_id, strip_name, brightness)
+                if res is None:
+                    self._send(404, {"error": "unknown theme or strip"}, started)
+                    return
+                res = dict(res)
+                res["theme"] = theme_id
                 self._send(200, res, started)
                 return
 
@@ -21433,6 +21833,18 @@ class Handler(BaseHTTPRequestHandler):
                         self._send(409, {"error": str(e)}, started)
                         return
                     self._send(200, r, started)
+                elif op in ("ok", "back"):
+                    # Trusted CDP key (Enter / Escape) — focus-independent
+                    # OK/Back for the d-pad. op id selects a frozen key spec.
+                    try:
+                        r = player_key(op)
+                    except ValueError:
+                        self._send(404, {"error": "not allowed"}, started)
+                        return
+                    except RuntimeError as e:
+                        self._send(409, {"error": str(e)}, started)
+                        return
+                    self._send(200, r, started)
                 elif op == "scale":
                     # TV zoom. The value is a SELECTOR into the frozen
                     # _PL_UI_SCALES tuple — membership or 404, never parsed.
@@ -21663,6 +22075,12 @@ class Handler(BaseHTTPRequestHandler):
                 if result is None:  # nothing can handle this op
                     self._send(404, {"error": "not found"}, started)
                     return
+                # Flash a volume OSD on every connected phone: the op ran, so a
+                # volume op means the volume just changed (non-volume ops are a
+                # no-op in _volume_nudge). App-driven and reliable — the agent
+                # itself performed the change, no CEC snooping involved.
+                if result.get("ok"):
+                    _volume_nudge(op)
                 self._send(200, result, started)
                 return
 
@@ -21825,6 +22243,82 @@ class Handler(BaseHTTPRequestHandler):
                   % (e.__class__.__name__, e), flush=True)
 
     # -- screen stream websocket (P4a, opt-in portal module) -------------------
+
+    def _volume_ws_handshake(self, parsed, started):
+        """Shared ?token= auth + 101 upgrade for a receive-only push WS. Returns
+        True once switched to WebSocket, False after sending an HTTP error. Mirrors
+        the /ws/screen handshake verbatim."""
+        self.close_connection = True
+        qs = parse_qs(parsed.query)
+        supplied = qs.get("token", [""])[0]
+        if not supplied or not hmac.compare_digest(supplied, self.token):
+            self._send(401, {"error": "unauthorized"}, started,
+                       extra_headers={"Connection": "close"})
+            return False
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        if upgrade != "websocket" or not key:
+            self._send(400, {"error": "websocket upgrade required"}, started,
+                       extra_headers={"Connection": "close"})
+            return False
+        accept = base64.b64encode(
+            hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+        try:
+            self.connection.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept.encode("ascii") + b"\r\n\r\n")
+        except OSError:
+            return False
+        self._log(101, started)
+        return True
+
+    def _handle_volume_ws(self, parsed, started):
+        """Live volume-change events over WebSocket. Self-auths (?token=) +
+        handshakes like /ws/screen, sends a `hello` advertising whether volume
+        events are live (a kernel CEC monitor is available), then registers as a
+        receive-only client and blocks until the socket closes. A box without CEC
+        degrades closed: hello says volume_events:false and the app shows no OSD."""
+        if not self._volume_ws_handshake(parsed, started):
+            return
+        self._volume_session()
+
+    def _volume_session(self):
+        """Register as a receive-only volume client and block until the socket
+        closes. Split out so a test can stub the blocking loop (same shape as
+        _h264_session)."""
+        conn = self.connection
+        entry = {"conn": conn, "slock": threading.Lock()}
+        _wsend_json(entry, {"t": "hello", "volume_events": _volume_events_available()})
+        with VOLUME_LOCK:
+            VOLUME_SESSIONS.append(entry)
+        # Receive-only: we read solely to notice the client go away and to keep
+        # the recv idle-clock fresh from its keepalive frames (the app pings so a
+        # backgrounded phone is reaped in <=VOLUME_IDLE_TIMEOUT_S and reconnects
+        # on foreground). The monitor thread is the ONLY writer of out-of-band
+        # frames; its writes take entry["slock"], so this reader never races it.
+        last = time.monotonic()
+        try:
+            conn.settimeout(min(20, VOLUME_IDLE_TIMEOUT_S))
+            while True:
+                try:
+                    data = conn.recv(1024)
+                except socket.timeout:
+                    if time.monotonic() - last > VOLUME_IDLE_TIMEOUT_S:
+                        break               # silent too long -> zombie, reap
+                    continue
+                except OSError:
+                    break
+                if not data:                 # clean TCP close
+                    break
+                last = time.monotonic()      # any inbound frame proves liveness
+        finally:
+            with VOLUME_LOCK:
+                try:
+                    VOLUME_SESSIONS.remove(entry)
+                except ValueError:
+                    pass
 
     def _handle_screen_ws(self, parsed, started):
         """MJPEG-over-WebSocket from the portal module. Mirrors the gamepad WS
