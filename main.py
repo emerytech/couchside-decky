@@ -29,6 +29,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -358,6 +359,139 @@ def _execstart_has_config(unit_text: str) -> bool:
     return False
 
 
+# ---- root file I/O inside the USER-owned state dir -------------------------
+# THIS BACKEND RUNS AS ROOT, and STATE_DIR is owned by the desktop user -- the
+# same account every game, browser and the LAN-exposed agent run as. So root
+# must never follow a symlink there (a planted `config.json -> /etc/shadow`
+# would otherwise be chowned to the user on the next plugin load, i.e. every
+# boot) and must never trust what it reads there. Everything below uses
+# O_NOFOLLOW fds, fchown/fchmod on the fd, and temp-file + os.replace() writes
+# (replace() swaps the directory entry, so a planted symlink is replaced, not
+# followed).
+
+# Token: /etc/couchside/token (TOKEN_FILE) is CANONICAL -- every rotation path
+# writes it (regenerate_token below, `couchside new-token`, install.sh). The
+# agent (>= 2.9.114) keeps a 0600 MIRROR at STATE_DIR/token, re-syncs it on every
+# start and serves it when the canonical file is gone: a SteamOS update has
+# dropped /etc/couchside wholesale while STATE_DIR survived. Same contract as
+# install.sh step (d)/(e0).
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{16,256}")
+_TOKEN_MAX_BYTES = 4096
+
+
+def _token_mirror() -> str:
+    """The agent's fallback copy of the token. Resolved at call time from
+    STATE_DIR so the tests can repoint the module globals."""
+    return os.path.join(STATE_DIR, "token")
+
+
+def _read_token(path, strict=False):
+    """The token stored at `path`, or None when it is missing, empty, oversized,
+    unreadable, not a regular file, or a symlink. Never raises.
+
+    `strict` additionally requires the content to LOOK like a token. Use it for
+    the user-writable mirror: without it, whatever a user-level process put
+    there (say, a copy of a root-only file) would be laundered into the
+    root-owned /etc/couchside/token."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, _TOKEN_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > _TOKEN_MAX_BYTES:
+        return None
+    tok = data.decode("utf-8", "replace").strip()
+    if not tok or (strict and not _TOKEN_RE.fullmatch(tok)):
+        return None
+    return tok
+
+
+def _write_private(path, data: str, uid: int, gid: int, mode: int = 0o600):
+    """Atomically write `data` to `path` with `mode`, owned uid:gid from the
+    first byte: a fresh temp file (O_CREAT|O_EXCL|O_NOFOLLOW, random name) in the
+    same directory, fchmod/fchown on the open fd, fsync, then os.replace() onto
+    `path`. Raises OSError; the temp file is removed on any failure."""
+    d = os.path.dirname(path) or "."
+    tmp = os.path.join(d, ".%s.%s.tmp" % (os.path.basename(path), secrets.token_hex(8)))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        try:
+            os.fchmod(fd, mode)
+            os.fchown(fd, uid, gid)
+            os.write(fd, data.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _ensure_state_dir(uid: int, gid: int):
+    """STATE_DIR, 0700 and owned by the desktop user (matching install.sh). The
+    agent writes temp files INTO this directory and os.replace()s them, so the
+    directory itself must be user-writable. /var/lib is root-owned, so the path
+    itself cannot be a user-planted symlink. Raises OSError."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    os.chown(STATE_DIR, uid, gid)
+
+
+def _sync_token_mirror(token: str, uid: int, gid: int) -> bool:
+    """Make the mirror hold `token`. Best effort: the agent re-syncs it from the
+    canonical file on every start, so a failure is logged, not raised."""
+    try:
+        _ensure_state_dir(uid, gid)
+        _write_private(_token_mirror(), token + "\n", uid, gid)
+        return True
+    except OSError:
+        log.exception("couchside: could not refresh the token mirror")
+        return False
+
+
+def _ensure_token(uid: int, gid: int) -> str:
+    """Install-time token step; returns the token the box will serve.
+
+    Order: canonical -> mirror -> an old product's token -> mint. When the
+    canonical file is missing, the mirror IS the live token phones are paired
+    to, so it must win over minting AND over a leftover old-product token.
+    Then the canonical file is (re)written 0600 for the desktop user and the
+    mirror refreshed to match. Never logs the token."""
+    os.makedirs(ETC_DIR, exist_ok=True)
+    token = _read_token(TOKEN_FILE)
+    if token is not None:
+        # Existing canonical: repair ownership/mode only. ETC_DIR is root-owned,
+        # so the desktop user cannot have swapped this file for a symlink.
+        os.chmod(TOKEN_FILE, 0o600)
+        os.chown(TOKEN_FILE, uid, gid)
+    else:
+        token = _read_token(_token_mirror(), strict=True)
+        if token is not None:
+            log.info("couchside: %s was missing; restored it from %s "
+                     "(existing pairings keep working)", TOKEN_FILE, _token_mirror())
+        else:
+            for old_etc, _, _ in OLD_INSTALLS:  # migrate an old product's token if present
+                old = _read_token(os.path.join(old_etc, "token"))
+                if old:
+                    token = old
+            if not token:
+                token = secrets.token_hex(24)
+        _write_private(TOKEN_FILE, token + "\n", uid, gid)
+    _sync_token_mirror(token, uid, gid)
+    return token
+
+
 def _migrate_legacy_config(uid: int, gid: int) -> bool:
     """Ensure a user-owned config.json at CONFIG_FILE, migrating the legacy
     root-owned one if that is all the box has. Idempotent; safe to call on every
@@ -374,12 +508,10 @@ def _migrate_legacy_config(uid: int, gid: int) -> bool:
     """
     changed = False
     try:
-        os.makedirs(STATE_DIR, exist_ok=True)
         # 0700 + user-owned, matching install.sh. The agent writes a temp file
         # into this DIRECTORY and os.replace()s it, so the directory itself must
         # be user-writable — a writable file in a root-owned dir is not enough.
-        os.chmod(STATE_DIR, 0o700)
-        os.chown(STATE_DIR, uid, gid)
+        _ensure_state_dir(uid, gid)
     except OSError:
         log.exception("couchside: could not prepare %s", STATE_DIR)
         return False
@@ -398,14 +530,25 @@ def _migrate_legacy_config(uid: int, gid: int) -> bool:
     if have_new:
         # Repair ownership even when we did not move anything: a box installed by
         # an older plugin has a root-owned file the agent still cannot write.
+        # Through an O_NOFOLLOW fd: this runs as root on every plugin load, and a
+        # path-based chown would follow a planted `config.json -> /etc/shadow`
+        # and hand that file to the user. A symlink or non-regular file is left
+        # alone (the open raises ELOOP, logged below).
         try:
-            st = os.stat(CONFIG_FILE)
-            if st.st_uid != uid or st.st_gid != gid:
-                os.chown(CONFIG_FILE, uid, gid)
-                changed = True
-            if st.st_mode & 0o777 != 0o600:
-                os.chmod(CONFIG_FILE, 0o600)
-                changed = True
+            fd = os.open(CONFIG_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    log.warning("couchside: %s is not a regular file; not touching it", CONFIG_FILE)
+                else:
+                    if st.st_uid != uid or st.st_gid != gid:
+                        os.fchown(fd, uid, gid)
+                        changed = True
+                    if st.st_mode & 0o777 != 0o600:
+                        os.fchmod(fd, 0o600)
+                        changed = True
+            finally:
+                os.close(fd)
         except OSError:
             log.exception("couchside: could not fix config ownership")
     return changed
@@ -813,24 +956,9 @@ class Plugin:
             except OSError:
                 pass
 
-        # (d) token
-        os.makedirs(ETC_DIR, exist_ok=True)
-        token = None
-        if os.path.exists(TOKEN_FILE) and os.path.getsize(TOKEN_FILE) > 0:
-            with open(TOKEN_FILE) as f:
-                token = f.read().strip()
-        else:
-            for old_etc, _, _ in OLD_INSTALLS:  # migrate an old token if present
-                op = os.path.join(old_etc, "token")
-                if os.path.exists(op) and os.path.getsize(op) > 0:
-                    with open(op) as f:
-                        token = f.read().strip()
-            if not token:
-                token = secrets.token_hex(24)
-            with open(TOKEN_FILE, "w") as f:
-                f.write(token + "\n")
-        os.chmod(TOKEN_FILE, 0o600)
-        os.chown(TOKEN_FILE, uid, gid)
+        # (d) token: canonical /etc/couchside/token, restored from the agent's
+        # mirror if an OS update dropped it (see _ensure_token), mirror refreshed.
+        token = _ensure_token(uid, gid)
 
         # (e) config.json in the user-owned state dir, migrating any legacy copy.
         # Migration must run BEFORE the "only if absent" check, or a box that
@@ -843,12 +971,14 @@ class Plugin:
             # (matches install.sh, which runs `flatpak info` as the invoking user).
             have_kodi = (shutil.which("flatpak") is not None
                          and _run(["sudo", "-u", user, "flatpak", "info", "tv.kodi.Kodi"]).returncode == 0)
-            with open(CONFIG_FILE, "w") as f:
-                json.dump(_gen_config(have_sddm, have_kodi), f, indent=2)
             # User-owned 0600, matching install.sh: the agent runs as this user
             # and MUST be able to rewrite the file when a pairing is saved.
-            os.chmod(CONFIG_FILE, 0o600)
-            os.chown(CONFIG_FILE, uid, gid)
+            # Written via _write_private, NOT open(..., "w"): os.path.exists() is
+            # False for a DANGLING symlink, and root following one would create
+            # an arbitrary file and then chown it to the user.
+            _write_private(CONFIG_FILE,
+                           json.dumps(_gen_config(have_sddm, have_kodi), indent=2),
+                           uid, gid)
 
         # (f0) Fixed-arg journal wrapper the sudoers rule grants. Root-owned
         # (0755) in the root-owned ETC_DIR so the desktop user can execute but
@@ -953,10 +1083,13 @@ class Plugin:
 
     # ---- pairing (for the QR) -------------------------------------------
     async def get_pairing(self):
-        if not (os.path.exists(TOKEN_FILE) and os.path.getsize(TOKEN_FILE) > 0):
+        # Canonical first, then the agent's mirror (agent >= 2.9.114): when an OS
+        # update dropped /etc/couchside/token, the mirror is exactly what the agent
+        # is serving, and without this fallback the QR would be dead precisely
+        # when the box needs re-showing it.
+        token = _read_token(TOKEN_FILE) or _read_token(_token_mirror(), strict=True)
+        if not token:
             return {"ok": False, "error": "not installed yet"}
-        with open(TOKEN_FILE) as f:
-            token = f.read().strip()
         port = _read_port()
         host = f"{_hostname_short()}.local"
         # HTTPS relaunch link; token rides the #fragment so it never hits the web server.
@@ -979,10 +1112,12 @@ class Plugin:
             pw = pwd.getpwnam(user)
             token = secrets.token_hex(24)
             os.makedirs(ETC_DIR, exist_ok=True)
-            with open(TOKEN_FILE, "w") as f:
-                f.write(token + "\n")
-            os.chmod(TOKEN_FILE, 0o600)
-            os.chown(TOKEN_FILE, pw.pw_uid, pw.pw_gid)
+            # Canonical first: this write IS the revocation (the agent reads
+            # /etc/couchside/token before its mirror). Then the mirror, so both
+            # copies agree even if the restart below fails; the agent would also
+            # re-sync it from the canonical file on its next start.
+            _write_private(TOKEN_FILE, token + "\n", pw.pw_uid, pw.pw_gid)
+            _sync_token_mirror(token, pw.pw_uid, pw.pw_gid)
             _run(["systemctl", "restart", "couchside.service"])
             return {"ok": True, "token": token}
         except Exception as e:
