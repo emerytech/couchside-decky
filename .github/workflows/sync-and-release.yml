@@ -139,6 +139,14 @@ jobs:
         if: steps.decide.outputs.release == 'true'
         run: python3 scripts/test-config-migration.py
 
+      # The token mirror (agent >= 2.9.114) and root file I/O inside the
+      # user-owned state dir. A regression here either mints over a live token
+      # (every phone loses its pairing after an OS update drops /etc) or lets a
+      # user-level process steer a root write/chown through a symlink.
+      - name: Test token mirror + state-dir root I/O
+        if: steps.decide.outputs.release == 'true'
+        run: python3 scripts/test-token-mirror.py
+
       - name: Build & package
         if: steps.decide.outputs.release == 'true'
         id: build
