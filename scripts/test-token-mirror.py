@@ -36,8 +36,8 @@ _spec.loader.exec_module(m)
 
 UID, GID = os.getuid(), os.getgid()
 FAILURES = []
-_REAL = {k: getattr(m, k) for k in ("STATE_DIR", "CONFIG_FILE", "ETC_DIR", "TOKEN_FILE", "OLD_INSTALLS",
-                                    "_target_user", "_run")}
+_REAL = {k: getattr(m, k, None) for k in ("STATE_DIR", "CONFIG_FILE", "ETC_DIR", "TOKEN_FILE", "OLD_INSTALLS",
+                                    "_target_user", "_run", "UNIT_DST", "_seat_owner", "_MIN_HUMAN_UID")}
 TOK_A = "a" * 48
 TOK_B = "b" * 48
 TOK_OLD = "c" * 48
@@ -75,12 +75,15 @@ def sandbox():
     m.STATE_DIR = os.path.join(root, "var", "lib", "couchside")
     m.CONFIG_FILE = os.path.join(m.STATE_DIR, "config.json")
     m.OLD_INSTALLS = [(os.path.join(root, "etc", "couchpilot"), "x", "y")]
+    m.UNIT_DST = os.path.join(root, "etc", "systemd", "system", "couchside.service")
+    m._MIN_HUMAN_UID = min(1000, UID)   # macOS dev hosts start regular users at 501
     return m.TOKEN_FILE, os.path.join(m.STATE_DIR, "token"), root
 
 
 def restore():
     for k, v in _REAL.items():
-        setattr(m, k, v)
+        if v is not None:
+            setattr(m, k, v)
 
 
 def case(fn):
@@ -254,6 +257,69 @@ def test_regenerate_creates_missing_dirs(canon, mirror, root):
           (_read(canon), _read(mirror), _mode(m.STATE_DIR)), (r.get("token"), r.get("token"), 0o700))
 
 
+# ---- whose token is it? (the account the SERVICE runs as) -----------------
+
+class _P:
+    def __init__(self, out, rc=0):
+        self.stdout, self.returncode, self.stderr = out, rc, ""
+
+
+def test_regenerate_owner_is_the_service_user(canon, mirror, root):
+    """A box at a login screen made seat detection return the greeter account;
+    the agent then could not read its own token. The unit's User= must win."""
+    _put(m.UNIT_DST, "[Service]\nUser=%s\nExecStart=/usr/bin/true\n" % getpass.getuser(), 0o644)
+    m._target_user = lambda: "sddm-greeter-account-that-does-not-exist"
+    m._run = lambda cmd, check=False: None
+    r = asyncio.run(m.Plugin().regenerate_token())
+    check("regenerate ok despite a bogus seat owner", r.get("ok"), True)
+    check("canonical + mirror owned by the service user",
+          (os.stat(canon).st_uid, os.stat(mirror).st_uid), (UID, UID))
+
+
+def test_regenerate_falls_back_to_target_user_without_unit(canon, mirror, root):
+    m._target_user = lambda: getpass.getuser()
+    m._run = lambda cmd, check=False: None
+    check("no unit -> _target_user fallback still works", asyncio.run(m.Plugin().regenerate_token()).get("ok"), True)
+
+
+def _fake_loginctl(sessions):
+    """sessions: list of dicts with Name/Active/Seat/Type/Class."""
+    def run(cmd, check=False):
+        if cmd[:2] == ["loginctl", "list-sessions"]:
+            return _P("".join("%s 0 %s seat0 tty1\n" % (i, d["Name"]) for i, d in enumerate(sessions)))
+        if cmd[:2] == ["loginctl", "show-session"]:
+            d = sessions[int(cmd[2])]
+            return _P("".join("%s=%s\n" % (k, v) for k, v in d.items()))
+        return _P("", 1)
+    return run
+
+
+def test_seat_owner_ignores_the_greeter(canon, mirror, root):
+    m._run = _fake_loginctl([{"Name": "sddm", "Active": "yes", "Seat": "seat0", "Type": "wayland", "Class": "greeter"}])
+    check("login-screen greeter is NOT the desktop user", m._seat_owner(), "")
+
+
+def test_seat_owner_finds_the_user_session(canon, mirror, root):
+    me = getpass.getuser()
+    m._run = _fake_loginctl([{"Name": "sddm", "Active": "no", "Seat": "seat0", "Type": "wayland", "Class": "greeter"},
+                             {"Name": me, "Active": "yes", "Seat": "seat0", "Type": "wayland", "Class": "user"}])
+    check("active user-class session is the desktop user", m._seat_owner(), me)
+
+
+def test_target_user_rejects_system_accounts(canon, mirror, root):
+    os.environ["DECKY_USER"] = "root"
+    try:
+        m._seat_owner = lambda: ""
+        raised = False
+        try:
+            m._target_user()
+        except RuntimeError:
+            raised = True
+        check("DECKY_USER=root (uid 0) refused; no guess -> RuntimeError", raised, True)
+    finally:
+        del os.environ["DECKY_USER"]
+
+
 if __name__ == "__main__":
     for fn in (test_canonical_present_mirror_created, test_canonical_wins_over_stale_mirror,
                test_lost_canonical_restored_from_mirror, test_mirror_beats_old_product_token,
@@ -263,7 +329,10 @@ if __name__ == "__main__":
                test_symlinked_config_not_chowned_on_load,
                test_pairing_canonical, test_pairing_falls_back_to_mirror, test_pairing_nothing,
                test_pairing_ignores_junk_mirror,
-               test_regenerate_writes_both, test_regenerate_creates_missing_dirs):
+               test_regenerate_writes_both, test_regenerate_creates_missing_dirs,
+               test_regenerate_owner_is_the_service_user, test_regenerate_falls_back_to_target_user_without_unit,
+               test_seat_owner_ignores_the_greeter, test_seat_owner_finds_the_user_session,
+               test_target_user_rejects_system_accounts):
         case(fn)
     if FAILURES:
         print("\n%d FAILED: %s" % (len(FAILURES), ", ".join(FAILURES)))

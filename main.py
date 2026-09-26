@@ -21,6 +21,7 @@ Frontend-callable methods:
     self_update()        -> {ok, updated?, version?, error?}  verified plugin self-update
 """
 
+import errno
 import hashlib
 import json
 import os
@@ -169,6 +170,42 @@ def _ver_gt(a: str, b: str) -> bool:
     return _ver_tuple(a) > _ver_tuple(b)
 
 
+# Regular login accounts. System accounts (sddm's greeter uid 958, gdm, nobody)
+# own the seat while a box sits at a login screen and must never be picked as
+# "the desktop user". Module-level so the tests can lower it on hosts whose
+# regular users start below 1000 (macOS uses 501).
+_MIN_HUMAN_UID = 1000
+_MAX_HUMAN_UID = 60000
+
+
+def _is_human_account(name) -> bool:
+    """True for an existing regular login account (UID_MIN..UID_MAX)."""
+    if not name:
+        return False
+    try:
+        uid = pwd.getpwnam(name).pw_uid
+    except KeyError:
+        return False
+    return _MIN_HUMAN_UID <= uid < _MAX_HUMAN_UID
+
+
+def _service_user():
+    """The account couchside.service runs as -- User= in the unit this plugin or
+    install.sh rendered -- i.e. the account that must be able to READ the token.
+    None when the unit is absent/unreadable or names a non-human account.
+    UNIT_DST lives in root-owned /etc/systemd/system, so it is trustworthy here."""
+    try:
+        with open(UNIT_DST) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("User="):
+                    name = line[len("User="):].strip()
+                    return name if _is_human_account(name) else None
+    except OSError:
+        pass
+    return None
+
+
 def _seat_owner() -> str:
     """The user who owns the active graphical seat, per loginctl. Empty string if
     it can't be determined unambiguously. This is the box's real desktop user and
@@ -187,7 +224,7 @@ def _seat_owner() -> str:
                 continue
             d = {}
             s = _run(["loginctl", "show-session", sid,
-                      "-p", "Name", "-p", "Active", "-p", "Seat", "-p", "Type"])
+                      "-p", "Name", "-p", "Active", "-p", "Seat", "-p", "Type", "-p", "Class"])
             if s.returncode != 0:
                 continue
             for kv in s.stdout.splitlines():
@@ -196,6 +233,13 @@ def _seat_owner() -> str:
                     d[k] = v
             name, seat = d.get("Name", ""), d.get("Seat", "")
             if not name or not seat:  # no seat => not a graphical local session
+                continue
+            # A login GREETER (or lock screen) owns the seat while nobody is
+            # logged in -- MEASURED on Bazzite 44 after autologin failed: the
+            # only seat session was sddm's greeter, Active=yes, Type=wayland, so
+            # "sddm" came back as the desktop user. Only user-class sessions
+            # count (an empty Class is an older systemd; keep those).
+            if d.get("Class", "") not in ("", "user"):
                 continue
             seat_users.add(name)
             if d.get("Active") == "yes" and d.get("Type") in ("x11", "wayland", "mir"):
@@ -220,13 +264,9 @@ def _target_user() -> str:
     multi-user box, picking an arbitrary /home user would grant privesc to the
     wrong account, so if the source is ambiguous we raise instead of guessing."""
     def _valid(name: str) -> bool:
-        if not name:
-            return False
-        try:
-            pwd.getpwnam(name)
-            return True
-        except KeyError:
-            return False
+        # A real REGULAR account: a system account (e.g. the display manager's
+        # greeter user) would get the passwordless-sudo grant and the token.
+        return _is_human_account(name)
 
     u = os.environ.get("DECKY_USER")
     if _valid(u):
@@ -549,8 +589,14 @@ def _migrate_legacy_config(uid: int, gid: int) -> bool:
                         changed = True
             finally:
                 os.close(fd)
-        except OSError:
-            log.exception("couchside: could not fix config ownership")
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                # Expected refusal, not a crash: something replaced config.json
+                # with a symlink. Leave it alone and say so plainly.
+                log.warning("couchside: %s is a symlink; refusing to follow it as root",
+                            CONFIG_FILE)
+            else:
+                log.exception("couchside: could not fix config ownership")
     return changed
 
 
@@ -1108,7 +1154,11 @@ class Plugin:
 
     async def regenerate_token(self):
         try:
-            user = _target_user()
+            # The token's owner must be the account the SERVICE runs as, or the
+            # agent cannot read it. Take it from the unit's User= first; seat
+            # detection is only a fallback (a box at a login screen reported its
+            # greeter account there, and the agent then read neither file).
+            user = _service_user() or _target_user()
             pw = pwd.getpwnam(user)
             token = secrets.token_hex(24)
             os.makedirs(ETC_DIR, exist_ok=True)
