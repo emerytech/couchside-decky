@@ -413,8 +413,9 @@ def _execstart_has_config(unit_text: str) -> bool:
 # writes it (regenerate_token below, `couchside new-token`, install.sh). The
 # agent (>= 2.9.114) keeps a 0600 MIRROR at STATE_DIR/token, re-syncs it on every
 # start and serves it when the canonical file is gone: a SteamOS update has
-# dropped /etc/couchside wholesale while STATE_DIR survived. Same contract as
-# install.sh step (d)/(e0).
+# dropped /etc/couchside wholesale while STATE_DIR survived. Same canonical/mirror
+# contract as install.sh step (d)/(e0); on restore this plugin ranks the mirror
+# above a leftover old-product token (it is the live pairing).
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{16,256}")
 _TOKEN_MAX_BYTES = 4096
 
@@ -465,7 +466,9 @@ def _write_private(path, data: str, uid: int, gid: int, mode: int = 0o600):
         try:
             os.fchmod(fd, mode)
             os.fchown(fd, uid, gid)
-            os.write(fd, data.encode("utf-8"))
+            # surrogateescape round-trips arbitrary bytes read with the same
+            # handler (the legacy-config migration copies a file verbatim).
+            os.write(fd, data.encode("utf-8", "surrogateescape"))
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -559,8 +562,17 @@ def _migrate_legacy_config(uid: int, gid: int) -> bool:
     have_new = os.path.exists(CONFIG_FILE) and os.path.getsize(CONFIG_FILE) > 0
     have_old = os.path.exists(LEGACY_CONFIG) and os.path.getsize(LEGACY_CONFIG) > 0
     if not have_new and have_old:
+        # NOT shutil.move: /etc and /var are different filesystems on SteamOS, so
+        # move() falls back to a copy that OPENS the destination path -- and
+        # os.path.exists() above is False for a dangling symlink, so root would
+        # write through a planted `config.json -> anywhere`. Read the legacy file
+        # (root-owned dir, trustworthy), write it via _write_private (os.replace
+        # swaps a planted link instead of following it), then drop the legacy copy.
         try:
-            shutil.move(LEGACY_CONFIG, CONFIG_FILE)
+            with open(LEGACY_CONFIG, "rb") as f:
+                data = f.read()
+            _write_private(CONFIG_FILE, data.decode("utf-8", "surrogateescape"), uid, gid)
+            os.unlink(LEGACY_CONFIG)
             log.info("couchside: migrated config %s -> %s (pairings preserved)",
                      LEGACY_CONFIG, CONFIG_FILE)
             changed = True
