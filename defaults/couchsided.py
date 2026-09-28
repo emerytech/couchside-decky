@@ -42,6 +42,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
@@ -52,7 +53,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.117"
+VERSION = "2.9.124"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -5712,6 +5713,10 @@ def leds_state(mock):
                 "effects": list(_LED_EFFECTS_ADVERTISED), "shape": True,
                 "reactive": {"meters": ["meter_cpu", "meter_battery"], "playtime": True,
                              "signals": {"cpu_temp": True, "battery": True}},
+                # Additive probe-and-appear flag (§4): this agent has POST
+                # /api/leds/aura, so the app may offer "paint from game artwork" on
+                # an addressable strip. Older agents omit it -> the app hides it.
+                "aura": bool(strips),
                 "active": {k: dict(v) for k, v in _MOCK_FX.items()},
                 "strips": [_mock_strip_public(p, m) for p, m in strips.items()]}
     names = _list_led_names()
@@ -5723,7 +5728,10 @@ def leds_state(mock):
     # app shows the SHAPE control only when present, so older agents stay clean.
     return {"available": any(p["notable"] for p in pubs), "leds": pubs,
             "effects": list(_LED_EFFECTS_ADVERTISED), "shape": True,
-            "reactive": _reactive_probe(bool(strips)), "active": _led_active_map(),
+            "reactive": _reactive_probe(bool(strips)),
+            # Additive probe-and-appear flag (§4): POST /api/leds/aura exists here
+            # AND a strip is present to paint. Absent on older agents -> app hides it.
+            "aura": bool(strips), "active": _led_active_map(),
             "strips": [_strip_public(p, m) for p, m in strips.items()]}
 
 
@@ -6313,6 +6321,22 @@ def _led_restore():
                 except OSError:
                     pass
             continue
+        # A Game Aura is a static per-LED palette -> re-arm via its own path. Like
+        # the sequence case, the colours are RE-VALIDATED from the file (never
+        # trusted, §3.6); a junk/short list is dropped rather than painted, and
+        # apply_strip_aura re-checks the strip + normalizes to its member count.
+        if effect == "aura" and name.startswith("strip:"):
+            prefix = name[len("strip:"):]
+            colors = st.get("colors")
+            members = strips.get(prefix)
+            if (members and isinstance(colors, list)
+                    and len(colors) == len(members)
+                    and all(_is_rgb_triple(c) for c in colors)):
+                try:
+                    apply_strip_aura(prefix, colors)
+                except OSError:
+                    pass
+            continue
         if effect not in _LED_EFFECTS:
             continue
         color = st.get("color") if _is_rgb_triple(st.get("color")) else None
@@ -6889,6 +6913,13 @@ def _seq_compute_frame(spec, now):
         return _seq_meter_frame(spec, now)
     if e == "playtime":
         return _seq_playtime_frame(spec, now)
+    if e == "aura":
+        # A STATIC per-LED palette (Game Aura): the frame never changes with time,
+        # so we just re-lay the stored one every tick. Rendering it through the
+        # _seq engine (rather than a one-shot paint) is deliberate -- it gets the
+        # SAME Steam stand-down + dark-frame guard as every other seq effect, so a
+        # dark aura is painted once and an owned strip is left to Steam.
+        return spec.get("frame")
     period = _seq_period(spec["speed"])
     color = spec["color"]
     rev = bool(spec.get("reverse"))
@@ -7363,6 +7394,81 @@ def apply_strip_sequence(prefix, frames, hold_ms, brightness, loop=True, holds=N
     if hnorm is not None:
         active["holds"] = hnorm
     return {"ok": True, "strip": prefix, "active": active}
+
+
+def _validate_aura_colors(colors, n):
+    """Shape check for the Game Aura frame (POST /api/leds/aura): EXACTLY `n`
+    {r,g,b} triples (ints 0-255), one per strip member. REJECTS -- never sanitises
+    (§3.6): a non-list, the wrong length, or any element that is not an exact RGB
+    triple is an error, and NOTHING is painted. Returns (frame, None) | (None,
+    error). `n` is the LIVE member count of the looked-up strip, so this is the
+    only place the client's colour count is bound to a real strip's size.
+
+    The colours are DATA. They are validated here and then written to the strip's
+    OWN members via the fixed-literal multi_intensity/brightness writers; no client
+    value ever becomes a path, an attribute name, or a command (§3)."""
+    if not isinstance(colors, list):
+        return None, "colors must be a list"
+    if len(colors) != n:
+        return None, "colors must have exactly %d entries (one per LED)" % n
+    for c in colors:
+        if not _is_rgb_triple(c):
+            return None, "each color must be {r,g,b} ints 0-255"
+    return [dict(c) for c in colors], None
+
+
+def apply_strip_aura(prefix, colors):
+    """Paint a STATIC per-LED palette across an addressable strip (Game Aura).
+
+    The general form behind "paint the strip from the running game's artwork":
+    the app samples a cover into ONE colour per LED and posts the frame; a Phase-2
+    per-game aura library reuses this same route with its own N-colour frames. It
+    is a one-frame `sequence` in spirit, but its OWN effect id so GET /api/leds
+    `active` names it and the app can show a distinct aura state.
+
+    ALLOWLIST (§3): `prefix` is LOOKED UP in the live strip set (None -> caller
+    404s); it is NEVER interpolated. `colors` is validated colour DATA -- the
+    render thread owns every write via the fixed-literal writers. The frame is
+    re-validated + normalized to EXACTLY the member count here (defence in depth,
+    like apply_strip_sequence) so nothing client-shaped can reach a write even if
+    the strip changed size between the handler's check and this call.
+
+    Registers on the _seq engine (so the Steam stand-down + 2.9.117 dark-frame
+    guard apply) and persists like any strip effect, so a reboot re-arms it.
+    Returns {"ok":True,..} | None (-> 404)."""
+    if not isinstance(prefix, str):
+        return None
+    members = _led_strips().get(prefix)
+    if not members:
+        return None
+    raws = {n: _read_led_raw(n) for n in members}
+    if not all(r and r["writable"] for r in raws.values()):
+        return None
+    n = len(members)
+    # Normalize to EXACTLY n members: keep only valid RGB triples, pad short with
+    # None (an off cell). The handler already rejects a wrong length with a 400;
+    # this is the last guard so a write is never client-shaped (§3.6).
+    frame = [(colors[i] if i < len(colors) and _is_rgb_triple(colors[i]) else None)
+             for i in range(n)]
+    for name in members:
+        try:
+            _led_write(name, "effect", "manual")
+        except OSError:
+            pass
+    with _SEQ_LOCK:
+        _SEQ_ACTIVE[prefix] = {
+            "members": members, "effect": "aura", "frame": frame,
+            "color": {"r": 255, "g": 255, "b": 255}, "speed": 50, "brightness": 100,
+            "prefix": prefix, "t0": time.monotonic(), "raws": raws}
+    _seq_ensure_thread()
+    persist = {"effect": "aura", "colors": [dict(c) if c else None for c in frame],
+               "brightness": 100}
+    with _FX_LOCK:
+        for m in members:
+            _LED_PERSIST.pop(m, None)
+        _LED_PERSIST["strip:" + prefix] = dict(persist)
+    _led_state_save()
+    return {"ok": True, "strip": prefix, "active": dict(persist)}
 
 
 # ---------------------------------------------------------------------------
@@ -22439,6 +22545,40 @@ def _reco_rank(playtime, installed, now, limit=5):
     return {"primary": primary, "alternates": alts[:limit], "counts": counts}
 
 
+def _steam_persona(root):
+    """The Steam PersonaName of the MOST-RECENT account on this box, read LOCALLY
+    from config/loginusers.vdf (line-scan, pure-stdlib — Steam ships no parser we can
+    import). None when the file is unreadable or has no persona. Read-only and never
+    leaves the box (the app only uses it for a "Good evening, <name>" greeting);
+    never raises."""
+    if not root:
+        return None
+    try:
+        with open(os.path.join(root, "config", "loginusers.vdf"),
+                  "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except Exception:
+        return None
+    # Each account is a `"<steamid>" { … }` block carrying a PersonaName and an
+    # optional `"MostRecent" "1"`. Track the current block's persona; prefer the
+    # MostRecent one, else the first seen (covers the single-account box).
+    first = None
+    cur = None
+    most_recent = None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith('"PersonaName"'):
+            v = _vdf_line_val(s)
+            if v:
+                cur = v
+                if first is None:
+                    first = v
+        elif s.startswith('"MostRecent"'):
+            if _vdf_line_val(s) == "1" and cur:
+                most_recent = cur
+    return most_recent or first or None
+
+
 def _recommend_payload(limit=5):
     """The /api/recommend body: analyse local Steam play history + installs and
     return ranked picks with names. `available: False` when there is nothing to
@@ -22471,10 +22611,16 @@ def _recommend_payload(limit=5):
             q["name"] = "App %s" % p["appid"]
         return q
 
-    return {"available": ranked["primary"] is not None, "generated": now,
+    body = {"available": ranked["primary"] is not None, "generated": now,
             "primary": _named(ranked["primary"]),
             "alternates": [_named(a) for a in ranked["alternates"]],
             "counts": ranked["counts"]}
+    # Probe-and-appear: only present when we could read it, so an older app just sees
+    # the field missing and drops the name.
+    persona = _steam_persona(root)
+    if persona:
+        body["persona"] = persona
+    return body
 
 
 def mock_recommend():
@@ -22496,7 +22642,827 @@ def mock_recommend():
                 pick("2231450", "Pizza Tower", 0.0, None, "Never played", "fresh",
                      "Installed but never launched — give it a shot.", 52.0),
             ],
-            "counts": {"streak": 1, "comfort": 3, "unfinished": 2, "rediscover": 1, "fresh": 4}}
+            "counts": {"streak": 1, "comfort": 3, "unfinished": 2, "rediscover": 1, "fresh": 4},
+            "persona": "Taylor"}
+
+
+# ---------------------------------------------------------------------------
+# STEAM WEB API — OPT-IN, and the box's ONE outbound internet call.
+#
+# The user pastes their own SteamID64 (or vanity profile name) + a free Steam Web
+# API key (steamcommunity.com/dev/apikey) in the app's Advanced settings. With it
+# the box MAY call https://api.steampowered.com to enrich What-to-Play and show
+# the user's OWN Steam data. This is the ONLY place the agent talks to the
+# internet; it is OFF unless the user configures it; nothing about the box leaves
+# — only the user's key rides out, to Steam, over HTTPS. The key is stored 0600 in
+# the user's OWN config dir (no root, no helper), NEVER logged, NEVER returned
+# (masked in the status), and cleared on disconnect. Every call is a single stdlib
+# GET with a FIXED host + FIXED path + validated params, so no client value can
+# steer the request (no SSRF), and every failure degrades to "unavailable" so the
+# local reco keeps working untouched.
+# ---------------------------------------------------------------------------
+_STEAM_WEBAPI_HOST = "https://api.steampowered.com"
+_STEAM_WEBAPI_CONF = os.path.expanduser("~/.config/couchside/steam_webapi.json")
+_STEAM_WEBAPI_TIMEOUT = 6.0
+_STEAM_WEBAPI = {"steamid64": None, "apikey": None}
+_STEAM_WEBAPI_LOCK = threading.Lock()
+_STEAM_SUMMARY_CACHE = {"ts": 0.0, "val": None}
+_STEAM_SUMMARY_TTL = 30.0
+
+
+def _valid_steamid64(s):
+    """A SteamID64 is exactly 17 ASCII digits in the individual-account range
+    (starts 7656119...). Reject anything else — never sanitise (section 3.6)."""
+    return (isinstance(s, str) and len(s) == 17 and s.isascii() and s.isdigit()
+            and s.startswith("7656119"))
+
+
+def _valid_steam_apikey(s):
+    """A Steam Web API key is exactly 32 hex characters. Reject anything else."""
+    if not isinstance(s, str) or len(s) != 32 or not s.isascii():
+        return False
+    try:
+        int(s, 16)
+        return True
+    except ValueError:
+        return False
+
+
+def _valid_steam_vanity(s):
+    """A vanity segment: 2-64 chars of [A-Za-z0-9_-]. The strict charset means it
+    can never carry a path or query separator into the request."""
+    return isinstance(s, str) and bool(re.fullmatch(r"[A-Za-z0-9_-]{2,64}", s))
+
+
+def _mask_apikey(key):
+    """Show only the last 4 of a key, never the whole thing."""
+    if not isinstance(key, str) or len(key) < 4:
+        return None
+    return "•" * (len(key) - 4) + key[-4:]
+
+
+def _steam_webapi_load():
+    """Read the stored {steamid64, apikey} into memory at startup. Degrade closed:
+    a missing / unreadable / garbage / ill-formed file leaves the feature simply
+    off. Never raises."""
+    try:
+        with open(_STEAM_WEBAPI_CONF, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        sid = d.get("steamid64")
+        key = d.get("apikey")
+        if _valid_steamid64(sid) and _valid_steam_apikey(key):
+            with _STEAM_WEBAPI_LOCK:
+                _STEAM_WEBAPI["steamid64"] = sid
+                _STEAM_WEBAPI["apikey"] = key
+    except Exception:
+        pass
+
+
+def _steam_webapi_save(steamid64, apikey):
+    """Persist the key 0600 in the user's OWN config dir via temp-file + os.replace.
+    The agent runs as the user, so this needs no root and touches nothing outside
+    ~/.config/couchside. Returns True on success. Sets 0600 BEFORE any bytes land."""
+    directory = os.path.dirname(_STEAM_WEBAPI_CONF)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return False
+    if not os.access(directory, os.W_OK | os.X_OK):
+        return False
+    fd, tmp = tempfile.mkstemp(prefix=".couchside-steam-", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"steamid64": steamid64, "apikey": apikey}, f)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _STEAM_WEBAPI_CONF)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    with _STEAM_WEBAPI_LOCK:
+        _STEAM_WEBAPI["steamid64"] = steamid64
+        _STEAM_WEBAPI["apikey"] = apikey
+    _STEAM_SUMMARY_CACHE["ts"] = 0.0
+    _STEAM_SUMMARY_CACHE["val"] = None
+    _STEAM_OWNED_CACHE["ts"] = 0.0
+    _STEAM_OWNED_CACHE["val"] = None
+    _STEAM_LEVEL_CACHE["ts"] = 0.0
+    _STEAM_LEVEL_CACHE["val"] = None
+    _STEAM_ACH_CACHE.clear()
+    _STEAM_WISHLIST_CACHE["ts"] = 0.0
+    _STEAM_WISHLIST_CACHE["val"] = None
+    return True
+
+
+def _steam_webapi_clear():
+    """Forget the key: wipe memory + delete the file. Never raises."""
+    with _STEAM_WEBAPI_LOCK:
+        _STEAM_WEBAPI["steamid64"] = None
+        _STEAM_WEBAPI["apikey"] = None
+    _STEAM_SUMMARY_CACHE["ts"] = 0.0
+    _STEAM_SUMMARY_CACHE["val"] = None
+    _STEAM_OWNED_CACHE["ts"] = 0.0
+    _STEAM_OWNED_CACHE["val"] = None
+    _STEAM_LEVEL_CACHE["ts"] = 0.0
+    _STEAM_LEVEL_CACHE["val"] = None
+    _STEAM_ACH_CACHE.clear()
+    _STEAM_WISHLIST_CACHE["ts"] = 0.0
+    _STEAM_WISHLIST_CACHE["val"] = None
+    try:
+        os.unlink(_STEAM_WEBAPI_CONF)
+    except OSError:
+        pass
+
+
+def _steam_webapi_configured():
+    with _STEAM_WEBAPI_LOCK:
+        return bool(_STEAM_WEBAPI["steamid64"] and _STEAM_WEBAPI["apikey"])
+
+
+def _steam_cache_ok(sid):
+    """True only if the box is STILL on the account `sid` that a fetch started for.
+    Guards every per-account cache WRITE so an in-flight fetch cannot resurrect a
+    slot that a concurrent account switch just wiped (TOCTOU)."""
+    with _STEAM_WEBAPI_LOCK:
+        return _STEAM_WEBAPI["steamid64"] == sid
+
+
+def _steam_api_get(interface, method, version, params, timeout=_STEAM_WEBAPI_TIMEOUT):
+    """ONE Steam Web API GET. `interface`, `method`, `version` are FIXED literals
+    the CALLER chose (never client input); `params` are validated values. Host +
+    path are fixed, so nothing client-shaped steers the request (no SSRF). Returns
+    the parsed JSON dict, or None on ANY failure (degrade closed). The URL carries
+    the secret key, so it is NEVER logged and no exception text is surfaced."""
+    try:
+        query = urllib.parse.urlencode(params)
+        url = "%s/%s/%s/v%s/?%s" % (_STEAM_WEBAPI_HOST, interface, method,
+                                    version, query)
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "couchside-agent/%s" % VERSION})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if getattr(r, "status", 200) != 200:
+                return None
+            return json.loads(r.read(1 << 20).decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _steam_get_summary(steamid64, apikey):
+    """The owner's ISteamUser/GetPlayerSummaries entry, or None. Doubles as the
+    key-validity probe: a bad key or profile yields no player."""
+    d = _steam_api_get("ISteamUser", "GetPlayerSummaries", "0002",
+                       {"key": apikey, "steamids": steamid64})
+    try:
+        players = d["response"]["players"]
+        for p in players:
+            if str(p.get("steamid")) == steamid64:
+                return p
+        return players[0] if players else None
+    except Exception:
+        return None
+
+
+def _steam_resolve_vanity(vanity, apikey):
+    """Resolve a vanity profile name to a SteamID64 via ISteamUser/ResolveVanityURL,
+    or None, so the user can paste their profile name instead of the 17-digit id."""
+    d = _steam_api_get("ISteamUser", "ResolveVanityURL", "0001",
+                       {"key": apikey, "vanityurl": vanity})
+    try:
+        r = d["response"]
+        if r.get("success") == 1 and _valid_steamid64(str(r.get("steamid"))):
+            return str(r["steamid"])
+    except Exception:
+        pass
+    return None
+
+
+def _steam_summary_cached():
+    """The owner's profile summary with a short TTL cache, so the status route does
+    not hammer Steam. None when unconfigured or unreachable."""
+    if not _steam_webapi_configured():
+        return None
+    now = time.monotonic()
+    if (_STEAM_SUMMARY_CACHE["val"] is not None
+            and now - _STEAM_SUMMARY_CACHE["ts"] < _STEAM_SUMMARY_TTL):
+        return _STEAM_SUMMARY_CACHE["val"]
+    with _STEAM_WEBAPI_LOCK:
+        sid = _STEAM_WEBAPI["steamid64"]
+        key = _STEAM_WEBAPI["apikey"]
+    summ = _steam_get_summary(sid, key)
+    if summ is not None and _steam_cache_ok(sid):
+        _STEAM_SUMMARY_CACHE["ts"] = now
+        _STEAM_SUMMARY_CACHE["val"] = summ
+    return summ
+
+
+def _steam_webapi_status():
+    """The GET /api/steam/webapi body: whether a key is configured, the MASKED key,
+    and a live connectivity check (persona/avatar) when reachable. NEVER returns the
+    full key. Additive / probe-and-appear (absent route on older agents)."""
+    with _STEAM_WEBAPI_LOCK:
+        sid = _STEAM_WEBAPI["steamid64"]
+        key = _STEAM_WEBAPI["apikey"]
+    if not (sid and key):
+        return {"configured": False}
+    summ = _steam_summary_cached()
+    body = {"configured": True, "steamid64": sid,
+            "apikey_masked": _mask_apikey(key),
+            "connected": summ is not None}
+    if summ is not None:
+        body["persona"] = summ.get("personaname")
+        body["avatar"] = summ.get("avatarmedium") or summ.get("avatar")
+    return body
+
+
+def mock_steam_webapi_status():
+    """Harness: the CONNECTED state, so the app's Steam-integration card can be
+    driven without a real key."""
+    return {"configured": True, "steamid64": "76561197960287930",
+            "apikey_masked": "•" * 28 + "AB12", "connected": True,
+            "persona": "Taylor", "avatar": "https://avatars.example/steam.jpg"}
+
+
+# --- Phase 1: profile / now-playing + whole-library, from the same opt-in key.
+# Two more read-only GETs (GetOwnedGames, GetSteamLevel) on the SAME fixed-host
+# client. Cached longer than the summary (a library changes rarely). Everything
+# is only-when-configured + degrade-closed, so a slow/absent Steam never affects
+# anything else and older apps just don't fetch these.
+_STEAM_OWNED_CACHE = {"ts": 0.0, "val": None}
+_STEAM_OWNED_TTL = 3600.0
+_STEAM_LEVEL_CACHE = {"ts": 0.0, "val": None}
+_STEAM_LEVEL_TTL = 3600.0
+_STEAM_PERSONA_STATES = {0: "Offline", 1: "Online", 2: "Busy", 3: "Away",
+                         4: "Snooze", 5: "Looking to trade", 6: "Looking to play"}
+
+
+def _steam_get_owned(steamid64, apikey):
+    """The owner's IPlayerService/GetOwnedGames list, or None. include_appinfo for
+    names, include_played_free_games so F2P time counts. Degrade closed."""
+    d = _steam_api_get("IPlayerService", "GetOwnedGames", "0001",
+                       {"key": apikey, "steamid": steamid64,
+                        "include_appinfo": 1, "include_played_free_games": 1})
+    try:
+        games = d["response"]["games"]
+        return games if isinstance(games, list) else None
+    except Exception:
+        return None
+
+
+def _steam_get_level(steamid64, apikey):
+    """The owner's Steam level (int) or None."""
+    d = _steam_api_get("IPlayerService", "GetSteamLevel", "0001",
+                       {"key": apikey, "steamid": steamid64})
+    try:
+        return int(d["response"]["player_level"])
+    except Exception:
+        return None
+
+
+def _steam_owned_cached():
+    if not _steam_webapi_configured():
+        return None
+    now = time.monotonic()
+    if (_STEAM_OWNED_CACHE["val"] is not None
+            and now - _STEAM_OWNED_CACHE["ts"] < _STEAM_OWNED_TTL):
+        return _STEAM_OWNED_CACHE["val"]
+    with _STEAM_WEBAPI_LOCK:
+        sid = _STEAM_WEBAPI["steamid64"]
+        key = _STEAM_WEBAPI["apikey"]
+    games = _steam_get_owned(sid, key)
+    if games is not None and _steam_cache_ok(sid):
+        _STEAM_OWNED_CACHE["ts"] = now
+        _STEAM_OWNED_CACHE["val"] = games
+    return games
+
+
+def _steam_level_cached():
+    if not _steam_webapi_configured():
+        return None
+    now = time.monotonic()
+    if (_STEAM_LEVEL_CACHE["val"] is not None
+            and now - _STEAM_LEVEL_CACHE["ts"] < _STEAM_LEVEL_TTL):
+        return _STEAM_LEVEL_CACHE["val"]
+    with _STEAM_WEBAPI_LOCK:
+        sid = _STEAM_WEBAPI["steamid64"]
+        key = _STEAM_WEBAPI["apikey"]
+    lv = _steam_get_level(sid, key)
+    if lv is not None and _steam_cache_ok(sid):
+        _STEAM_LEVEL_CACHE["ts"] = now
+        _STEAM_LEVEL_CACHE["val"] = lv
+    return lv
+
+
+def _steam_profile_payload():
+    """GET /api/steam/profile: the owner's live profile card — persona, avatar,
+    online state, what they're playing (even on another device), Steam level.
+    {"configured": False} without a key; connected False when Steam is unreachable."""
+    if not _steam_webapi_configured():
+        return {"configured": False}
+    summ = _steam_summary_cached()
+    if summ is None:
+        return {"configured": True, "connected": False}
+    try:
+        state_code = int(summ.get("personastate") or 0)
+    except (TypeError, ValueError):
+        state_code = 0
+    body = {"configured": True, "connected": True,
+            "persona": summ.get("personaname"),
+            "avatar": (summ.get("avatarfull") or summ.get("avatarmedium")
+                       or summ.get("avatar")),
+            "state_code": state_code,
+            "state": _STEAM_PERSONA_STATES.get(state_code, "Online"),
+            "playing": summ.get("gameextrainfo"),
+            "profileurl": summ.get("profileurl")}
+    if summ.get("gameid"):
+        body["gameid"] = str(summ.get("gameid"))
+    lv = _steam_level_cached()
+    if lv is not None:
+        body["level"] = lv
+    return body
+
+
+def _steam_library_payload():
+    """GET /api/steam/library: whole-library aggregates for the stat tile + the
+    "jump back in" rail — total games, total hours, most-played title, last-two-weeks
+    hours, backlog (owned but never played), and the recently played. ONE
+    GetOwnedGames call. {"configured": False} without a key."""
+    if not _steam_webapi_configured():
+        return {"configured": False}
+    with _STEAM_WEBAPI_LOCK:
+        _sid = _STEAM_WEBAPI["steamid64"]
+    games = _steam_owned_cached()
+    if games is None:
+        return {"configured": True, "connected": False}
+    games = [g for g in games if isinstance(g, dict)]
+
+    def _mins(g, key):
+        try:
+            return int(g.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _slim(g, key):
+        return {"appid": str(g.get("appid")),
+                "name": g.get("name") or ("App %s" % g.get("appid")),
+                "hours": round(_mins(g, key) / 60.0, 1)}
+
+    count = len(games)
+    total_min = 0
+    played = 0
+    top = None
+    recent = []
+    for g in games:
+        m = _mins(g, "playtime_forever")
+        total_min += m
+        if m > 0:
+            played += 1
+        if top is None or m > _mins(top, "playtime_forever"):
+            top = g
+        wk = _mins(g, "playtime_2weeks")
+        if wk > 0:
+            recent.append(g)
+    recent.sort(key=lambda g: _mins(g, "playtime_2weeks"), reverse=True)
+    # True this-week / this-month need a daily snapshot of lifetime minutes, keyed by
+    # account (Steam only exposes "last 2 weeks" + lifetime). Piggybacks on this fetch.
+    # Only record if the box is STILL on the account this fetch started for, so a
+    # concurrent account switch can't file account A's total under account B (TOCTOU).
+    if _sid and _steam_cache_ok(_sid):
+        _pt = _steam_playtime_deltas(_steam_playtime_record(_sid, total_min), total_min)
+    else:
+        _pt = {"played_7d": None, "played_30d": None}
+    body = {"configured": True, "connected": True,
+            "count": count, "played": played, "backlog": count - played,
+            "total_hours": round(total_min / 60.0, 1),
+            "hours_2weeks": round(sum(_mins(g, "playtime_2weeks") for g in recent) / 60.0, 1),
+            "played_7d": _pt["played_7d"], "played_30d": _pt["played_30d"],
+            "recent": [_slim(g, "playtime_2weeks") for g in recent[:8]]}
+    if top is not None and _mins(top, "playtime_forever") > 0:
+        body["top"] = _slim(top, "playtime_forever")
+    return body
+
+
+def mock_steam_profile_payload():
+    return {"configured": True, "connected": True, "persona": "Taylor",
+            "avatar": "https://avatars.example/steam_full.jpg",
+            "state_code": 1, "state": "Online", "playing": "Hades II",
+            "gameid": "1145350", "level": 42,
+            "profileurl": "https://steamcommunity.com/id/taylor/"}
+
+
+def mock_steam_library_payload():
+    return {"configured": True, "connected": True, "count": 312, "played": 47,
+            "backlog": 265, "total_hours": 1240.5, "hours_2weeks": 6.2,
+            "played_7d": 4.1, "played_30d": None,
+            "top": {"appid": "1245620", "name": "Elden Ring", "hours": 210.4},
+            "recent": [
+                {"appid": "1145350", "name": "Hades II", "hours": 3.2},
+                {"appid": "1245620", "name": "Elden Ring", "hours": 2.1},
+                {"appid": "413150", "name": "Stardew Valley", "hours": 0.9}]}
+
+
+# --- "On sale now": current Steam specials, KEYLESS from the public Storefront.
+# A SECOND fixed host (store.steampowered.com; no key, no account). Still gated on
+# the Steam integration being ON, so ALL Steam outbound stays behind the ONE opt-in.
+# The region is the box's OWN country (from its locale) or "us", validated to two
+# lowercase letters so it can never carry anything into the request. Cached ~1h;
+# degrade closed. No secret is involved. NOT per-account, so no save/clear reset.
+_STEAM_STORE_HOST = "https://store.steampowered.com"
+_STEAM_DEALS_CACHE = {"ts": 0.0, "val": None, "cc": None}
+_STEAM_DEALS_TTL = 3600.0
+
+
+def _steam_country():
+    """A 2-letter lowercase country for Storefront pricing, from the box locale, or
+    'us'. The regex guarantees the result is exactly [a-z]{2}, so it can only ever be
+    a country code in the request."""
+    for var in ("LC_ALL", "LC_MONETARY", "LANG"):
+        m = re.search(r"_([A-Za-z]{2})", os.environ.get(var) or "")
+        if m:
+            return m.group(1).lower()
+    return "us"
+
+
+def _steam_store_get(endpoint, params, timeout=_STEAM_WEBAPI_TIMEOUT):
+    """ONE public Storefront GET (no key). `endpoint` is a FIXED literal the caller
+    chose; `params` are validated values. Fixed host + HTTPS + urlencoded query, so
+    no value steers the host/path. Returns parsed JSON or None (degrade closed).
+    Never logs; there is no secret on this path."""
+    try:
+        url = "%s/api/%s?%s" % (_STEAM_STORE_HOST, endpoint,
+                                urllib.parse.urlencode(params))
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "couchside-agent/%s" % VERSION})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if getattr(r, "status", 200) != 200:
+                return None
+            return json.loads(r.read(1 << 21).decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _steam_featured(cc):
+    """Current specials from featuredcategories, as a slim list, or None. Prices are
+    in the currency's minor units (cents). Skips any malformed item."""
+    d = _steam_store_get("featuredcategories", {"cc": cc, "l": "english"})
+    try:
+        items = d["specials"]["items"]
+    except Exception:
+        return None
+    if not isinstance(items, list):
+        return None
+    out = []
+    for it in items:
+        if not isinstance(it, dict) or it.get("id") is None:
+            continue
+
+        def _int(k):
+            try:
+                return int(it.get(k) or 0)
+            except (TypeError, ValueError):
+                return 0
+        out.append({"appid": str(it.get("id")),
+                    "name": it.get("name") or ("App %s" % it.get("id")),
+                    "discount_percent": _int("discount_percent"),
+                    "final": _int("final_price"),
+                    "original": _int("original_price"),
+                    "currency": it.get("currency") or ""})
+    return out
+
+
+def _steam_deals_payload():
+    """GET /api/steam/deals: the "on sale now" row. Gated on the Steam integration
+    being ON (keeps ALL Steam outbound behind the one opt-in). {"configured": False}
+    without it; connected:False when the Storefront is unreachable."""
+    if not _steam_webapi_configured():
+        return {"configured": False}
+    cc = _steam_country()
+    now = time.monotonic()
+    if (_STEAM_DEALS_CACHE["val"] is not None and _STEAM_DEALS_CACHE["cc"] == cc
+            and now - _STEAM_DEALS_CACHE["ts"] < _STEAM_DEALS_TTL):
+        items = _STEAM_DEALS_CACHE["val"]
+    else:
+        items = _steam_featured(cc)
+        if items is not None:
+            _STEAM_DEALS_CACHE["ts"] = now
+            _STEAM_DEALS_CACHE["val"] = items
+            _STEAM_DEALS_CACHE["cc"] = cc
+    if items is None:
+        return {"configured": True, "connected": False}
+    return {"configured": True, "connected": True, "region": cc, "items": items[:20]}
+
+
+def mock_steam_deals_payload():
+    return {"configured": True, "connected": True, "region": "us", "items": [
+        {"appid": "1245620", "name": "Elden Ring", "discount_percent": 30,
+         "final": 4199, "original": 5999, "currency": "USD"},
+        {"appid": "1091500", "name": "Cyberpunk 2077", "discount_percent": 50,
+         "final": 2999, "original": 5999, "currency": "USD"},
+        {"appid": "413150", "name": "Stardew Valley", "discount_percent": 20,
+         "final": 1199, "original": 1499, "currency": "USD"}]}
+
+
+# --- Achievement progress + rarest-unlocked for a game, from the opt-in key.
+# The app passes the game's appid (the running game, or a pick); the agent returns
+# the owner's progress + the rarest achievement they've unlocked (global % from the
+# KEY-FREE GetGlobalAchievementPercentagesForApp). Per-account, so the cache is
+# wiped on save/clear like the owned/level caches. Bounded per-appid cache, 60s TTL.
+_STEAM_ACH_CACHE = {}          # appid -> {"ts": float, "val": dict}
+_STEAM_ACH_TTL = 60.0
+_STEAM_ACH_CACHE_MAX = 32
+
+
+def _valid_appid(s):
+    """A Steam appid is 1-7 ASCII digits. Reject anything else (never sanitise)."""
+    return isinstance(s, str) and 1 <= len(s) <= 7 and s.isascii() and s.isdigit()
+
+
+def _steam_get_global_pct(appid):
+    """{apiname: global_unlock_percent} for a game, from the KEY-FREE endpoint, or
+    {} on any failure. Used only to rank the owner's own unlocks by rarity."""
+    d = _steam_api_get("ISteamUserStats", "GetGlobalAchievementPercentagesForApp",
+                       "0002", {"gameid": appid})
+    try:
+        out = {}
+        for a in d["achievementpercentages"]["achievements"]:
+            if isinstance(a, dict) and a.get("name") is not None:
+                try:
+                    out[str(a["name"])] = float(a.get("percent") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+        return out
+    except Exception:
+        return {}
+
+
+def _steam_achievements_payload(appid):
+    """GET /api/steam/achievements?appid=<digits>: the owner's achievement progress
+    for one game + their rarest unlocked. {"configured": False} without a key;
+    connected:false when Steam is unreachable; has_achievements:false for a game with
+    none (or a profile that hides them). Cached 60s per appid. `appid` is already
+    validated (digits) by the route."""
+    if not _steam_webapi_configured():
+        return {"configured": False}
+    now = time.monotonic()
+    ent = _STEAM_ACH_CACHE.get(appid)
+    if ent is not None and now - ent["ts"] < _STEAM_ACH_TTL:
+        return ent["val"]
+    with _STEAM_WEBAPI_LOCK:
+        sid = _STEAM_WEBAPI["steamid64"]
+        key = _STEAM_WEBAPI["apikey"]
+    d = _steam_api_get("ISteamUserStats", "GetPlayerAchievements", "0001",
+                       {"key": key, "steamid": sid, "appid": appid, "l": "english"})
+    if d is None:
+        return {"configured": True, "connected": False, "appid": appid}
+    try:
+        ps = d["playerstats"]
+    except Exception:
+        return {"configured": True, "connected": False, "appid": appid}
+    if not ps.get("success"):
+        body = {"configured": True, "connected": True, "appid": appid,
+                "has_achievements": False}
+    else:
+        achs = ps.get("achievements")
+        if not isinstance(achs, list):
+            achs = []
+        total = len(achs)
+        unlocked = sum(1 for a in achs if isinstance(a, dict) and a.get("achieved"))
+        gpct = _steam_get_global_pct(appid)
+        rarest = None
+        for a in achs:
+            if not isinstance(a, dict) or not a.get("achieved"):
+                continue
+            pct = gpct.get(a.get("apiname"))
+            if pct is None:
+                continue
+            if rarest is None or pct < rarest["global_pct"]:
+                rarest = {"name": a.get("name") or a.get("apiname"),
+                          "global_pct": round(pct, 1)}
+        body = {"configured": True, "connected": True, "appid": appid,
+                "has_achievements": total > 0, "unlocked": unlocked, "total": total,
+                "percent": int(round(100.0 * unlocked / total)) if total else 0,
+                "rarest": rarest}
+    # bounded cache
+    if _steam_cache_ok(sid):
+        if len(_STEAM_ACH_CACHE) >= _STEAM_ACH_CACHE_MAX:
+            _STEAM_ACH_CACHE.clear()
+        _STEAM_ACH_CACHE[appid] = {"ts": now, "val": body}
+    return body
+
+
+def mock_steam_achievements_payload(appid):
+    return {"configured": True, "connected": True, "appid": appid or "1145350",
+            "has_achievements": True, "unlocked": 18, "total": 33, "percent": 55,
+            "rarest": {"name": "Isolated", "global_pct": 2.4}}
+
+
+# --- Wishlist sale-watch: which of the owner's wishlist games are discounted now.
+# GetWishlist (needs the key) gives appids; ONE batched Storefront appdetails price
+# call finds the discounted ones; names are fetched only for those (bounded). Per-
+# account, so the cache is wiped on save/clear. Cached ~1h; degrade closed. Bounded:
+# at most WL_CONSIDER price-checked + WL_MAX named, so a huge wishlist can't fan out.
+_STEAM_WISHLIST_CACHE = {"ts": 0.0, "val": None}
+_STEAM_WISHLIST_TTL = 3600.0
+_STEAM_WL_CONSIDER = 50
+_STEAM_WL_MAX = 12
+
+
+def _steam_get_wishlist(steamid64, apikey):
+    """The owner's wishlist appids (validated digits) via IPlayerService-style
+    IWishlistService/GetWishlist, or None. Order is the wishlist's own priority."""
+    d = _steam_api_get("IWishlistService", "GetWishlist", "0001",
+                       {"key": apikey, "steamid": steamid64})
+    try:
+        items = d["response"]["items"]
+    except Exception:
+        return None
+    if not isinstance(items, list):
+        return None
+    out = []
+    for it in items:
+        if not isinstance(it, dict) or it.get("appid") is None:
+            continue
+        aid = str(it.get("appid"))
+        if aid.isascii() and aid.isdigit() and 1 <= len(aid) <= 7:
+            out.append(aid)
+    return out
+
+
+def _steam_wishlist_payload():
+    """GET /api/steam/wishlist: the owner's wishlist size + which of those games are
+    on sale right now (name, discount, price). {"configured": False} without a key;
+    connected:false when the wishlist can't be read. Bounded + cached ~1h."""
+    if not _steam_webapi_configured():
+        return {"configured": False}
+    now = time.monotonic()
+    if (_STEAM_WISHLIST_CACHE["val"] is not None
+            and now - _STEAM_WISHLIST_CACHE["ts"] < _STEAM_WISHLIST_TTL):
+        return _STEAM_WISHLIST_CACHE["val"]
+    with _STEAM_WEBAPI_LOCK:
+        sid = _STEAM_WEBAPI["steamid64"]
+        key = _STEAM_WEBAPI["apikey"]
+    appids = _steam_get_wishlist(sid, key)
+    if appids is None:
+        return {"configured": True, "connected": False}
+
+    def _int(v):
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    cc = _steam_country()
+    consider = appids[:_STEAM_WL_CONSIDER]
+    on_sale = []
+    if consider:
+        pd = _steam_store_get("appdetails",
+                              {"appids": ",".join(consider), "filters": "price_overview", "cc": cc})
+        if isinstance(pd, dict):
+            for aid in consider:
+                e = pd.get(aid)
+                if not isinstance(e, dict) or not e.get("success"):
+                    continue
+                po = (e.get("data") or {}).get("price_overview")
+                if not isinstance(po, dict):
+                    continue
+                if _int(po.get("discount_percent")) > 0:
+                    on_sale.append({"appid": aid,
+                                    "discount_percent": _int(po.get("discount_percent")),
+                                    "final": _int(po.get("final")),
+                                    "original": _int(po.get("initial")),
+                                    "currency": po.get("currency") or ""})
+        # names only for the ones we'll show (bounded)
+        for it in on_sale[:_STEAM_WL_MAX]:
+            nd = _steam_store_get("appdetails", {"appids": it["appid"], "filters": "basic", "cc": cc})
+            entry = nd.get(it["appid"]) if isinstance(nd, dict) else None
+            name = (entry.get("data") or {}).get("name") if isinstance(entry, dict) else None
+            it["name"] = name or ("App %s" % it["appid"])
+    body = {"configured": True, "connected": True, "count": len(appids),
+            "on_sale": on_sale[:_STEAM_WL_MAX]}
+    if _steam_cache_ok(sid):
+        _STEAM_WISHLIST_CACHE["ts"] = now
+        _STEAM_WISHLIST_CACHE["val"] = body
+    return body
+
+
+def mock_steam_wishlist_payload():
+    return {"configured": True, "connected": True, "count": 41, "on_sale": [
+        {"appid": "1086940", "name": "Baldur's Gate 3", "discount_percent": 20,
+         "final": 4799, "original": 5999, "currency": "USD"},
+        {"appid": "1174180", "name": "Red Dead Redemption 2", "discount_percent": 67,
+         "final": 1979, "original": 5999, "currency": "USD"}]}
+
+
+# --- Playtime tracker: Steam only exposes "last 2 weeks" + lifetime, so to show
+# true this-week / this-month we snapshot the library's TOTAL minutes once a day,
+# keyed by account, and diff. Piggybacks on the library fetch (no extra API call).
+# Stored 0600 in the user's own dir, keyed by steamid64 (so it survives a transient
+# disconnect and never mixes accounts), pruned to ~70 days. Never raises.
+_STEAM_PLAYTIME_CONF = os.path.expanduser("~/.config/couchside/steam_playtime.json")
+_STEAM_PLAYTIME_KEEP = 70  # days of history to retain
+_STEAM_PLAYTIME_TOL = 3    # max days a baseline may sit before a window edge
+
+
+def _pt_day(offset_days=0):
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() - offset_days * 86400))
+
+
+def _steam_playtime_load():
+    try:
+        with open(_STEAM_PLAYTIME_CONF, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _steam_playtime_save(d):
+    directory = os.path.dirname(_STEAM_PLAYTIME_CONF)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return
+    if not os.access(directory, os.W_OK | os.X_OK):
+        return
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".couchside-playtime-", dir=directory)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _STEAM_PLAYTIME_CONF)
+    except Exception:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _steam_playtime_record(sid, total_min):
+    """Record today's total library minutes for `sid`, once per day (latest read of
+    the day wins). Prunes to the last ~70 days. Skips the disk write when today's
+    value is unchanged. Returns the account's {date: minutes} dict. Never raises."""
+    if not sid:
+        return {}
+    try:
+        total_min = int(total_min)
+    except (TypeError, ValueError):
+        return {}
+    today = _pt_day(0)
+    alld = _steam_playtime_load()
+    acct = alld.get(sid)
+    if not isinstance(acct, dict):
+        acct = {}
+    if acct.get(today) == total_min:
+        return acct  # nothing new today
+    acct[today] = total_min
+    cutoff = _pt_day(_STEAM_PLAYTIME_KEEP)
+    acct = {k: v for k, v in acct.items() if isinstance(k, str) and k >= cutoff}
+    alld[sid] = acct
+    _steam_playtime_save(alld)
+    return acct
+
+
+def _steam_playtime_deltas(acct, total_min):
+    """From an account's date->minutes snapshots + today's total, hours played in the
+    last 7 and 30 days. None for a window with no old-enough snapshot yet."""
+    try:
+        total_min = int(total_min)
+    except (TypeError, ValueError):
+        return {"played_7d": None, "played_30d": None}
+
+    def _delta(days):
+        target = _pt_day(days)
+        base = None
+        base_date = None
+        for k, v in (acct or {}).items():
+            if not isinstance(k, str) or k > target:
+                continue
+            try:
+                vi = int(v)
+            except (TypeError, ValueError):
+                continue
+            if base_date is None or k > base_date:
+                base_date = k
+                base = vi
+        if base is None:
+            return None
+        # Degrade closed: if the nearest baseline sits well BEFORE the window edge
+        # (a gap — box off / no library fetch for days), the diff would span more
+        # than N days. An honest "not enough recent history" beats an inflated
+        # number, so None out anything older than the edge by more than the tolerance.
+        if base_date < _pt_day(days + _STEAM_PLAYTIME_TOL):
+            return None
+        return round(max(0, total_min - base) / 60.0, 1)
+
+    return {"played_7d": _delta(7), "played_30d": _delta(30)}
 
 
 def _gaming_payload():
@@ -26097,6 +27063,45 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     data = mock_gaming() if self.mock else _gaming_payload()
                     self._send(200, data, started)
+            elif path == "/api/steam/webapi":
+                # Opt-in Steam Web API status: is a key configured, and does it
+                # connect (persona/avatar). NEVER returns the full key (masked).
+                # Probe-and-appear (absent on older agents). Bearer-gated: the
+                # do_GET auth gate above already ran.
+                self._send(200, {"configured": False} if self.mock
+                           else _steam_webapi_status(), started)
+            elif path == "/api/steam/profile":
+                # Opt-in: the owner's live Steam profile card (persona/avatar/state/
+                # now-playing/level). {configured:false} without a key; probe-and-
+                # appear (older agents 404). Bearer-gated: the do_GET gate ran.
+                self._send(200, mock_steam_profile_payload() if self.mock
+                           else _steam_profile_payload(), started)
+            elif path == "/api/steam/library":
+                # Opt-in: whole-library aggregates (totals, top game, backlog,
+                # recently played) from one GetOwnedGames call. Probe-and-appear.
+                self._send(200, mock_steam_library_payload() if self.mock
+                           else _steam_library_payload(), started)
+            elif path == "/api/steam/deals":
+                # Opt-in "on sale now" row (keyless public Storefront). Gated on the
+                # Steam integration being on so all Steam outbound stays behind one
+                # toggle; probe-and-appear. Bearer-gated: the do_GET gate ran.
+                self._send(200, mock_steam_deals_payload() if self.mock
+                           else _steam_deals_payload(), started)
+            elif path == "/api/steam/achievements":
+                # Opt-in: the owner's achievement progress for one game. `appid` is a
+                # query param VALIDATED to digits (reject, never sanitise) before it
+                # reaches the Steam API. Bearer-gated; probe-and-appear.
+                appid = (parse_qs(parsed.query).get("appid") or [""])[0]
+                if not _valid_appid(appid):
+                    self._send(400, {"error": "appid must be digits"}, started)
+                    return
+                self._send(200, mock_steam_achievements_payload(appid) if self.mock
+                           else _steam_achievements_payload(appid), started)
+            elif path == "/api/steam/wishlist":
+                # Opt-in: which of the owner's wishlist games are on sale now. No
+                # client input. Bearer-gated; probe-and-appear.
+                self._send(200, mock_steam_wishlist_payload() if self.mock
+                           else _steam_wishlist_payload(), started)
             elif path == "/api/recommend":
                 # "What to play next" — ranks INSTALLED Steam games from local play
                 # history (hours + recency). READ-ONLY: it recommends, it never
@@ -26590,6 +27595,53 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200 if ok else 500,
                            {"ok": bool(ok), "id": place}, started)
                 return
+            if path == "/api/steam/webapi":
+                # Store the user's Steam Web API key + SteamID64 (or resolve a
+                # vanity name). The key is a SECRET: bearer-gated (the auth gate
+                # above already ran), validated by FORMAT (reject, never sanitise),
+                # TESTED against Steam before storing, kept 0600 in the user's OWN
+                # config dir, and NEVER echoed back (the GET masks it). Degrade
+                # closed: if Steam does not accept the pair, a 400 and nothing is
+                # stored.
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(req, dict):
+                        raise ValueError("body must be a JSON object")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "body must be a JSON object"}, started)
+                    return
+                apikey = req.get("apikey")
+                if not _valid_steam_apikey(apikey):
+                    self._send(400, {"error": "apikey must be 32 hex characters"}, started)
+                    return
+                if self.mock:
+                    self._send(200, mock_steam_webapi_status(), started)
+                    return
+                sid = req.get("steamid64")
+                if not _valid_steamid64(sid):
+                    vanity = req.get("vanity")
+                    if _valid_steam_vanity(vanity):
+                        sid = _steam_resolve_vanity(vanity, apikey)
+                        if not sid:
+                            self._send(400, {"error": "could not resolve that Steam profile name (check the name and the key)"}, started)
+                            return
+                    else:
+                        self._send(400, {"error": "provide steamid64 (17 digits) or a vanity profile name"}, started)
+                        return
+                if _steam_get_summary(sid, apikey) is None:
+                    self._send(400, {"error": "Steam did not accept that key + profile (check both, and that the key has no domain restriction)"}, started)
+                    return
+                if not _steam_webapi_save(sid, apikey):
+                    self._send(500, {"error": "could not save the Steam key on the box"}, started)
+                    return
+                self._send(200, _steam_webapi_status(), started)
+                return
+            if path == "/api/steam/webapi/disconnect":
+                # Forget the stored key. Bearer-gated, idempotent.
+                if not self.mock:
+                    _steam_webapi_clear()
+                self._send(200, {"configured": False}, started)
+                return
             if path == "/api/steam/menus":
                 # _read_body() hands back BYTES, not a parsed object — decode
                 # like every other POST route here.
@@ -26728,6 +27780,59 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(404, {"error": "unknown strip"}, started)
                     return
                 self._send(200, res, started)
+                return
+
+            if path == "/api/leds/aura":
+                # GAME AURA: paint a STATIC per-LED palette across a strip. Body is
+                # a FIXED shape -- { strip: <prefix>, colors: [{r,g,b}, ...] } -- with
+                # ONE colour per strip member (the app samples a game's cover into N
+                # colours). This is a general N-colour frame; a Phase-2 per-game aura
+                # library reuses this same route.
+                #
+                # ALLOWLIST (§3): the strip PREFIX is LOOKED UP in the live strip set
+                # (mock: MOCK_LEDS) and 404s if unknown -- never interpolated. `colors`
+                # is DATA: it must be a list of EXACTLY the strip's member count, each
+                # an {r,g,b} of ints 0-255 (rejected, not sanitised -> 400, nothing
+                # painted). The validated ints are written to the strip's OWN members
+                # via the fixed-literal multi_intensity/brightness writers; no client
+                # value becomes a path, an attr name, or a command. Bearer-gated like
+                # every state-changing route (the auth gate above already ran).
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(req, dict):
+                        raise ValueError("body must be a JSON object")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "body must be a JSON object"}, started)
+                    return
+                strip_name = req.get("strip")
+                colors = req.get("colors")
+                # Look up the strip FIRST (both paths) so `colors` is validated
+                # against the REAL member count; an unknown strip 404s and nothing
+                # is even shape-checked against it.
+                if self.mock:
+                    strips = _led_strips([l["name"] for l in MOCK_LEDS if l["writable"]])
+                else:
+                    strips = _led_strips()
+                members = strips.get(strip_name) if isinstance(strip_name, str) else None
+                if not members:
+                    self._send(404, {"error": "unknown strip"}, started)
+                    return
+                frame, verr = _validate_aura_colors(colors, len(members))
+                if verr is not None:
+                    self._send(400, {"error": verr}, started)
+                    return
+                if self.mock:
+                    active = {"effect": "aura", "colors": frame, "brightness": 100}
+                    _MOCK_FX["strip:" + strip_name] = active
+                    self._send(200, {"ok": True, "strip": strip_name,
+                                     "active": active}, started)
+                    return
+                res = apply_strip_aura(strip_name, frame)
+                if res is None:
+                    self._send(404, {"error": "unknown strip"}, started)
+                    return
+                self._send(res.get("status", 200) if not res.get("ok") else 200,
+                           res, started)
                 return
 
             if path == "/api/leds/theme":
@@ -29563,6 +30668,7 @@ def main():
     args = p.parse_args()
 
     load_config(args.config)
+    _steam_webapi_load()  # opt-in Steam Web API key (user-owned, degrade-closed)
     if args.arm_boot_session:
         # Nothing else runs: no server, no probes, no capability scan. Just
         # write the drop-in and get out of the shutdown's way.
