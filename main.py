@@ -322,6 +322,35 @@ def _chown(path, uid, gid, recursive=False):
                     pass
 
 
+def _controller_health(port, running):
+    if not running:
+        return {"state": "service_stopped"}
+    token = _read_token(TOKEN_FILE) or _read_token(_token_mirror(), strict=True)
+    if token:
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/controller-health",
+                headers={"Authorization": "Bearer " + token})
+            # Never route a local pairing token through an environment proxy.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=2) as r:
+                result = json.loads(r.read(4096))
+            allowed = {"device_missing", "access_denied", "creation_failed", "accessible", "unknown"}
+            if isinstance(result, dict) and result.get("state") in allowed:
+                return {"state": result["state"]}
+        except Exception:
+            pass
+    # Root's access and Unix mode bits cannot establish the service's actual
+    # access (ACLs, supplementary groups, sandboxing). Do not guess denied.
+    try:
+        os.stat("/dev/uinput")
+    except FileNotFoundError:
+        return {"state": "device_missing"}
+    except OSError:
+        pass
+    return {"state": "unknown"}
+
+
 def _uinput_ready() -> bool:
     """Whether /dev/uinput exists and is writable by the TARGET user. This
     backend runs as root (os.access would always say yes), so decide from the
@@ -1136,8 +1165,10 @@ class Plugin:
                     version = json.loads(r.read().decode()).get("version")
             except Exception:
                 pass
+        health = _controller_health(port, running)
         return {"installed": installed, "running": running, "port": port,
-                "agent_version": version, "uinput_ready": _uinput_ready()}
+                "agent_version": version, "uinput_ready": health["state"] == "accessible",
+                "controller_health": health}
 
     # ---- pairing (for the QR) -------------------------------------------
     async def get_pairing(self):
