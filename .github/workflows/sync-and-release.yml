@@ -147,6 +147,10 @@ jobs:
         if: steps.decide.outputs.release == 'true'
         run: python3 scripts/test-token-mirror.py
 
+      - name: Test controller diagnostics
+        if: steps.decide.outputs.release == 'true'
+        run: python3 scripts/test-controller-health.py
+
       - name: Build & package
         if: steps.decide.outputs.release == 'true'
         id: build

@@ -1,3 +1,4 @@
+import { controllerMessage } from "./controllerHealth";
 import {
   ButtonItem,
   PanelSection,
@@ -14,7 +15,7 @@ import { FaCouch, FaDownload, FaRotate, FaKey, FaTrash } from "react-icons/fa6";
 import { QRCodeSVG } from "qrcode.react";
 
 // ---- backend bridges (names match main.py's Plugin methods) --------------
-type Status = { installed: boolean; running: boolean; port: number; agent_version?: string | null; uinput_ready?: boolean };
+type Status = { installed: boolean; running: boolean; port: number; agent_version?: string | null; uinput_ready?: boolean; controller_health?: { state: string } };
 type Pairing = { ok: boolean; host?: string; port?: number; token?: string; pair_url?: string; error?: string };
 type Result = { ok: boolean; error?: string };
 type UpdateCheck = { ok: boolean; current: string; latest?: string; update_available: boolean; error?: string };
@@ -148,7 +149,7 @@ function Content() {
                 games. Surface it instead of showing a bare green "Running". */}
             <Field label="Virtual gamepad" focusable={false} bottomSeparator="none">
               <span style={{ color: "#f5a623" }}>
-                Unavailable — reboot or reinstall
+                {controllerMessage(status.controller_health?.state)}
               </span>
             </Field>
           </PanelSectionRow>
