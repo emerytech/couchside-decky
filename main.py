@@ -24,6 +24,8 @@ Frontend-callable methods:
 import errno
 import hashlib
 import json
+import time
+import asyncio
 import os
 import pwd
 import re
@@ -803,6 +805,29 @@ def _extract_tarball(tarball, dest):
             t.extractall(dest)
 
 
+def _theme_document_validate(value):
+    if value is None:
+        return None
+    keys = {"format", "version", "name", "author", "layout", "accent", "wallpaper", "motion", "stats"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError("unknown or missing theme document fields")
+    if value["format"] != "couchside-theme" or type(value["version"]) is not int or value["version"] != 1:
+        raise ValueError("unsupported theme document")
+    for key, limit in (("name", 60), ("author", 80)):
+        text = value[key]
+        if not isinstance(text, str) or len(text) > limit or any(ord(c) < 32 or ord(c) == 127 for c in text):
+            raise ValueError("invalid theme metadata")
+    if not value["name"].strip():
+        raise ValueError("theme name required")
+    if any(not isinstance(value[k], str) for k in ("layout", "accent", "wallpaper")):
+        raise ValueError("invalid theme option type")
+    if value["layout"] not in ("couchside", "orbit", "shelf", "wave", "channels", "crossbar", "horizon") or value["accent"] not in ("teal", "blue", "violet", "amber") or value["wallpaper"] not in ("original", "midnight", "ocean", "forest", "sunset"):
+        raise ValueError("unknown theme option")
+    if type(value["motion"]) is not bool or type(value["stats"]) is not bool:
+        raise ValueError("invalid theme flag")
+    return dict(value, name=value["name"].strip(), author=value["author"].strip())
+
+
 class Plugin:
     # ---- lifecycle -------------------------------------------------------
     async def _main(self):
@@ -1171,6 +1196,195 @@ class Plugin:
                 "controller_health": health}
 
     # ---- pairing (for the QR) -------------------------------------------
+    async def report_theme_ui(self, state, detail=""):
+        if state not in ("rendered", "error", "hook") or not isinstance(detail, str):
+            return False
+        detail = detail[:160].replace("\n", " ").replace("\r", " ")
+        log.info("Couchside themes UI: %s %s", state, detail)
+        self._theme_ui = {"state": state, "detail": detail}
+        return True
+
+    async def set_steam_theme(self, patch):
+        """TV controls use the same authenticated agent validation as the phone.
+
+        Never accept URLs, paths, code, install flags or raw settings files.
+        Keep credentials inside the backend and bound the response and timeout.
+        """
+        if not isinstance(patch, dict) or not patch or set(patch) - {"enabled", "theme", "accent", "motion"}:
+            return {"ok": False, "error": "Invalid theme settings"}
+        for key in ("enabled", "motion"):
+            if key in patch and type(patch[key]) is not bool:
+                return {"ok": False, "error": "Invalid theme flag"}
+        for key, allowed in (("theme", ("couchside", "orbit", "shelf", "wave", "channels", "crossbar", "horizon")),
+                             ("accent", ("teal", "blue", "violet", "amber"))):
+            if key in patch and (not isinstance(patch[key], str) or patch[key] not in allowed):
+                return {"ok": False, "error": "Unknown " + key}
+        def save():
+            token = _read_token(TOKEN_FILE) or _read_token(_token_mirror(), strict=True)
+            if not token:
+                return {"ok": False, "error": "Pair Couchside with the local service first"}
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/api/steam/themes" % _read_port(),
+                data=json.dumps(patch).encode("utf-8"), method="POST",
+                headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=4) as response:
+                    raw = response.read(16385)
+                if len(raw) > 16384:
+                    raise ValueError("Theme response too large")
+                return {"ok": True, "state": json.loads(raw)}
+            except urllib.error.HTTPError as error:
+                try:
+                    body = json.loads(error.read(4096))
+                    detail = str(body.get("error", "Theme settings were refused"))[:180]
+                except (ValueError, OSError):
+                    detail = "Theme settings were refused"
+                return {"ok": False, "error": detail}
+            except (OSError, ValueError):
+                return {"ok": False, "error": "Couchside service unavailable. Your saved theme is unchanged."}
+        return await asyncio.to_thread(save)
+
+    async def get_theme_game_stats(self, appid):
+        # Fixed loopback route. Tokens and Steam API keys never reach the renderer.
+        if type(appid) is not int or not 0 < appid < 10000000000:
+            return {}
+        def read():
+            token = _read_token(TOKEN_FILE) or _read_token(_token_mirror(), strict=True)
+            if not token:
+                return {}
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/api/steam/themes/game?appid=%d" % (_read_port(), appid),
+                headers={"Authorization": "Bearer " + token})
+            try:
+                with urllib.request.urlopen(req, timeout=3) as response:
+                    raw = response.read(4097)
+                value = json.loads(raw) if len(raw) <= 4096 else {}
+                if not isinstance(value, dict) or value.get("appid") != appid:
+                    return {}
+                return {k: value[k] for k in ("appid", "configured", "hours", "last_played", "achievements") if k in value}
+            except (OSError, ValueError):
+                return {}
+        # Single-flight backend work caps threads even if the UI is reopened.
+        task = getattr(self, "_theme_stats_task", None)
+        if task is not None and not task.done():
+            return {}
+        task = asyncio.create_task(asyncio.to_thread(read))
+        self._theme_stats_task = task
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=3.5)
+        except asyncio.TimeoutError:
+            return {}
+
+    async def get_steam_theme(self):
+        # One worker at a time: a slow external library must not block Decky's
+        # event loop or accumulate a new scanning thread on every phone poll.
+        task = getattr(self, "_steam_theme_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(asyncio.to_thread(self._steam_theme_snapshot))
+            self._steam_theme_task = task
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=2)
+        except (asyncio.TimeoutError, OSError, ValueError):
+            return {"settings": {"version": 1, "installed": False, "enabled": False,
+                                 "theme": "couchside", "accent": "teal", "motion": False},
+                    "games": []}
+
+    @staticmethod
+    def _theme_runtime(name):
+        return bool(re.match(r"^(?:Proton(?: \d| -| Experimental$| Hotfix$)|Steam Linux Runtime(?: |$)|Steamworks Common Redistributables$|Steamworks Shared$)", name, re.I))
+
+    def _steam_theme_snapshot(self):
+        """Read data for the optional renderer; malformed settings restore Steam.
+
+        No theme executes Python/JS or supplies paths. This root backend only
+        reads bounded regular files and never writes into a user-owned directory.
+        """
+        defaults = {"version": 1, "installed": False, "enabled": False,
+                    "theme": "couchside", "accent": "teal", "motion": True, "studio": None}
+        revision = ""
+        theme_path = os.path.join(STATE_DIR, "steam-themes.json")
+        def read_regular(path, limit):
+            nonlocal revision
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK |
+                         getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+                info = os.fstat(f.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("not a regular file")
+                if path == theme_path:
+                    revision = str(info.st_mtime_ns)
+                text = f.read(limit + 1)
+            if len(text) > limit:
+                raise ValueError("file too large")
+            return text
+        try:
+            data = json.loads(read_regular(theme_path, 4096))
+            if not isinstance(data, dict) or set(data) - set(defaults):
+                raise ValueError("invalid schema")
+            data = dict(defaults, **data)
+            data["studio"] = _theme_document_validate(data["studio"])
+            if data["studio"] and any(data[k] != data["studio"][v] for k, v in (("theme", "layout"), ("accent", "accent"), ("motion", "motion"))):
+                raise ValueError("theme document mismatch")
+            if type(data["version"]) is not int or data["version"] != 1:
+                raise ValueError("invalid version")
+            for key in ("installed", "enabled", "motion"):
+                if type(data[key]) is not bool:
+                    raise ValueError("invalid flag")
+            if data["theme"] not in ("couchside", "orbit", "shelf", "wave", "channels", "crossbar", "horizon") or data["accent"] not in ("teal", "blue", "violet", "amber"):
+                raise ValueError("invalid theme")
+            if not data["installed"]:
+                data["enabled"] = False
+        except (OSError, ValueError, TypeError):
+            data = defaults
+        if not data["enabled"]:
+            return {"settings": data, "games": [], "revision": revision}
+        cached = getattr(self, "_theme_games_cache", (0, []))
+        if time.monotonic() - cached[0] > 60:
+            games = []
+            try:
+                home = pwd.getpwnam(_target_user()).pw_dir
+                roots = [os.path.join(home, ".local/share/Steam"),
+                         os.path.join(home, ".steam/steam")]
+                root = next(r for r in roots if os.path.isdir(os.path.join(r, "steamapps")))
+                libraries = [os.path.join(root, "steamapps")]
+                try:
+                    vdf = read_regular(os.path.join(root, "steamapps/libraryfolders.vdf"), 131072)
+                    libraries.extend(os.path.join(path, "steamapps") for path in
+                                     re.findall(r'"path"\s+"([^"\n]+)"', vdf)[:32])
+                except (OSError, ValueError):
+                    pass
+                seen = set()
+                budget = 1024
+                for library in dict.fromkeys(map(os.path.realpath, libraries)):
+                    try:
+                        with os.scandir(library) as entries:
+                            for entry in entries:
+                                budget -= 1
+                                if budget < 0:
+                                    break
+                                if not re.fullmatch(r"appmanifest_[0-9]{1,10}\.acf", entry.name):
+                                    continue
+                                try:
+                                    text = read_regular(entry.path, 65536)
+                                    appid = int(re.search(r'"appid"\s+"([0-9]+)"', text)[1])
+                                    name = re.search(r'"name"\s+"([^"\n]+)"', text)[1][:160]
+                                    if 0 < appid < 2**32 and appid not in seen and not self._theme_runtime(name):
+                                        seen.add(appid)
+                                        games.append({"appid": appid, "name": name})
+                                except (OSError, ValueError, TypeError):
+                                    continue
+                    except OSError:
+                        continue
+                    if budget < 0:
+                        break
+                games.sort(key=lambda g: g["name"].casefold())
+            except (OSError, StopIteration, KeyError):
+                pass
+            cached = (time.monotonic(), games[:120])
+            self._theme_games_cache = cached
+        return {"settings": data, "games": cached[1], "revision": revision,
+                "ui": getattr(self, "_theme_ui", None)}
+
     async def get_pairing(self):
         # Canonical first, then the agent's mirror (agent >= 2.9.114): when an OS
         # update dropped /etc/couchside/token, the mirror is exactly what the agent

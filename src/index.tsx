@@ -1,4 +1,5 @@
 import { controllerMessage } from "./controllerHealth";
+import { installSteamThemes, openSteamTheme, openSteamThemeHub, pauseSteamTheme } from "./SteamThemes";
 import {
   ButtonItem,
   PanelSection,
@@ -136,6 +137,11 @@ function Content() {
   // ---- installed: status + QR + actions ---------------------------------
   return (
     <>
+      <PanelSection title="Couchside Themes · Beta">
+        <PanelSectionRow><ButtonItem layout="below" onClick={openSteamThemeHub}>Browse Couchside Themes · Beta</ButtonItem></PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" onClick={openSteamTheme}>Open themed home</ButtonItem></PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" onClick={pauseSteamTheme}>Return to Steam home</ButtonItem></PanelSectionRow>
+      </PanelSection>
       <PanelSection title="Couchside">
         <PanelSectionRow>
           <Field label="Status" bottomSeparator="none">
@@ -265,9 +271,13 @@ function Content() {
   );
 }
 
-export default definePlugin(() => ({
+export default definePlugin(() => {
+  const stopThemes = installSteamThemes();
+  return ({
   name: "Couchside",
   titleView: <div className={staticClasses.Title}>Couchside</div>,
   content: <Content />,
   icon: <FaCouch />,
-}));
+  onDismount: stopThemes,
+});
+});
