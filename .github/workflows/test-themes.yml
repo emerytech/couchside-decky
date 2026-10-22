@@ -1,0 +1,30 @@
+name: Themes regression checks
+on:
+  pull_request:
+  push:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  themes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tsc --noEmit
+      - name: Navigation, fallback and safe settings
+        run: |
+          node scripts/test-console-navigation.cjs
+          node scripts/test-steam-themes-renderer.cjs
+          node scripts/test-theme-hub.cjs
+          node scripts/test-theme-layouts.cjs
+          python3 scripts/test-steam-themes.py
+          python3 scripts/test-controller-health.py
+      - run: pnpm build
