@@ -8,4 +8,10 @@ assert.equal(tree.props.style['--ap-bg'],'linear-gradient(90deg,#123456,#abcdef)
 assert.equal(tree.props.style['--ap-library'],'linear-gradient(180deg,#223344,#556677)');
 assert.equal(frame.AppearanceFrame({pack:p,children:'child',section:'settings'}).props.style['--ap-bg'],'linear-gradient(135deg,#001122,#334455)');
 assert.throws(()=>frame.AppearanceFrame({pack:{...p,colors:{...p.colors,accent:'url(x)'}},children:'child'}));
+const neutral=frame.AppearanceFrame({pack:null,children:'child'});
+assert.equal(neutral.type,tree.type,'default preview must preserve the container');
+assert.equal(neutral.props.className,'cs-appearance-frame');
+assert.equal(neutral.props.children[0].props.children,'','default preview must remove pack CSS');
+assert.equal(neutral.props.children[1],tree.props.children[1],'preview content must retain its React position');
+assert.equal(neutral.props.style['--ap-bg'],undefined);
 console.log('PASS: appearance values validated before rendering; gradients map to fixed sections');

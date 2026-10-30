@@ -62,7 +62,7 @@ export function CouchsideThemeHub() {
           </DialogButton>)}
         </Focusable>
         {!visible.length && <p>No themes match your search. Clear it to see your selection.</p>}
-        {!!draft.appearance_packs?.length && <><h3>Appearance packs</h3><Focusable flow-children="row" style={{display:'flex',gap:12,flexWrap:'wrap'}}><DialogButton className="cs-hub-control" disabled={busy} onClick={()=>setDraft({...draft,appearance:null})}>Layout default{!draft.appearance?' ✓':''}</DialogButton>{(draft.appearance_packs||[]).map(pack=><DialogButton className="cs-hub-control" key={pack.name} disabled={busy} onClick={()=>setDraft({...draft,appearance:pack})}>{pack.name}{draft.appearance?.name===pack.name?' ✓':''}</DialogButton>)}<DialogButton className="cs-hub-control" disabled={busy} onClick={()=>setDraft(active)}>Cancel changes</DialogButton></Focusable></>}
+        {!!draft.appearance_packs?.length && <><h3>Appearance packs</h3><Focusable flow-children="column" style={{display:'flex',flexDirection:'column',gap:12}}><DialogButton className="cs-hub-control" disabled={busy} onClick={()=>setDraft({...draft,appearance:null})}>Layout default{!draft.appearance?' ✓':''}</DialogButton>{(draft.appearance_packs||[]).map(pack=><DialogButton className="cs-hub-control" key={pack.name} disabled={busy} onClick={()=>setDraft({...draft,appearance:pack})}>{pack.name}{draft.appearance?.name===pack.name?' ✓':''}</DialogButton>)}<DialogButton className="cs-hub-control" disabled={busy} onClick={()=>setDraft(active)}>Cancel changes</DialogButton></Focusable></>}
         <h3>Make it yours</h3><Focusable flow-children="row" style={{ display: 'flex', gap: 16, marginBottom: 16 }}>{(Object.keys(accents) as Accent[]).map(accent => <DialogButton className="cs-hub-control" disabled={busy} key={accent} onClick={() => setDraft({ ...draft, accent })} style={{ border: `3px solid ${accents[accent]}`, color: '#f0f4fa', background: '#172235' }}>{accent}{draft.accent === accent ? ' ✓' : ''}</DialogButton>)}</Focusable>
         <ToggleField label="Animations" description="Respect reduced motion; turn off theme transitions." checked={draft.motion} disabled={busy} onChange={motion => setDraft({ ...draft, motion })} />
         <p style={{ color: '#b0bfd2' }}>Original Couchside layouts. Previews use a sample library. Steam default is always available.</p>
@@ -70,5 +70,7 @@ export function CouchsideThemeHub() {
     </div>
     <footer style={{ paddingTop: 12, borderTop: '1px solid #33435b', flexShrink: 0 }}><div role="status" style={{ minHeight: 24 }}>{message || (pending ? 'Preview selection — press Apply to change the TV.' : '')}</div><DialogButton className="cs-hub-control" disabled={busy || !draft?.installed || !selectedVisible} onClick={() => void apply(true)} style={{ width: '100%', background: color, color: '#0c1321', padding: 14 }}>{busy ? 'Saving…' : !selectedVisible ? 'Select a visible theme' : 'Apply selected theme'}</DialogButton></footer>
   </Focusable>;
-  return draft?.appearance ? <AppearanceFrame pack={draft.appearance} section="settings">{content}</AppearanceFrame> : content;
+  // Once packs are available, retain this container through default/pack previews.
+  // Installations without packs keep their original render tree.
+  return draft && (draft.appearance || draft.appearance_packs?.length) ? <AppearanceFrame pack={draft.appearance ?? null} section="settings">{content}</AppearanceFrame> : content;
 }
