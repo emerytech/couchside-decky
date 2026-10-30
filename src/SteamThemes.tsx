@@ -1,3 +1,5 @@
+import {AppearanceFrame} from './AppearanceFrame';
+import type {AppearancePack} from './AppearancePack';
 import { ConsoleHome } from './ConsoleHome';
 import { waveGames, waveSections, type WaveSection, type ThemeGame } from './ThemeLayouts';
 import { CouchsideThemeHub } from './ThemeHub';
@@ -7,7 +9,7 @@ import { Component, useEffect, useRef, useState, useSyncExternalStore, type Reac
 
 // Original Couchside renderer. Theme packs are fixed layouts and settings;
 // no remote scripts, CSS selectors or executable theme files are accepted.
-type Settings = { installed: boolean; enabled: boolean; theme: string; accent: string; motion: boolean; studio?: { name: string; wallpaper: string; stats: boolean } | null };
+type Settings = { installed: boolean; enabled: boolean; theme: string; accent: string; motion: boolean; appearance?: AppearancePack | null; studio?: { name: string; wallpaper: string; stats: boolean } | null };
 type ThemeData = { revision?: string; settings: Settings; games: { appid: number; name: string }[] };
 const wordmark = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTYwIiBoZWlnaHQ9IjIxMCIgdmlld0JveD0iMCAwIDExNjAgMjEwIiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IkNvdWNoc2lkZSI+CiAgPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6IlNwYWNlIE1vbm8iLHVpLW1vbm9zcGFjZSxTRk1vbm8tUmVndWxhcixNZW5sbyxtb25vc3BhY2U7Zm9udC13ZWlnaHQ6NzAwfTwvc3R5bGU+CiAgPHRleHQgeD0iMCIgeT0iMTUwIiBmb250LXNpemU9IjIwMCIgbGV0dGVyLXNwYWNpbmc9Ii02IiBmaWxsPSIjZTZlZGY3Ij5Db3VjaDx0c3BhbiBmaWxsPSIjMzRkMzk5Ij5zaWRlPC90c3Bhbj48L3RleHQ+Cjwvc3ZnPgo=';
 const readTheme = callable<[], ThemeData>('get_steam_theme');
@@ -213,7 +215,7 @@ function StandardThemeHome() {
       {item.label} <span style={{ opacity: .7 }}>({waveGames(games, item.id).length})</span></DialogButton>)}</Focusable>}
     {!visibleGames.length && <div style={{ padding: 32, border: '1px solid #63768c', borderRadius: 18 }}><h2>{games.length ? 'No games in this group' : 'Your library starts here'}</h2><p>{games.length ? 'Choose another group to browse your installed library.' : 'Installed Steam games appear here. Use Steam’s library to install or browse games.'}</p>{!games.length && <DialogButton onClick={() => Navigation.Navigate('/library')}>Open Steam library</DialogButton>}</div>}
     <div style={{ display: 'flex', alignItems: 'flex-start', gap: 40 }}>
-      <Focusable preferredFocus navEntryPreferPosition={NavEntryPositionPreferences.PREFERRED_CHILD} flow-children={wave || channels ? 'column' : 'row'}
+      <Focusable className="cs-theme-library" preferredFocus navEntryPreferPosition={NavEntryPositionPreferences.PREFERRED_CHILD} flow-children={wave || channels ? 'column' : 'row'}
         style={{ display: 'flex', flexDirection: wave || channels ? 'column' : 'row', gap: channels ? 24 : grid ? 14 : 22, flexWrap: carousel || wave ? 'nowrap' : 'wrap', overflowX: carousel ? 'auto' : undefined, overflowY: crossbar ? 'auto' : undefined, maxHeight: crossbar ? 'calc(100vh - 440px)' : undefined, alignItems: horizon ? 'flex-start' : undefined, minHeight: horizon ? 315 : undefined, padding: 10, width: wave || dashboard ? '60%' : '100%', boxSizing: 'border-box' }}>
         {channels ? Array.from({ length: Math.ceil(visibleGames.length / 3) }, (_, row) => <Focusable key={row} flow-children="row" style={{ display: 'flex', gap: 24, width: '100%', flexShrink: 0 }}>{visibleGames.slice(row * 3, row * 3 + 3).map(renderGame)}</Focusable>) : visibleGames.map(renderGame)}
       </Focusable>
@@ -231,11 +233,11 @@ function StandardThemeHome() {
 function ThemeGate({ fallback }: { fallback: ReactNode }) {
   const { settings } = useData();
   if (!settings.installed || !settings.enabled || paused) return <>{fallback}</>;
-  return <ThemeBoundary fallback={fallback}><ThemeHome key={settings.theme} /></ThemeBoundary>;
+  return <ThemeBoundary fallback={fallback}>{settings.appearance ? <AppearanceFrame pack={settings.appearance}><ThemeHome key={settings.theme}/></AppearanceFrame> : <ThemeHome key={settings.theme} />}</ThemeBoundary>;
 }
 function ThemeRoute() {
   const data = useData();
-  return data.settings.enabled && !paused ? <ThemeBoundary fallback={<DialogButton onClick={pauseSteamTheme}>Return to Steam</DialogButton>}><ThemeHome key={data.settings.theme} /></ThemeBoundary> : <DialogButton onClick={pauseSteamTheme}>Themes are off. Return to Steam</DialogButton>;
+  return data.settings.enabled && !paused ? <ThemeBoundary fallback={<DialogButton onClick={pauseSteamTheme}>Return to Steam</DialogButton>}>{data.settings.appearance ? <AppearanceFrame pack={data.settings.appearance}><ThemeHome key={data.settings.theme}/></AppearanceFrame> : <ThemeHome key={data.settings.theme} />}</ThemeBoundary> : <DialogButton onClick={pauseSteamTheme}>Themes are off. Return to Steam</DialogButton>;
 }
 
 export function installSteamThemes() {

@@ -169,6 +169,7 @@ jobs:
           node scripts/test-console-navigation.cjs
           node scripts/test-steam-themes-renderer.cjs
           node scripts/test-theme-hub.cjs
+          node scripts/test-appearance-pack.cjs
           node scripts/test-theme-layouts.cjs
           pnpm build
           # Layout Decky Loader + install.sh expect: a top-level Couchside/ dir.

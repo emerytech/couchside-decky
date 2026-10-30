@@ -1,3 +1,5 @@
+import {AppearanceFrame} from './AppearanceFrame';
+import type {AppearancePack} from './AppearancePack';
 import { callable } from '@decky/api';
 import { DialogButton, Focusable, TextField, ToggleField, Navigation, NavEntryPositionPreferences } from '@decky/ui';
 import { useEffect, useRef, useState } from 'react';
@@ -5,7 +7,7 @@ import { themeCatalog } from './ThemeCatalog';
 
 type ThemeId = typeof themeCatalog[number]['id'];
 type Accent = 'teal' | 'blue' | 'violet' | 'amber';
-type Settings = { installed: boolean; enabled: boolean; theme: ThemeId; accent: Accent; motion: boolean };
+type Settings = { installed: boolean; enabled: boolean; theme: ThemeId; accent: Accent; motion: boolean; appearance?: AppearancePack | null; appearance_packs?: AppearancePack[] };
 const read = callable<[], { settings: Settings }>('get_steam_theme');
 const write = callable<[Partial<Settings>], { ok: boolean; error?: string }>('set_steam_theme');
 const accents: Record<Accent, string> = { teal: '#26d4be', blue: '#73b5ff', violet: '#b5a0ff', amber: '#ffcf7b' };
@@ -31,7 +33,7 @@ export function CouchsideThemeHub() {
     if (!draft || saving.current || (enabled && (!draft.installed || !selectedVisible))) return;
     saving.current = true; setBusy(true); setMessage('Saving…');
     try {
-      const result = await write({ enabled, theme: draft.theme, accent: draft.accent, motion: draft.motion });
+      const result = await write({ enabled, theme: draft.theme, accent: draft.accent, motion: draft.motion, ...((active?.appearance_packs?.length || active?.appearance) ? {appearance:draft.appearance ?? null} : {}) });
       if (!live.current) return;
       if (!result.ok) { setMessage(result.error || 'Could not save. Your previous theme is unchanged.'); return; }
       const value = { ...draft, enabled };
@@ -42,8 +44,8 @@ export function CouchsideThemeHub() {
     finally { saving.current = false; if (live.current) setBusy(false); }
   };
   const color = accents[draft?.accent || 'teal'];
-  const pending = !!draft && !!active && (!active.enabled || draft.theme !== active.theme || draft.accent !== active.accent || draft.motion !== active.motion);
-  return <Focusable preferredFocus navEntryPreferPosition={NavEntryPositionPreferences.PREFERRED_CHILD} flow-children="column" onCancel={() => Navigation.Navigate('/library/home')} style={{ height: 'calc(100vh - 80px)', display: 'flex', flexDirection: 'column', background: '#0c1321', color: '#f0f4fa', padding: '56px 36px 20px', boxSizing: 'border-box' }}>
+  const pending = !!draft && !!active && (!active.enabled || draft.theme !== active.theme || draft.accent !== active.accent || draft.motion !== active.motion || JSON.stringify(draft.appearance)!==JSON.stringify(active.appearance));
+  const content = <Focusable preferredFocus navEntryPreferPosition={NavEntryPositionPreferences.PREFERRED_CHILD} flow-children="column" onCancel={() => Navigation.Navigate('/library/home')} style={{ height: 'calc(100vh - 80px)', display: 'flex', flexDirection: 'column', background: '#0c1321', color: '#f0f4fa', padding: '56px 36px 20px', boxSizing: 'border-box' }}>
     <style>{`.cs-hub-control:focus,.cs-hub-control.gpfocus{outline:3px solid #f0f4fa!important;outline-offset:3px;box-shadow:0 0 0 6px #0c1321!important}.cs-hub-control{flex-grow:0!important}`}</style>
     <header style={{ display: 'flex', justifyContent: 'space-between', gap: 24 }}><div style={{ flex: 1, minWidth: 0 }}><h1 style={{ margin: '0 0 8px' }}>Couchside Themes <span style={{ fontSize: 13, border: '1px solid #8edcfa', color: '#8edcfa', borderRadius: 6, padding: '3px 7px', verticalAlign: 'middle' }}>BETA</span></h1><p style={{ margin: '0 0 16px', color: '#b0bfd2' }}>Choose your home. Your Steam games stay where they are.</p></div><DialogButton className="cs-hub-control" style={{ width: 140, flexGrow: 0, flexShrink: 0, height: 48, alignSelf: 'flex-start' }} onClick={() => Navigation.Navigate('/library/home')}>Back</DialogButton></header>
     <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 8 }}>
@@ -60,6 +62,7 @@ export function CouchsideThemeHub() {
           </DialogButton>)}
         </Focusable>
         {!visible.length && <p>No themes match your search. Clear it to see your selection.</p>}
+        {!!draft.appearance_packs?.length && <><h3>Appearance packs</h3><Focusable flow-children="row" style={{display:'flex',gap:12,flexWrap:'wrap'}}><DialogButton className="cs-hub-control" disabled={busy} onClick={()=>setDraft({...draft,appearance:null})}>Layout default{!draft.appearance?' ✓':''}</DialogButton>{(draft.appearance_packs||[]).map(pack=><DialogButton className="cs-hub-control" key={pack.name} disabled={busy} onClick={()=>setDraft({...draft,appearance:pack})}>{pack.name}{draft.appearance?.name===pack.name?' ✓':''}</DialogButton>)}<DialogButton className="cs-hub-control" disabled={busy} onClick={()=>setDraft(active)}>Cancel changes</DialogButton></Focusable></>}
         <h3>Make it yours</h3><Focusable flow-children="row" style={{ display: 'flex', gap: 16, marginBottom: 16 }}>{(Object.keys(accents) as Accent[]).map(accent => <DialogButton className="cs-hub-control" disabled={busy} key={accent} onClick={() => setDraft({ ...draft, accent })} style={{ border: `3px solid ${accents[accent]}`, color: '#f0f4fa', background: '#172235' }}>{accent}{draft.accent === accent ? ' ✓' : ''}</DialogButton>)}</Focusable>
         <ToggleField label="Animations" description="Respect reduced motion; turn off theme transitions." checked={draft.motion} disabled={busy} onChange={motion => setDraft({ ...draft, motion })} />
         <p style={{ color: '#b0bfd2' }}>Original Couchside layouts. Previews use a sample library. Steam default is always available.</p>
@@ -67,4 +70,5 @@ export function CouchsideThemeHub() {
     </div>
     <footer style={{ paddingTop: 12, borderTop: '1px solid #33435b', flexShrink: 0 }}><div role="status" style={{ minHeight: 24 }}>{message || (pending ? 'Preview selection — press Apply to change the TV.' : '')}</div><DialogButton className="cs-hub-control" disabled={busy || !draft?.installed || !selectedVisible} onClick={() => void apply(true)} style={{ width: '100%', background: color, color: '#0c1321', padding: 14 }}>{busy ? 'Saving…' : !selectedVisible ? 'Select a visible theme' : 'Apply selected theme'}</DialogButton></footer>
   </Focusable>;
+  return draft?.appearance ? <AppearanceFrame pack={draft.appearance} section="settings">{content}</AppearanceFrame> : content;
 }

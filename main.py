@@ -805,6 +805,37 @@ def _extract_tarball(tarball, dest):
             t.extractall(dest)
 
 
+def _appearance_pack_validate(value):
+    """Portable data only. No CSS, selectors, paths, URLs or executable values."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"version", "name", "colors", "backgrounds"}:
+        raise ValueError("invalid appearance pack fields")
+    if type(value["version"]) is not int or value["version"] != 1:
+        raise ValueError("unsupported appearance pack version")
+    name = value["name"]
+    if not isinstance(name, str) or not name.strip() or len(name) > 60 or any(ord(c) < 32 or ord(c) == 127 for c in name):
+        raise ValueError("invalid appearance pack name")
+    colors = value["colors"]
+    keys = {"background", "surface", "text", "muted", "accent", "focus"}
+    def color(v):
+        return isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v) is not None
+    if not isinstance(colors, dict) or set(colors) != keys or not all(color(v) for v in colors.values()):
+        raise ValueError("appearance colors must be six-digit hex values")
+    backgrounds = value["backgrounds"]
+    if not isinstance(backgrounds, dict) or set(backgrounds) - {"home", "library", "settings"}:
+        raise ValueError("invalid appearance backgrounds")
+    for gradient in backgrounds.values():
+        if not isinstance(gradient, dict) or set(gradient) != {"angle", "stops"}:
+            raise ValueError("invalid appearance gradient")
+        if type(gradient["angle"]) is not int or not 0 <= gradient["angle"] <= 360:
+            raise ValueError("invalid gradient angle")
+        stops = gradient["stops"]
+        if not isinstance(stops, list) or not 2 <= len(stops) <= 4 or not all(color(v) for v in stops):
+            raise ValueError("invalid gradient stops")
+    return json.loads(json.dumps(dict(value, name=name.strip())))
+
+
 def _theme_document_validate(value):
     if value is None:
         return None
@@ -1210,7 +1241,7 @@ class Plugin:
         Never accept URLs, paths, code, install flags or raw settings files.
         Keep credentials inside the backend and bound the response and timeout.
         """
-        if not isinstance(patch, dict) or not patch or set(patch) - {"enabled", "theme", "accent", "motion"}:
+        if not isinstance(patch, dict) or not patch or set(patch) - {"enabled", "theme", "accent", "motion", "appearance"}:
             return {"ok": False, "error": "Invalid theme settings"}
         for key in ("enabled", "motion"):
             if key in patch and type(patch[key]) is not bool:
@@ -1219,6 +1250,11 @@ class Plugin:
                              ("accent", ("teal", "blue", "violet", "amber"))):
             if key in patch and (not isinstance(patch[key], str) or patch[key] not in allowed):
                 return {"ok": False, "error": "Unknown " + key}
+        if "appearance" in patch:
+            try:
+                patch = dict(patch, appearance=_appearance_pack_validate(patch["appearance"]))
+            except (ValueError, TypeError):
+                return {"ok": False, "error": "Invalid appearance pack"}
         def save():
             token = _read_token(TOKEN_FILE) or _read_token(_token_mirror(), strict=True)
             if not token:
@@ -1229,8 +1265,8 @@ class Plugin:
                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
             try:
                 with urllib.request.urlopen(req, timeout=4) as response:
-                    raw = response.read(16385)
-                if len(raw) > 16384:
+                    raw = response.read(32769)
+                if len(raw) > 32768:
                     raise ValueError("Theme response too large")
                 return {"ok": True, "state": json.loads(raw)}
             except urllib.error.HTTPError as error:
@@ -1300,7 +1336,7 @@ class Plugin:
         reads bounded regular files and never writes into a user-owned directory.
         """
         defaults = {"version": 1, "installed": False, "enabled": False,
-                    "theme": "couchside", "accent": "teal", "motion": True, "studio": None}
+                    "theme": "couchside", "accent": "teal", "motion": True, "studio": None, "appearance": None, "appearance_packs": []}
         revision = ""
         theme_path = os.path.join(STATE_DIR, "steam-themes.json")
         def read_regular(path, limit):
@@ -1318,10 +1354,14 @@ class Plugin:
                 raise ValueError("file too large")
             return text
         try:
-            data = json.loads(read_regular(theme_path, 4096))
+            data = json.loads(read_regular(theme_path, 32768))
             if not isinstance(data, dict) or set(data) - set(defaults):
                 raise ValueError("invalid schema")
             data = dict(defaults, **data)
+            data["appearance"] = _appearance_pack_validate(data["appearance"])
+            if not isinstance(data["appearance_packs"], list) or len(data["appearance_packs"]) > 8 or any(p is None for p in data["appearance_packs"]):
+                raise ValueError("invalid saved appearance packs")
+            data["appearance_packs"] = [_appearance_pack_validate(p) for p in data["appearance_packs"]]
             data["studio"] = _theme_document_validate(data["studio"])
             if data["studio"] and any(data[k] != data["studio"][v] for k, v in (("theme", "layout"), ("accent", "accent"), ("motion", "motion"))):
                 raise ValueError("theme document mismatch")

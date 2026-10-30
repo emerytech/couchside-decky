@@ -13,6 +13,13 @@ spec = importlib.util.spec_from_file_location('plugin', ROOT / 'main.py')
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 
 class ThemeFallback(unittest.TestCase):
+    def test_appearance_contract(self):
+        pack = {"version": 1, "name": "Test", "colors": dict(background="#112233", surface="#223344", text="#ffffff", muted="#aabbcc", accent="#88ccaa", focus="#99ddbb"), "backgrounds": {"settings": {"angle": 135, "stops": ["#112233", "#334455"]}}}
+        self.assertEqual(m._appearance_pack_validate(pack), pack)
+        for patch_value in [{"version": True}, {"name": "bad\nname"}, {"colors": {"accent": "url(x)"}}, {"backgrounds": {"settings": {"angle": -1, "stops": ["#112233", "#334455"]}}}]:
+            with self.assertRaises(ValueError):
+                m._appearance_pack_validate(dict(pack, **patch_value))
+
     def test_shared_theme_contract(self):
         f=json.loads((ROOT / 'scripts/fixtures/theme-v1.json').read_text())
         self.assertEqual(m._theme_document_validate(f['valid']),f['valid'])
@@ -24,7 +31,7 @@ class ThemeFallback(unittest.TestCase):
         plugin = m.Plugin()
         with patch.object(m.urllib.request, 'urlopen') as request:
             for value in [None, [], {}, {'installed': True}, {'url': 'https://example.com'},
-                          {'theme': []}, {'theme': '../../x'}, {'motion': 1}, {'enabled': 'true'}]:
+                          {'theme': []}, {'theme': '../../x'}, {'motion': 1}, {'enabled': 'true'}, {'appearance': {'version': 1, 'name': 'x', 'colors': {'accent': 'url(x)'}, 'backgrounds': {}}}]:
                 self.assertFalse(asyncio.run(plugin.set_steam_theme(value))['ok'])
             request.assert_not_called()
 
@@ -82,7 +89,7 @@ class ThemeFallback(unittest.TestCase):
             path = Path(temp) / 'steam-themes.json'; path.write_text(json.dumps(value))
             m._target_user = lambda: 'nonexistent-user-for-test'
             result = asyncio.run(m.Plugin().get_steam_theme())
-            self.assertEqual(result['settings'], dict(value, studio=None)); self.assertEqual(result['games'], [])
+            self.assertEqual(result['settings'], dict(value, studio=None, appearance=None, appearance_packs=[])); self.assertEqual(result['games'], [])
             self.assertEqual(json.loads(path.read_text()), value)
 
 if __name__ == '__main__': unittest.main()
