@@ -31,7 +31,11 @@ export function ConsoleHome(p: Props) {
   function cancel() { const next=backConsole(p.layout,stateRef.current); if(next)commit(next);else p.exit(); }
   function button(event: GamepadEvent) {
     const key=event.detail.button;
-    const direction=({[GamepadButton.DIR_LEFT]:'left',[GamepadButton.DIR_RIGHT]:'right',[GamepadButton.DIR_UP]:'up',[GamepadButton.DIR_DOWN]:'down'} as const)[key];
+    const directions: Partial<Record<GamepadButton, 'left' | 'right' | 'up' | 'down'>> = {
+      [GamepadButton.DIR_LEFT]: 'left', [GamepadButton.DIR_RIGHT]: 'right',
+      [GamepadButton.DIR_UP]: 'up', [GamepadButton.DIR_DOWN]: 'down',
+    };
+    const direction = directions[key];
     if (!direction && key!==GamepadButton.OK && key!==GamepadButton.CANCEL) return;
     event.preventDefault();event.stopPropagation();
     if(direction)commit(moveConsole(p.layout,stateRef.current,direction,lists));else if(key===GamepadButton.OK)activate();else cancel();
