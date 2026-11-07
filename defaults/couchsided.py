@@ -53,7 +53,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 APP_NAME = "couchside-agent"
-VERSION = "2.9.136"
+VERSION = "2.9.138"
 UID = os.getuid()
 XDG_RUNTIME_DIR = "/run/user/%d" % UID
 
@@ -13729,287 +13729,6 @@ _DECKY_PINNED_UNIT = os.path.join(_DECKY_SERVICES_DIR, ".systemd",
 _DECKY_SETTINGS = os.path.join(_DECKY_HOMEBREW, "settings", "loader.json")
 # The Couchside panel plugin folder (install.sh DECKY_PLUGIN_DIR).
 _DECKY_PANEL_DIR = os.path.join(_DECKY_PLUGINS_DIR, "Couchside")
-# ---------------------------------------------------------------------------
-# Couchside-Ports: a frozen catalogue of installable game PORTS (engine-only;
-# the player always supplies their own game dump). couchside-bbport (native
-# Bloodborne) is the first entry and the template for the rest.
-#
-# SECURITY (CLAUDE.md §3) — the catalogue IS the allowlist. A phone sends only a
-# port `id`; it is looked up in _PORTS_BY_ID and an unknown id is a 404, never a
-# pass-through. The only thing ever executed is the FROZEN recipe's bootstrap
-# URL, chosen HERE: fetched over https to a tmp file (step 1, bounded), then run
-# as `bash <file>` with an argv LIST (step 2, detached) — no shell, no pipe, no
-# client string in argv. No game data is EVER fetched: the bootstrap ships the
-# engine only, and we only run the bootstrap. `ports/index.json` is the
-# canonical copy; tests/test_ports_catalog.py pins _PORTS == that file.
-# ---------------------------------------------------------------------------
-_PORTS_MARKER = "/etc/couchside/allow-ports"
-PORTS_INSTALL_LOG = os.path.expanduser("~/.cache/couchside/ports-install.log")
-
-_PORTS = (
-    {
-        "id": "couchside-bbport",
-        "name": "Bloodborne (native port)",
-        "category": "game",
-        "platforms": ("steamos", "bazzite"),
-        "arch": "x86_64",
-        "description": "Native Bloodborne port for the Steam Machine. Engine only -- you supply your own Bloodborne dump (1.09) during setup. No game files are downloaded.",
-        "requires_user_files": True,
-        "user_files_prompt": "Dump your own copy of Bloodborne (any region, 1.09 update merged) and point the launcher at the folder containing eboot.bin.",
-        "installed_check": "~/Applications/couchside-bbport",
-        "source": {
-            "type": "github_release",
-            "repo": "emerytech/Bloodborne-Android",
-            "tag": "couchside-bbport",
-            "appimage": "Bloodborne-bbport-x86_64.AppImage",
-        },
-        "install": {
-            "bootstrap_url": "https://github.com/emerytech/Bloodborne-Android/releases/download/couchside-bbport/bootstrap.sh",
-        },
-        "uninstall": {
-            "bootstrap_url": "https://github.com/emerytech/Bloodborne-Android/releases/download/couchside-bbport/uninstall.sh",
-        },
-        "setup_flow": (
-            "Install drops the runtime AppImage into ~/Applications/couchside-bbport and adds menu + Steam shortcuts.",
-            "The launcher opens so you select YOUR OWN Bloodborne folder; it verifies edition/version and explains any fix.",
-            "Once a verified dump is configured, the Steam shortcut plays directly.",
-        ),
-    },
-)
-_PORTS_BY_ID = {p["id"]: p for p in _PORTS}
-
-# Current/last port install-or-uninstall job. `proc` is the detached child; the
-# rest is the summary the app polls. Exactly ONE job at a time — a second launch
-# while one runs is refused (409), never allowed to truncate the live transcript
-# or spawn a rival child (the flatpak_update() lesson, KI pattern).
-_PORTS_JOB = {
-    "proc": None, "id": None, "mode": None, "started": 0.0, "finished": 0.0,
-    "exit_code": None, "requires_user_files": False, "user_files_prompt": None,
-}
-_PORTS_JOB_LOCK = threading.Lock()
-
-
-def _ports_allowed():
-    """The on-box opt-in marker (`couchside allow-ports on`). Never raises.
-
-    Installing a port runs an installer from the internet as the desktop user —
-    a new class of phone-triggered action, so it is OFF by default and can only
-    be enabled ON THE BOX, exactly like `allow-decky`. Listing the catalogue is
-    always allowed; only the state-changing install/uninstall is gated."""
-    try:
-        return os.path.exists(_PORTS_MARKER)
-    except Exception:
-        return False
-
-
-def _port_installed(port):
-    """True when the port's installed_check path exists. Degrades to False (a
-    missing/unreadable path reads as 'not installed', never a false 'installed')."""
-    chk = port.get("installed_check")
-    if not chk:
-        return False
-    try:
-        return os.path.exists(os.path.expanduser(chk))
-    except Exception:
-        return False
-
-
-def _ports_read_log(limit=200):
-    """Last `limit` non-blank lines of the install transcript, or []. The PATH IS
-    A CONSTANT — no client input selects a file. Never raises."""
-    try:
-        with open(PORTS_INSTALL_LOG, "r", errors="replace") as f:
-            lines = f.read().splitlines()
-    except OSError:
-        return []
-    return [ln.rstrip() for ln in lines if ln.strip()][-limit:]
-
-
-def _ports_running():
-    """True while the install/uninstall this agent launched is still executing.
-    poll() on the Popen we hold is authoritative and reaps the child on exit.
-    Degrade-closed toward DONE so a lost handle never strands the card."""
-    proc = _PORTS_JOB["proc"]
-    if proc is None:
-        return False
-    try:
-        return proc.poll() is None
-    except Exception:
-        return False
-
-
-def ports_install_status():
-    """The current/last job summary the app polls, or None if none ran this
-    uptime. Records completion exactly once (first observation)."""
-    with _PORTS_JOB_LOCK:
-        if _PORTS_JOB["id"] is None:
-            return None
-        proc = _PORTS_JOB["proc"]
-        running = False
-        if proc is not None:
-            try:
-                running = proc.poll() is None
-            except Exception:
-                running = False
-            if not running and _PORTS_JOB["finished"] == 0.0:
-                try:
-                    _PORTS_JOB["exit_code"] = proc.returncode
-                except Exception:
-                    _PORTS_JOB["exit_code"] = None
-                _PORTS_JOB["finished"] = time.time()
-        ok = None
-        if not running and _PORTS_JOB["finished"]:
-            ok = _PORTS_JOB["exit_code"] == 0
-        return {
-            "id": _PORTS_JOB["id"], "mode": _PORTS_JOB["mode"],
-            "running": running,
-            "started": int(_PORTS_JOB["started"]),
-            "finished": (int(_PORTS_JOB["finished"]) or None),
-            "exit_code": _PORTS_JOB["exit_code"], "ok": ok,
-            "requires_user_files": bool(_PORTS_JOB["requires_user_files"]),
-            "user_files_prompt": _PORTS_JOB["user_files_prompt"],
-            "lines": _ports_read_log(),
-        }
-
-
-def ports_catalog(mock=False):
-    """Public catalogue for GET /api/ports (frozen; no client input). `mock`
-    forces installed=False so the dev harness never stats the real FS."""
-    out = []
-    for p in _PORTS:
-        out.append({
-            "id": p["id"], "name": p["name"],
-            "category": p.get("category", "game"),
-            "description": p.get("description", ""),
-            "platforms": list(p.get("platforms", ())),
-            "arch": p.get("arch", ""),
-            "requires_user_files": bool(p.get("requires_user_files")),
-            "user_files_prompt": p.get("user_files_prompt"),
-            "setup_flow": list(p.get("setup_flow", ())),
-            "installed": (False if mock else _port_installed(p)),
-        })
-    return out
-
-
-def ports_state(mock=False):
-    """GET /api/ports payload: catalogue + opt-in flag + current/last job. In
-    mock the opt-in reads True (so the harness can exercise the Install button)
-    and no real job/marker/FS is touched."""
-    if mock:
-        return {"ports": ports_catalog(mock=True), "allowed": True, "install": None}
-    return {"ports": ports_catalog(), "allowed": _ports_allowed(),
-            "install": ports_install_status()}
-
-
-def ports_run(port_id, mode):
-    """Start a frozen port install/uninstall, detached, writing to
-    PORTS_INSTALL_LOG. Returns (payload, http_status). `mode` in
-    {install, uninstall}.
-
-    The id is looked up in _PORTS_BY_ID (unknown -> 404, nothing runs). The URL
-    executed is the FROZEN recipe's — never from the client. Two steps, argv
-    lists only: fetch the small bootstrap over https to a tmp file, then run it
-    as `bash <file>` detached (the long AppImage download happens in that child,
-    which writes to the log, never an unread pipe)."""
-    port = _PORTS_BY_ID.get(port_id)
-    if not port:
-        return {"started": False, "error": "unknown port"}, 404
-    if mode not in ("install", "uninstall"):
-        return {"started": False, "error": "unknown mode"}, 400
-    if not _ports_allowed():
-        return {"started": False, "needs_optin": True,
-                "error": "port installs are not enabled "
-                         "(run on the box: couchside allow-ports on)"}, 403
-    url = (port.get(mode) or {}).get("bootstrap_url")
-    # Frozen data, so a bad URL is a catalogue bug, not client input — refuse
-    # closed rather than run something unpinned.
-    if not isinstance(url, str) or not url.startswith("https://github.com/"):
-        return {"started": False,
-                "error": "no %s step for this port" % mode}, 409
-    with _PORTS_JOB_LOCK:
-        if _ports_running():
-            return {"started": False, "running": True, "id": _PORTS_JOB["id"],
-                    "error": "a port %s is already running"
-                             % (_PORTS_JOB["mode"] or "job")}, 409
-        try:
-            os.makedirs(os.path.dirname(PORTS_INSTALL_LOG), exist_ok=True)
-        except OSError:
-            pass
-        try:
-            tmp = tempfile.mkdtemp(prefix="couchside-port-")
-        except OSError as e:
-            return {"started": False, "error": "cannot stage: %s" % e}, 500
-        script = os.path.join(tmp, "bootstrap.sh")
-        try:
-            logf = open(PORTS_INSTALL_LOG, "w")
-        except OSError as e:
-            shutil.rmtree(tmp, ignore_errors=True)
-            return {"started": False, "error": "cannot open log: %s" % e}, 500
-        # Step 1 (bounded, synchronous): fetch ONLY the small bootstrap script.
-        # https pinned via --proto; the URL is frozen. argv list, never a shell.
-        fetch = ["curl", "-fL", "--proto", "=https", "--tlsv1.2", "--retry", "3",
-                 "-o", script, url]
-        try:
-            rc = subprocess.run(
-                fetch, stdout=logf, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, timeout=60, env=_user_env()).returncode
-        except Exception as e:
-            logf.close()
-            shutil.rmtree(tmp, ignore_errors=True)
-            return {"started": False,
-                    "error": "download failed: %s" % e.__class__.__name__}, 502
-        if rc != 0:
-            logf.close()
-            shutil.rmtree(tmp, ignore_errors=True)
-            return {"started": False, "exit_code": rc,
-                    "error": "could not download the installer",
-                    "lines": _ports_read_log()}, 502
-        # Step 2 (detached, long): run the bootstrap. It downloads the engine
-        # AppImage + installer scripts from the SAME frozen release and wires up
-        # the menu / Steam shortcuts, all as the desktop user — no root, no
-        # game data. Output -> the log file (an unread pipe deadlocks on a long
-        # child; see flatpak_update()).
-        try:
-            proc = subprocess.Popen(
-                ["bash", script], cwd=tmp, env=_user_env(),
-                stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                start_new_session=True)
-        except OSError as e:
-            logf.close()
-            shutil.rmtree(tmp, ignore_errors=True)
-            return {"started": False, "error": str(e)}, 500
-        finally:
-            try:
-                logf.close()
-            except OSError:
-                pass
-        rf = bool(port.get("requires_user_files")) if mode == "install" else False
-        up = port.get("user_files_prompt") if mode == "install" else None
-        _PORTS_JOB.update({
-            "proc": proc, "id": port_id, "mode": mode,
-            "started": time.time(), "finished": 0.0, "exit_code": None,
-            "requires_user_files": rf, "user_files_prompt": up,
-        })
-    # Short wait so an installer that dies instantly surfaces now, not as a
-    # false 'started'. Outside the lock — the job is already registered.
-    try:
-        rc = proc.wait(timeout=0.8)
-    except subprocess.TimeoutExpired:
-        rc = None
-    if rc is not None and rc != 0:
-        with _PORTS_JOB_LOCK:
-            _PORTS_JOB["exit_code"] = rc
-            _PORTS_JOB["finished"] = time.time()
-        return {"started": False, "id": port_id, "mode": mode, "exit_code": rc,
-                "error": "the installer exited immediately",
-                "lines": _ports_read_log()}, 502
-    print("[ports] %s %s started (log: %s)" % (mode, port_id, PORTS_INSTALL_LOG),
-          flush=True)
-    return {"started": True, "id": port_id, "mode": mode,
-            "requires_user_files": rf, "user_files_prompt": up,
-            "log": PORTS_INSTALL_LOG}, 200
-
-
 _DECKY_MARKER = "/etc/couchside/allow-decky"
 _DECKY_WRAPPER = "/etc/couchside/couchside-decky-loader"
 _DECKY_UNIT_TMPL = "/etc/systemd/system/couchside-decky-loader@.service"
@@ -16690,7 +16409,7 @@ def mock_decky_loader_log(n=None):
 # cannot silently ship.
 _DECKY_MOCK_PLUGINS_SEED = [
     {"name": "Couchside", "folder": "Couchside", "version": "0.2.9",
-     "author": "ETS3D LLC", "root": True, "disabled": False,
+     "author": "Emery Tech Solutions", "root": True, "disabled": False,
      "hidden": False, "frozen": False},
     {"name": "SteamGridDB", "folder": "SteamGridDB", "version": "1.7.0",
      "author": "SteamGridDB", "root": False, "disabled": False,
@@ -18459,6 +18178,7 @@ class _WebOSWS:
         u = urlparse(url)
         host, port = u.hostname, (u.port or WEBOS_PORT)
         sock = socket.create_connection((host, port), timeout=timeout)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         if u.scheme == "wss":
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
@@ -18537,6 +18257,7 @@ class _WebOSSession:
     WEBOS_LOCK."""
 
     def __init__(self, host):
+        self.host = host
         self.ws = _WebOSWS("wss://%s:%d/" % (host, WEBOS_PORT))
         self._id = 0
         self.pointer = None
@@ -18580,6 +18301,18 @@ class _WebOSSession:
                     raise IOError(msg.get("error", "ssap error"))
                 return msg.get("payload", {})
         raise IOError("ssap request timed out: %s" % uri)
+
+    def pointer_frame(self, frame):
+        if self.pointer is None:
+            payload = self.request("ssap://com.webos.service.networkinput/getPointerInputSocket")
+            path = payload.get("socketPath", "")
+            parsed = urlparse(path)
+            if (parsed.scheme not in ("ws", "wss") or parsed.hostname != self.host
+                    or parsed.port not in (3000, 3001) or parsed.username or parsed.password
+                    or "\r" in path or "\n" in path):
+                raise IOError("invalid TV pointer socket")
+            self.pointer = _WebOSWS(path)
+        self.pointer.send_text(frame)
 
     def button(self, name):
         if self.pointer is None:
@@ -18683,6 +18416,34 @@ def real_webos(op):
     uri, payload = uri_payload
     return _webos_do(lambda s: (s.request(uri, payload), op)[1])
 
+
+def real_webos_pointer(req):
+    """Bounded native pointer commands; never retry uncertain movement/click."""
+    global WEBOS
+    if not isinstance(req, dict) or req.get("op") not in ("move", "click", "stop"):
+        raise ValueError("invalid TV pointer operation")
+    op = req["op"]
+    if op == "move":
+        dx, dy = req.get("dx"), req.get("dy")
+        if any(type(v) is not int or abs(v) > 120 for v in (dx, dy)):
+            raise ValueError("invalid TV pointer delta")
+        frame = "type:move\ndx:%d\ndy:%d\ndown:0\n\n" % (dx, dy)
+    else:
+        frame = "type:click\n\n"
+    start = time.monotonic()
+    if _WEBOS_MOCK: return _webos_result(start, True, "mock TV pointer " + op)
+    with WEBOS_LOCK:
+        try:
+            if op == "stop":
+                if WEBOS and WEBOS.pointer:
+                    WEBOS.pointer.close(); WEBOS.pointer = None
+            else:
+                _webos_conn().pointer_frame(frame)
+            return _webos_result(start, True, "ok")
+        except (IOError, OSError, ValueError, KeyError):
+            if WEBOS: WEBOS.close()
+            WEBOS = None
+            return _webos_result(start, False, "TV pointer disconnected. Try again.")
 
 def real_webos_key(k):
     """Send one factory-remote key (PANEL_KEYS vocabulary) as a pointer button."""
@@ -20549,6 +20310,8 @@ def tv_info():
                  or samsung_available() or roku_available()
                  or androidtv_available() or vidaa_available()),
         "key_backends": tv_key_backends_available(),
+        "pointer_backends": ["webos"] if webos_available() else [],
+        "pointer_stream": webos_available(),
         # A "source" key opens the TV's input picker (agent >= 2.9.12). Android/
         # Google TV (KEYCODE_TV_INPUT) and Samsung (KEY_SOURCE) have one; webOS/
         # Roku don't (no single input-menu key), and the RS-232 panel uses its
@@ -22118,8 +21881,8 @@ class MockKeyboard:
 # session reuses an already-enumerated device, so its first keystroke lands.
 #
 # ONLY the keyboard is shared; the pad and mouse stay per-session. Keyboard
-# frames always pair press+release (keyboard_events / _handle_kt), so no key can
-# be left held between sessions. A pad's d-pad is a LATCHED absolute axis and a
+# text/tap frames pair press+release. Camera holds are separately tracked and
+# leased by _camera_key; demotion and disconnect retire their ownership. A pad's d-pad is a LATCHED absolute axis and a
 # mouse button can be held mid-drag, so those two are torn down with the session
 # to guarantee release (see _release_devices / _gamepad_cleanup) -- the keyboard
 # has no such state to leak, which is exactly what makes sharing it safe.
@@ -27295,6 +27058,71 @@ def _volume_events_available():
     return True
 
 
+# Camera keys are separately leased and reference-counted because the keyboard
+# is shared between sessions. A lost phone cannot leave WASD held indefinitely.
+_CAMERA_KEY_LOCK = threading.RLock()
+_CAMERA_KEY_ENTRIES = {}
+_CAMERA_KEY_WORKER = None
+
+
+def _camera_keys_release(entry):
+    with _CAMERA_KEY_LOCK:
+        owned = entry.get("camera_keys", set())
+        for key in list(owned):
+            other = any(e is not entry and key in e.get("camera_keys", set())
+                        for e in _CAMERA_KEY_ENTRIES.values())
+            if not other and entry.get("keyboard") is not None:
+                try:
+                    entry["keyboard"].emit([(EV_KEY, CHAR_KEYMAP[key][0], 0)])
+                except Exception:
+                    pass
+            owned.discard(key)
+        _CAMERA_KEY_ENTRIES.pop(id(entry), None)
+
+
+def _camera_keys_watch():
+    global _CAMERA_KEY_WORKER
+    while True:
+        time.sleep(.05)
+        with _CAMERA_KEY_LOCK:
+            for entry in list(_CAMERA_KEY_ENTRIES.values()):
+                if entry.get("camera_until", 0) <= time.monotonic():
+                    _camera_keys_release(entry)
+            if not _CAMERA_KEY_ENTRIES:
+                _CAMERA_KEY_WORKER = None
+                return
+
+
+def _camera_key(entry, req):
+    global _CAMERA_KEY_WORKER
+    key, value = req.get("key"), req.get("v")
+    if not isinstance(key, str) or key not in ("w", "a", "s", "d") or type(value) is not int or value not in (0, 1):
+        raise ValueError("invalid camera key")
+    with _CAMERA_KEY_LOCK:
+        owned = entry.setdefault("camera_keys", set())
+        others = any(e is not entry and key in e.get("camera_keys", set())
+                     for e in _CAMERA_KEY_ENTRIES.values())
+        if value and key not in owned:
+            owned.add(key)
+            _CAMERA_KEY_ENTRIES[id(entry)] = entry
+            entry["camera_until"] = time.monotonic() + .5
+            if _CAMERA_KEY_WORKER is None:
+                _CAMERA_KEY_WORKER = threading.Thread(target=_camera_keys_watch, daemon=True)
+                _CAMERA_KEY_WORKER.start()
+            if not others:
+                entry["keyboard"].emit([(EV_KEY, CHAR_KEYMAP[key][0], 1)])
+        elif not value and key in owned:
+            if not others:
+                entry["keyboard"].emit([(EV_KEY, CHAR_KEYMAP[key][0], 0)])
+            owned.discard(key)
+        entry["camera_until"] = time.monotonic() + .5
+        if not owned:
+            _CAMERA_KEY_ENTRIES.pop(id(entry), None)
+        elif _CAMERA_KEY_WORKER is None:
+            _CAMERA_KEY_WORKER = threading.Thread(target=_camera_keys_watch, daemon=True)
+            _CAMERA_KEY_WORKER.start()
+
+
 def _release_devices(entry):
     """Demote a session that stays connected as a waiter: destroy its gamepad
     (one pad per holder — the new holder brings its own) but KEEP the mouse and
@@ -27302,8 +27130,8 @@ def _release_devices(entry):
     makes regaining control instant — re-creating them restarted the 0.5s
     enumeration-settle window, so the first swipe after a pass-back stalled
     ~500ms (measured). Mouse buttons are defensively released (a drag could be
-    mid-press at demote; keyboard frames always pair press+release, so keys
-    can never be left held)."""
+    mid-press at demote). Leased camera keys are released before promotion."""
+    _camera_keys_release(entry)
     dev = entry.get("device")
     if dev is not None:
         # Zero the pad BEFORE destroying it, for the same reason the mouse is
@@ -27392,6 +27220,8 @@ def _make_holder(entry, mock):
     # kill its own socket against an older agent. Old clients ignore the field.
     _wsend_json(entry, {"t": "hello", "dev": dev,
                         "text": _text_caps(mock),
+                        "no_pad": bool(entry.get("nopad")),
+                        "camera_keys": ["w", "a", "s", "d"],
                         "keys": sorted(set(SPECIAL_KEYS)
                                        | set(DESKTOP_CHORDS)
                                        | set(KEY_CHORDS)
@@ -27740,6 +27570,132 @@ _BOX_POP_LOCK = threading.Lock()
 _BOX_POP_AT = [0.0]                 # monotonic time of the last box-screen pop
 _BOX_POP_COOLDOWN = 5.0            # seconds; hard floor between pops
 
+
+
+
+# Temporary Xwayland cursor enlargement. The worker snapshots the original image,
+# restores it on pipe EOF/8s lease expiry, and survives long enough to restore if
+# this agent exits. No persistent settings or privileged process is involved.
+_AIR_CURSOR_WORKER = r'''import ctypes as c, json, select, sys, time
+class Image(c.Structure):
+ _fields_=[('x',c.c_short),('y',c.c_short),('width',c.c_ushort),('height',c.c_ushort),('xhot',c.c_ushort),('yhot',c.c_ushort),('serial',c.c_ulong),('pixels',c.POINTER(c.c_ulong)),('atom',c.c_ulong),('name',c.c_char_p)]
+class Cursor(c.Structure):
+ _fields_=[('version',c.c_uint),('size',c.c_uint),('width',c.c_uint),('height',c.c_uint),('xhot',c.c_uint),('yhot',c.c_uint),('delay',c.c_uint),('pixels',c.POINTER(c.c_uint))]
+desired=int(sys.argv[1]) if len(sys.argv)>1 else 192
+saved=[]; enlarged=False
+try:
+ x=c.CDLL('libX11.so.6');f=c.CDLL('libXfixes.so.3');u=c.CDLL('libXcursor.so.1')
+ x.XOpenDisplay.argtypes=[c.c_char_p];x.XOpenDisplay.restype=c.c_void_p
+ x.XFree.argtypes=[c.c_void_p];x.XSync.argtypes=[c.c_void_p,c.c_int];x.XFreeCursor.argtypes=[c.c_void_p,c.c_ulong];x.XCloseDisplay.argtypes=[c.c_void_p]
+ f.XFixesGetCursorImage.argtypes=[c.c_void_p];f.XFixesGetCursorImage.restype=c.POINTER(Image)
+ f.XFixesChangeCursorByName.argtypes=[c.c_void_p,c.c_ulong,c.c_char_p]
+ f.XFixesSetCursorName.argtypes=[c.c_void_p,c.c_ulong,c.c_char_p]
+ u.XcursorImageCreate.argtypes=[c.c_int,c.c_int];u.XcursorImageCreate.restype=c.POINTER(Cursor)
+ u.XcursorImageDestroy.argtypes=[c.POINTER(Cursor)]
+ u.XcursorImageLoadCursor.argtypes=[c.c_void_p,c.POINTER(Cursor)];u.XcursorImageLoadCursor.restype=c.c_ulong
+ def make(d,pixels,w,h,hx,hy,scale):
+  target=desired if scale>1 else max(w,h);nw=max(1,round(w*target/max(w,h)));nh=max(1,round(h*target/max(w,h)));p=u.XcursorImageCreate(nw,nh)
+  if not p: raise RuntimeError('cursor allocation')
+  q=p.contents;q.xhot=hx*nw//w;q.yhot=hy*nh//h
+  for y in range(nh):
+   for z in range(nw):q.pixels[y*nw+z]=pixels[(y*h//nh)*w+z*w//nw]
+  handle=u.XcursorImageLoadCursor(d,p);u.XcursorImageDestroy(p)
+  if not handle:raise RuntimeError('cursor loading')
+  return handle
+ for display in (b':0',b':1'):
+  d=x.XOpenDisplay(display)
+  if not d:continue
+  p=f.XFixesGetCursorImage(d)
+  if not p:x.XCloseDisplay(d);continue
+  q=p.contents;name=q.name;w=q.width;h=q.height;hx=q.xhot;hy=q.yhot
+  if not name or not (0<w<=128 and 0<h<=128):x.XFree(p);x.XCloseDisplay(d);continue
+  pixels=[q.pixels[i] for i in range(w*h)];x.XFree(p)
+  original=make(d,pixels,w,h,hx,hy,1);large=make(d,pixels,w,h,hx,hy,3)
+  f.XFixesSetCursorName(d,large,name)
+  saved.append((d,original,large,name));f.XFixesChangeCursorByName(d,large,name);x.XSync(d,0)
+  check=f.XFixesGetCursorImage(d)
+  if check:
+   enlarged = enlarged or (max(check.contents.width,check.contents.height) >= desired)
+   x.XFree(check)
+ print(json.dumps({'ok':enlarged}),flush=True)
+ deadline=time.monotonic()+8;maximum=time.monotonic()+600
+ while saved and time.monotonic()<min(deadline,maximum):
+  if select.select([sys.stdin],[],[],max(0,min(deadline,maximum)-time.monotonic()))[0]:
+   if not sys.stdin.readline():break
+   deadline=time.monotonic()+8
+except Exception:
+ print(json.dumps({'ok':False}),flush=True)
+finally:
+ for d,original,large,name in reversed(saved):
+  f.XFixesSetCursorName(d,original,name)
+  f.XFixesChangeCursorByName(d,original,name);x.XSync(d,0);x.XFreeCursor(d,large);x.XFreeCursor(d,original);x.XCloseDisplay(d)
+'''
+_AIR_CURSOR_LOCK = threading.Lock()
+_AIR_CURSOR_PROCESS = None
+_AIR_CURSOR_OWNER = None
+_AIR_CURSOR_SIZE = None
+
+def air_cursor_lease(enabled, lease, size=192):
+    global _AIR_CURSOR_PROCESS, _AIR_CURSOR_OWNER, _AIR_CURSOR_SIZE
+    import select
+    if type(enabled) is not bool or not isinstance(lease, str) or not re.fullmatch(r"[a-zA-Z0-9]{8,64}", lease):
+        raise ValueError("invalid cursor lease")
+    if type(size) is not int or size not in (128,192,256):
+        raise ValueError("invalid cursor size")
+    with _AIR_CURSOR_LOCK:
+        proc = _AIR_CURSOR_PROCESS
+        if not enabled:
+            if proc and _AIR_CURSOR_OWNER == lease:
+                try:
+                    proc.stdin.close()
+                    proc.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    return {"ok": False}
+                _AIR_CURSOR_PROCESS = None
+                _AIR_CURSOR_OWNER = None
+                _AIR_CURSOR_SIZE = None
+            return {"ok": True}
+        if proc and proc.poll() is None and _AIR_CURSOR_OWNER == lease and _AIR_CURSOR_SIZE == size:
+            try:
+                proc.stdin.write("renew\n"); proc.stdin.flush()
+                return {"ok": True}
+            except OSError:
+                pass
+        if proc:
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                return {"ok": False}
+        proc = subprocess.Popen([sys.executable, "-c", _AIR_CURSOR_WORKER, str(size)],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+        _AIR_CURSOR_PROCESS, _AIR_CURSOR_OWNER, _AIR_CURSOR_SIZE = proc, lease, size
+        try:
+            ready = select.select([proc.stdout], [], [], 3)[0]
+            result = json.loads(proc.stdout.readline()) if ready else {"ok": False}
+        except (OSError, ValueError):
+            result = {"ok": False}
+        if result.get("ok") is not True:
+            try: proc.stdin.close()
+            except OSError: pass
+            return {"ok": False}
+        return {"ok": True}
+
+def render_air_mouse_page():
+    """Static local target exercise. No credentials, remote scripts or control API."""
+    return r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Couchside · Air Mouse setup</title>
+<style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#0b1120;color:#e8eef9;font:22px system-ui}header{position:absolute;top:3vh;left:5vw;right:5vw;text-align:center}h1{font-size:32px;margin:0 0 12px}p{color:#a5b3ca;margin:8px}button{background:#152034;color:#e8eef9;border:1px solid #33445f;border-radius:14px;padding:12px 22px;font:inherit;cursor:pointer}#target{position:absolute;width:88px;height:88px;border-radius:50%;border:3px solid #25cdb8;background:#153a40;transform:translate(-50%,-50%);pointer-events:none;display:grid;place-items:center;font-size:38px;box-shadow:0 0 0 18px #25cdb815}footer{position:absolute;bottom:3vh;width:100%;text-align:center}#result{color:#25cdb8}#close{position:absolute;right:20px;top:16px}</style>
+<header><h1>Air Mouse · four-target setup</h1><p id="instruction">On your phone, use Quick calibrate while holding still. Turn Air Mouse on.</p><p>Move the cursor onto each target, then tap Confirm target on your phone.</p><p id="result" aria-live="polite">Target 1 of 4</p></header><button id="close">Exit</button><div id="target" aria-hidden="true">+</div>
+<footer><p>Point the phone toward the TV, screen facing up (Remote grip). Use Speed to tune movement.</p><p>Hold still to pause. Recenter stops motion so you can comfortably regrip; it does not move the cursor.</p><button id="restart">Start again</button> <button id="full">Full screen</button></footer>
+<script>
+'use strict';
+const spots=[[.25,.36],[.75,.36],[.75,.67],[.25,.67]], target=document.querySelector('#target'), result=document.querySelector('#result');let step=0,errors=[];
+function place(){target.style.left=spots[Math.min(step,3)][0]*100+'vw';target.style.top=spots[Math.min(step,3)][1]*100+'vh'}
+function reset(){step=0;errors=[];target.hidden=false;target.style.display='grid';result.textContent='Target 1 of 4';place()}
+document.addEventListener('click',e=>{if(e.target.closest('button')||step>=4)return;const p=spots[step];errors.push(Math.hypot(e.clientX-innerWidth*p[0],e.clientY-innerHeight*p[1])/Math.min(innerWidth,innerHeight));step++;if(step===4){target.style.display='none';const mean=errors.reduce((a,b)=>a+b,0)/4;result.textContent=mean<.05?'Four targets complete · accuracy looks good.':'Four targets complete · try a slower Speed and repeat for more precision.';document.querySelector('#instruction').textContent='Now hold still and check for drift. If it drifts, turn Air Mouse off and Quick calibrate again.'}else{result.textContent='Target '+(step+1)+' of 4';place()}});
+document.querySelector('#restart').onclick=reset;document.querySelector('#full').onclick=()=>{if(document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(()=>{})};document.querySelector('#close').onclick=()=>{window.close();document.querySelector('#instruction').textContent='Test finished. Turn Air Mouse off on your phone, then close this browser or return to Steam.';target.style.display='none';step=4};document.addEventListener('keydown',e=>{if(e.key==='Escape'){target.style.display='none';step=4;result.textContent='Test stopped. Turn Air Mouse off on your phone.'}});reset();
+</script></html>'''
 
 def pair_show_on_box(port):
     """Open the loopback /pair page on the BOX'S own screen so the PIN is
@@ -28491,6 +28447,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_webrtc_ws(parsed, started)
                 return
 
+            if path == "/air-mouse":
+                if not self._is_loopback() or not self._host_header_is_local():
+                    self._send(403, {"error": "forbidden"}, started)
+                    return
+                self._send_html(200, render_air_mouse_page(), started)
+                return
+
             if path == "/pair":
                 # LOCALHOST-ONLY: /pair renders the pairing token as a QR, so a
                 # non-loopback client MUST NOT see it. Two gates, both required:
@@ -28693,13 +28656,6 @@ class Handler(BaseHTTPRequestHandler):
                 # needs_enable/no_adapter). Read-only; the app gates the whole
                 # section behind an opt-in pref.
                 self._send(200, {"utilities": utilities_state(self.mock)}, started)
-            elif path == "/api/ports":
-                # Couchside-Ports: the frozen catalogue of installable game
-                # ports + the on-box opt-in flag + the current/last install job
-                # the app polls for progress. Read-only; the state-changing
-                # install/uninstall live on POST and need the opt-in. Old agents
-                # 404 this route, so the app's probe-and-appear hides the section.
-                self._send(200, ports_state(self.mock), started)
             elif path == "/api/utilities/openpuck/latest":
                 # OPT-IN "check for newer firmware": the fork's newest release vs
                 # the pinned build. Read-only (contacts GitHub, cached 10 min); the
@@ -29547,6 +29503,40 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(401, {"error": "unauthorized"}, started)
                 return
 
+            if path == "/api/air-mouse/cursor":
+                self.close_connection = True
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if self.headers.get("Transfer-Encoding") or not 0 < length <= 256:
+                        raise ValueError("invalid body length")
+                    req = json.loads(self.rfile.read(length))
+                    if not isinstance(req, dict): raise ValueError("invalid body")
+                    result = air_cursor_lease(req.get("enabled"), req.get("lease"), req.get("size",192))
+                except (ValueError, TypeError):
+                    self._send(400, {"error": "invalid cursor request"}, started)
+                    return
+                self._send(200, result, started)
+                return
+
+            if path == "/api/air-mouse/show":
+                # Fixed local URL only; authenticated callers cannot supply a URL.
+                # Close because this action does not consume a request body.
+                self.close_connection = True
+                with _BOX_POP_LOCK:
+                    now = time.monotonic()
+                    if now - _BOX_POP_AT[0] < _BOX_POP_COOLDOWN:
+                        self._send(429, {"error": "Please wait before opening setup again"}, started)
+                        return
+                    _BOX_POP_AT[0] = now
+                try:
+                    pair_show_on_box_url("http://localhost:%d/air-mouse" % self.port)
+                except Exception:
+                    self._send(503, {"error": "Could not open the on-box browser"}, started)
+                    return
+                self._send(200, {"ok": True, "requested": True}, started)
+                return
+
+
             # POST /api/ticket[?once=1] — mint a short-lived ticket the app uses in
             # ?ticket= on un-pinnable <Image> (cover art) / upload requests, so the
             # real token never rides those cleartext URLs on a TLS box. Reachable
@@ -30232,40 +30222,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, result, started)
                 return
 
-            # POST /api/ports/install | /api/ports/uninstall {"id": "..."}:
-            # install or remove a port from the FROZEN catalogue. The id is
-            # looked up in _PORTS_BY_ID — an unknown id is a 404 and nothing
-            # runs. The only thing executed is the recipe's frozen bootstrap URL
-            # (ports_run: https fetch to a tmp file, then `bash <file>` as the
-            # desktop user; no shell, no client string in argv, no game data).
-            # Gated by the on-box opt-in (couchside allow-ports on) -> 403.
-            if path in ("/api/ports/install", "/api/ports/uninstall"):
-                mode = "install" if path.endswith("install") else "uninstall"
-                try:
-                    req = json.loads(body.decode("utf-8")) if body else {}
-                    if not isinstance(req, dict):
-                        raise ValueError
-                    pid = req.get("id")
-                except (ValueError, UnicodeDecodeError):
-                    self._send(400, {"error": "id required"}, started)
-                    return
-                # Reject (never sanitise) a non-allowlisted id before anything runs.
-                if not isinstance(pid, str) or pid not in _PORTS_BY_ID:
-                    self._send(404, {"error": "unknown port"}, started)
-                    return
-                if self.mock:
-                    port = _PORTS_BY_ID[pid]
-                    rf = bool(port.get("requires_user_files")) if mode == "install" else False
-                    self._send(200, {"started": True, "id": pid, "mode": mode,
-                                     "mock": True, "requires_user_files": rf,
-                                     "user_files_prompt": (port.get("user_files_prompt")
-                                                           if mode == "install" else None)},
-                               started)
-                    return
-                payload, code = ports_run(pid, mode)
-                self._send(code, payload, started)
-                return
-
             # POST /api/wol {"mac": "..."}: broadcast a Wake-on-LAN magic packet
             # from THIS box, on behalf of a phone that cannot send one itself.
             # iOS blocks UDP for apps entirely (broadcast AND unicast), so the
@@ -30448,6 +30404,19 @@ class Handler(BaseHTTPRequestHandler):
             # POST /api/tv/volume: absolute volume {"level": 0-100, "target":
             # "box"|"tv"}. Box converges via media-key steps (Game Mode OSD),
             # TV via the RS-232 closed loop. Checked before /api/tv/<op>.
+            if path == "/api/tv/webos/pointer":
+                if not webos_available():
+                    self._send(404, {"error": "LG TV not configured"}, started)
+                    return
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    result = real_webos_pointer(req)
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "invalid TV pointer request"}, started)
+                    return
+                self._send(200, result, started)
+                return
+
             if path == "/api/tv/volume":
                 try:
                     req = json.loads(body.decode("utf-8")) if body else {}
@@ -32106,6 +32075,7 @@ class Handler(BaseHTTPRequestHandler):
             self._gamepad_cleanup(entry)
 
     def _gamepad_cleanup(self, entry):
+        _camera_keys_release(entry)
         """Remove a dead session; if it held control, promote a waiter (prefer
         one that requested). Runs from the session's own thread on exit."""
         global GAMEPAD_HOLDER
@@ -32313,6 +32283,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_control(entry, t)
         # Input frames only from the holder; a waiter's input is ignored.
         if not entry.get("held"):
+            return True
+        if t == "kh":
+            try:
+                if entry.get("keyboard") is None:
+                    entry["keyboard"] = _shared_keyboard(self.mock)
+                _camera_key(entry, msg)
+            except (ValueError, TypeError, OSError):
+                _camera_keys_release(entry)
+                _wsend_json(entry, {"t": "camera_error", "msg": "Camera keys unavailable"})
+            return True
+        if t == "tvp":
+            # Authenticated holder only. Never replay uncertain TV movement.
+            if webos_available():
+                try:
+                    result = real_webos_pointer(msg)
+                    if not result["ok"]:
+                        _wsend_json(entry, {"t": "tvp_error", "msg": "TV pointer unavailable"})
+                except (ValueError, TypeError):
+                    _wsend_json(entry, {"t": "tvp_error", "msg": "Invalid TV pointer frame"})
             return True
         # ABSOLUTE pointer (remote-desktop P2) rides the opt-in portal module, a
         # SEPARATE channel from the uinput mouse. Additive + tolerant: an absent/
